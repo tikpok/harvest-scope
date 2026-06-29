@@ -10,7 +10,7 @@ use tauri_plugin_notification::NotificationExt;
 use crate::{
     adapters::adapter_for,
     domain::{NodeSample, NodeStatus, StoredNode},
-    error::AppResult,
+    error::{AppError, AppResult},
     state::AppState,
 };
 
@@ -126,21 +126,20 @@ async fn monitor_node_inner(
         force || now - runtime.last_peer_poll >= settings.peer_interval_seconds as i64 * 1_000;
     if health.is_some() && peers_due {
         match adapter.fetch_peers().await {
-            Ok(peers) => {
-                state
-                    .repository
-                    .replace_peers(&node.id, &peers, now)
-                    .await?;
-                runtime.peers = peers;
-                runtime.last_peer_poll = now;
-            }
+            Ok(peers) => match state.repository.replace_peers(&node.id, &peers, now).await {
+                Ok(()) => {
+                    runtime.peers = peers;
+                    runtime.last_peer_poll = now;
+                }
+                Err(err) => error = Some(err.to_string()),
+            },
             Err(err) => error = Some(err.to_string()),
         }
     }
     let static_due = force || now - runtime.last_static_poll >= 15 * 60 * 1_000;
     if health.is_some() && static_due {
         if let Ok(identity) = adapter.fetch_static_info().await {
-            state
+            match state
                 .repository
                 .upsert_node(
                     &node.id,
@@ -150,8 +149,11 @@ async fn monitor_node_inner(
                     node.enabled,
                     node.favorite,
                 )
-                .await?;
-            runtime.last_static_poll = now;
+                .await
+            {
+                Ok(()) => runtime.last_static_poll = now,
+                Err(err) => error = Some(err.to_string()),
+            }
         }
     }
     runtime.chain.network_height = runtime
@@ -362,18 +364,40 @@ pub async fn monitor_node(
     node: StoredNode,
     force: bool,
 ) -> AppResult<()> {
+    let node_id = node.id.clone();
     {
         let mut active = state.monitoring_nodes.lock().await;
-        if !active.insert(node.id.clone()) {
+        if !active.insert(node_id.clone()) {
             return Ok(());
         }
     }
-    let permit = state.request_limit.clone().acquire_owned().await;
-    let result = match permit {
-        Ok(_permit) => monitor_node_inner(app, state.clone(), node.clone(), force).await,
-        Err(error) => Err(crate::error::AppError::Configuration(error.to_string())),
+    // Run the operation behind a join boundary so a panic cannot leave the
+    // node permanently present in `monitoring_nodes`. The timeout also recovers
+    // from a dependency that stops responding despite request-level timeouts.
+    let task_state = state.clone();
+    let mut task = tokio::spawn(async move {
+        let _permit = task_state
+            .request_limit
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| AppError::Configuration(error.to_string()))?;
+        monitor_node_inner(app, task_state, node, force).await
+    });
+    let result = match tokio::time::timeout(Duration::from_secs(60), &mut task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(AppError::Configuration(format!(
+            "監視処理が異常終了しました: {error}"
+        ))),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            Err(AppError::Network(
+                "監視処理が60秒以内に完了しませんでした".into(),
+            ))
+        }
     };
-    state.monitoring_nodes.lock().await.remove(&node.id);
+    state.monitoring_nodes.lock().await.remove(&node_id);
     result
 }
 

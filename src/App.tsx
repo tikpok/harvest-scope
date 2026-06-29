@@ -1,7 +1,9 @@
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
+  ArrowDown,
+  ArrowUp,
   Bell,
   ChevronRight,
   CircleGauge,
@@ -105,10 +107,25 @@ function DashboardPage() {
     mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) => enabled ? api.pauseNode(id) : api.resumeNode(id),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
   });
+  const reorder = useMutation({
+    mutationFn: ({ id, direction }: { id: string; direction: "up" | "down" }) => api.moveNode(id, direction),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
+  });
+  const remove = useMutation({
+    mutationFn: (id: string) => api.deleteNode(id),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
+  });
   const nodes = useMemo(() => data.nodes.filter((node) => {
     const text = `${node.displayName} ${node.baseUrl} ${node.network ?? ""}`.toLowerCase();
     return text.includes(nodeFilter.toLowerCase()) && (statusFilter === "all" || node.status === statusFilter);
   }), [data.nodes, nodeFilter, statusFilter]);
+  const filterActive = nodeFilter.trim() !== "" || statusFilter !== "all";
+  const reorderTitle = filterActive ? "絞り込みを解除すると並び替えできます" : undefined;
+
+  function unregisterNode(nodeId: string, displayName: string) {
+    const confirmed = window.confirm(`「${displayName}」の登録を解除しますか？\n保存済みの監視履歴とアラートも削除されます。`);
+    if (confirmed) remove.mutate(nodeId);
+  }
 
   return (
     <>
@@ -127,18 +144,22 @@ function DashboardPage() {
           </div>
         </div>
         {error && <div className="notice notice--error">監視サービスに接続できません: {String(error)}</div>}
+        {(reorder.error || remove.error) && <div className="notice notice--error">操作に失敗しました: {String(reorder.error ?? remove.error)}</div>}
         {isLoading ? <div className="loading">監視データを読み込み中…</div> : nodes.length === 0 ? (
           <EmptyState title="監視ノードがありません">「ノード追加」からURLを登録するか、LAN内をスキャンしてください。</EmptyState>
         ) : (
           <div className="table-wrap"><table>
             <thead><tr><th>ノード</th><th>種別</th><th>状態</th><th>チェーン高</th><th>最終化高</th><th>遅延</th><th>ピア</th><th>REST</th><th>最終確認</th><th aria-label="操作" /></tr></thead>
-            <tbody>{nodes.map((node) => <tr key={node.id} className="clickable" onClick={() => navigate(`/nodes/${node.id}`)}>
+            <tbody>{nodes.map((node, index) => <tr key={node.id} className="clickable" onClick={() => navigate(`/nodes/${node.id}`)}>
               <td><strong>{node.displayName}</strong><small>{node.baseUrl}</small></td>
               <td><span className={`kind kind--${node.kind}`}>{node.kind === "symbol" ? "Symbol" : "NIS1"}</span></td>
               <td><StatusBadge status={node.status} /></td><td className="mono">{node.height ?? "—"}</td><td className="mono">{node.finalizedHeight ?? "—"}</td><td>{node.lag ?? "—"}</td><td>{node.peerCount ?? "—"}</td><td>{formatLatency(node.latencyMs)}</td><td>{formatTime(node.lastSeenAt)}</td>
               <td><div className="row-actions">
+                <button className="icon-button" aria-label={`${node.displayName}を上へ移動`} title={reorderTitle ?? "上へ移動"} disabled={filterActive || index === 0 || reorder.isPending} onClick={(event) => { event.stopPropagation(); reorder.mutate({ id: node.id, direction: "up" }); }}><ArrowUp size={16} /></button>
+                <button className="icon-button" aria-label={`${node.displayName}を下へ移動`} title={reorderTitle ?? "下へ移動"} disabled={filterActive || index === nodes.length - 1 || reorder.isPending} onClick={(event) => { event.stopPropagation(); reorder.mutate({ id: node.id, direction: "down" }); }}><ArrowDown size={16} /></button>
                 <button className="icon-button" title="今すぐ更新" onClick={(event) => { event.stopPropagation(); refresh.mutate(node.id); }}><RefreshCw size={16} /></button>
                 <button className="icon-button" title={node.enabled ? "監視を停止" : "監視を再開"} onClick={(event) => { event.stopPropagation(); pause.mutate({ id: node.id, enabled: node.enabled }); }}>{node.enabled ? <Pause size={16} /> : <Play size={16} />}</button>
+                <button className="icon-button icon-button--danger" aria-label={`${node.displayName}の登録を解除`} title="登録解除" disabled={remove.isPending} onClick={(event) => { event.stopPropagation(); unregisterNode(node.id, node.displayName); }}><Trash2 size={16} /></button>
                 <ChevronRight size={17} />
               </div></td>
             </tr>)}</tbody>
@@ -173,19 +194,22 @@ function NodeDetailPage() {
 function DiscoveryPage() {
   const queryClient = useQueryClient();
   const { data: interfaces = [] } = useQuery({ queryKey: ["interfaces"], queryFn: api.interfaces });
-  const [cidr, setCidr] = useState("192.0.2.10/24");
+  const [cidr, setCidr] = useState("");
   const [ports, setPorts] = useState("3000,3001,7890");
   const [manualUrl, setManualUrl] = useState("");
   const [manualName, setManualName] = useState("");
   const scan = useMutation({ mutationFn: api.scan });
   const add = useMutation({ mutationFn: api.upsertNode, onSuccess: () => queryClient.invalidateQueries({ queryKey: ["dashboard"] }) });
+  useEffect(() => {
+    if (!cidr && interfaces.length > 0) setCidr(interfaces[0].cidr);
+  }, [cidr, interfaces]);
   function submitScan(event: FormEvent) { event.preventDefault(); scan.mutate({ cidr, ports: ports.split(",").map(Number).filter((port) => Number.isInteger(port)) }); }
   function addManual(event: FormEvent) { event.preventDefault(); add.mutate({ baseUrl: manualUrl, displayName: manualName || undefined }); setManualUrl(""); setManualName(""); }
   function addCandidate(candidate: ScanCandidate) { add.mutate({ baseUrl: candidate.baseUrl, displayName: candidate.name ?? undefined, kind: candidate.kind }); }
   return <>
     <div className="page-heading"><div><h2>ノード検出</h2><p>選択したCIDRだけを明示的にスキャンします。候補は確認後に登録されます。</p></div></div>
     <section className="split-grid">
-      <form className="panel form-card" onSubmit={submitScan}><h3>LANをスキャン</h3><label>ネットワーク候補<select value={cidr} onChange={(event) => setCidr(event.target.value)}><option value={cidr}>{cidr}</option>{interfaces.filter((item) => item.cidr !== cidr).map((item) => <option key={`${item.name}-${item.cidr}`} value={item.cidr}>{item.name} — {item.cidr}</option>)}</select></label><label>CIDR<input value={cidr} onChange={(event) => setCidr(event.target.value)} required /></label><label>ポート（カンマ区切り）<input value={ports} onChange={(event) => setPorts(event.target.value)} required /></label><div className="actions"><button className="button button--primary" disabled={scan.isPending}><Search size={16} />{scan.isPending ? "スキャン中…" : "スキャン開始"}</button>{scan.isPending && <button type="button" className="button" onClick={() => api.cancelScan()}>キャンセル</button>}</div><p className="form-hint">最大1,024アドレス、既定ポート3000 / 3001 / 7890</p></form>
+      <form className="panel form-card" onSubmit={submitScan}><h3>LANをスキャン</h3><label>ネットワーク候補<select value={cidr} onChange={(event) => setCidr(event.target.value)}>{!cidr && <option value="">ネットワークを選択</option>}{cidr && !interfaces.some((item) => item.cidr === cidr) && <option value={cidr}>{cidr}</option>}{interfaces.map((item) => <option key={`${item.name}-${item.cidr}`} value={item.cidr}>{item.name} — {item.cidr}</option>)}</select></label><label>CIDR<input value={cidr} onChange={(event) => setCidr(event.target.value)} required /></label><label>ポート（カンマ区切り）<input value={ports} onChange={(event) => setPorts(event.target.value)} required /></label><div className="actions"><button className="button button--primary" disabled={scan.isPending}><Search size={16} />{scan.isPending ? "スキャン中…" : "スキャン開始"}</button>{scan.isPending && <button type="button" className="button" onClick={() => api.cancelScan()}>キャンセル</button>}</div><p className="form-hint">最大1,024アドレス、既定ポート3000 / 3001 / 7890</p></form>
       <form className="panel form-card" onSubmit={addManual}><h3>URLを手動登録</h3><label>表示名<input value={manualName} onChange={(event) => setManualName(event.target.value)} placeholder="例: Symbol Main API" /></label><label>REST URL<input type="url" value={manualUrl} onChange={(event) => setManualUrl(event.target.value)} placeholder="http://192.0.2.10:3000" required /></label><button className="button button--primary" disabled={add.isPending}><Plus size={16} />接続確認して登録</button><p className="form-hint">HTTP/HTTPSのみ。秘密鍵やログイン情報は入力しないでください。</p></form>
     </section>
     {(scan.error || add.error) && <div className="notice notice--error">{String(scan.error ?? add.error)}</div>}
@@ -221,4 +245,3 @@ export default function App() {
   useMonitorEvents();
   return <Layout><Routes><Route path="/" element={<DashboardPage />} /><Route path="/nodes/:nodeId" element={<NodeDetailPage />} /><Route path="/discovery" element={<DiscoveryPage />} /><Route path="/alerts" element={<AlertsPage />} /><Route path="/settings" element={<SettingsPage />} /></Routes></Layout>;
 }
-

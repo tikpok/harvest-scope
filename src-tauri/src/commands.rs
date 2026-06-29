@@ -1,4 +1,4 @@
-use std::sync::atomic::Ordering;
+use std::{sync::atomic::Ordering, time::Instant};
 
 use tauri::{AppHandle, State};
 use tauri_plugin_autostart::ManagerExt;
@@ -8,7 +8,7 @@ use crate::{
     adapters::{adapter_for, normalize_base_url, probe_endpoint},
     domain::{
         AlertRecord, AppSettings, DashboardData, MetricPoint, NetworkInterfaceInfo, NodeDetail,
-        NodeStatus, NodeSummary, ScanCandidate, ScanRequest, UpsertNodeInput,
+        NodeSample, NodeStatus, NodeSummary, ScanCandidate, ScanRequest, UpsertNodeInput,
     },
     error::{AppError, AppResult},
     services::{discovery, monitor},
@@ -72,6 +72,56 @@ pub async fn upsert_node(
         .filter(|value| !value.trim().is_empty())
         .or(identity.name.clone())
         .unwrap_or_else(|| base_url.clone());
+
+    // Registration and monitoring used to be separate operations. If the
+    // background monitor was delayed or failed before saving its first sample,
+    // a successfully probed node remained "unknown" indefinitely. Capture a
+    // lightweight health sample as part of registration so every registered
+    // node immediately has an observable state.
+    let health_adapter = adapter_for(identity.kind, base_url.clone(), state.client.clone());
+    let health_started = Instant::now();
+    let health_result = health_adapter.fetch_health().await;
+    let health_latency_ms = health_started.elapsed().as_millis() as i64;
+    let latency_warning_ms = state.settings.read().await.latency_warning_ms;
+    let observed_at = chrono::Utc::now().timestamp_millis();
+    let initial_sample = match health_result {
+        Ok(health) => NodeSample {
+            observed_at,
+            reachable: health.reachable,
+            status: if !health.healthy || health_latency_ms as u64 >= latency_warning_ms {
+                NodeStatus::Warning
+            } else {
+                NodeStatus::Healthy
+            },
+            latency_ms: Some(health_latency_ms),
+            height: None,
+            finalized_height: None,
+            network_height: None,
+            lag: None,
+            peer_count: None,
+            chain_score: None,
+            api_status: health.api_status,
+            db_status: health.db_status,
+            nis_status_code: health.nis_status_code,
+            last_error: None,
+        },
+        Err(error) => NodeSample {
+            observed_at,
+            reachable: false,
+            status: NodeStatus::Warning,
+            latency_ms: Some(health_latency_ms),
+            height: None,
+            finalized_height: None,
+            network_height: None,
+            lag: None,
+            peer_count: None,
+            chain_score: None,
+            api_status: None,
+            db_status: None,
+            nis_status_code: None,
+            last_error: Some(error.to_string()),
+        },
+    };
     state
         .repository
         .upsert_node(
@@ -83,11 +133,16 @@ pub async fn upsert_node(
             input.favorite.unwrap_or(false),
         )
         .await?;
+    state.repository.save_sample(&id, &initial_sample).await?;
     let node = state.repository.get_stored_node(&id).await?;
     let app_for_monitor = app.clone();
     let state_for_monitor = state.inner().clone();
     tauri::async_runtime::spawn(async move {
-        let _ = monitor::monitor_node(app_for_monitor, state_for_monitor, node, true).await;
+        if let Err(error) =
+            monitor::monitor_node(app_for_monitor, state_for_monitor, node, true).await
+        {
+            tracing::warn!(%error, "initial node monitor failed");
+        }
     });
     state
         .repository
@@ -103,6 +158,24 @@ pub async fn delete_node(state: State<'_, AppState>, node_id: String) -> AppResu
     state.repository.delete_node(&node_id).await?;
     state.runtime.lock().await.remove(&node_id);
     Ok(())
+}
+
+#[tauri::command]
+pub async fn move_node(
+    state: State<'_, AppState>,
+    node_id: String,
+    direction: String,
+) -> AppResult<()> {
+    let offset = match direction.as_str() {
+        "up" => -1,
+        "down" => 1,
+        _ => {
+            return Err(AppError::Configuration(
+                "並び替え方向はupまたはdownを指定してください".into(),
+            ))
+        }
+    };
+    state.repository.move_node(&node_id, offset).await
 }
 
 #[tauri::command]

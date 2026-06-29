@@ -61,9 +61,9 @@ impl Repository {
 
     pub async fn list_stored_nodes(&self, enabled_only: bool) -> AppResult<Vec<StoredNode>> {
         let sql = if enabled_only {
-            "SELECT * FROM nodes WHERE enabled = 1 ORDER BY favorite DESC, display_name"
+            "SELECT * FROM nodes WHERE enabled = 1 ORDER BY sort_order, display_name COLLATE NOCASE, id"
         } else {
-            "SELECT * FROM nodes ORDER BY favorite DESC, display_name"
+            "SELECT * FROM nodes ORDER BY sort_order, display_name COLLATE NOCASE, id"
         };
         let rows = sqlx::query(sql).fetch_all(&self.pool).await?;
         rows.into_iter()
@@ -170,8 +170,8 @@ impl Repository {
         let now = chrono::Utc::now().timestamp_millis();
         let roles = serde_json::to_string(&identity.roles)?;
         sqlx::query(
-            "INSERT INTO nodes (id, display_name, kind, base_url, network, version, public_key, roles_json, rest_version, enabled, favorite, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO nodes (id, display_name, kind, base_url, network, version, public_key, roles_json, rest_version, enabled, favorite, sort_order, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort_order) + 1, 0) FROM nodes), ?, ?)
              ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name, kind=excluded.kind, base_url=excluded.base_url,
              network=excluded.network, version=excluded.version, public_key=excluded.public_key, roles_json=excluded.roles_json,
              rest_version=excluded.rest_version, enabled=excluded.enabled, favorite=excluded.favorite, updated_at=excluded.updated_at"
@@ -195,10 +195,46 @@ impl Repository {
     }
 
     pub async fn delete_node(&self, id: &str) -> AppResult<()> {
-        sqlx::query("DELETE FROM nodes WHERE id = ?")
+        let result = sqlx::query("DELETE FROM nodes WHERE id = ?")
             .bind(id)
             .execute(&self.pool)
             .await?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::NotFound(id.into()));
+        }
+        Ok(())
+    }
+
+    pub async fn move_node(&self, id: &str, offset: isize) -> AppResult<()> {
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query(
+            "SELECT id FROM nodes ORDER BY sort_order, display_name COLLATE NOCASE, id",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut ids = rows
+            .into_iter()
+            .map(|row| row.try_get::<String, _>("id"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let current = ids
+            .iter()
+            .position(|node_id| node_id == id)
+            .ok_or_else(|| AppError::NotFound(id.into()))?;
+        let target = current.checked_add_signed(offset);
+        let Some(target) = target.filter(|target| *target < ids.len()) else {
+            return Ok(());
+        };
+        ids.swap(current, target);
+        let now = chrono::Utc::now().timestamp_millis();
+        for (sort_order, node_id) in ids.iter().enumerate() {
+            sqlx::query("UPDATE nodes SET sort_order = ?, updated_at = ? WHERE id = ?")
+                .bind(sort_order as i64)
+                .bind(now)
+                .bind(node_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -226,7 +262,10 @@ impl Repository {
             .execute(&mut *tx)
             .await?;
         for peer in peers {
-            sqlx::query("INSERT INTO peers_current (node_id, peer_key, name, host, port, status, version, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+            // Public node APIs can return the same peer more than once. Keep
+            // the first occurrence (NIS1 orders active peers first) instead of
+            // aborting the entire monitor cycle on the composite primary key.
+            sqlx::query("INSERT OR IGNORE INTO peers_current (node_id, peer_key, name, host, port, status, version, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
                 .bind(node_id).bind(&peer.key).bind(&peer.name).bind(&peer.host).bind(peer.port.map(i64::from))
                 .bind(&peer.status).bind(&peer.version).bind(observed_at).execute(&mut *tx).await?;
         }
@@ -421,5 +460,151 @@ impl Repository {
             .await?;
         tx.commit().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn symbol_identity() -> NodeIdentity {
+        NodeIdentity {
+            kind: NodeKind::Symbol,
+            name: None,
+            network: Some("Symbol Mainnet".into()),
+            version: Some("1.0.0".into()),
+            public_key: None,
+            roles: Vec::new(),
+            rest_version: Some("2.4.0".into()),
+        }
+    }
+
+    async fn node_ids(repository: &Repository) -> Vec<String> {
+        repository
+            .list_stored_nodes(false)
+            .await
+            .expect("nodes should be listed")
+            .into_iter()
+            .map(|node| node.id)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn persists_manual_node_order() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let database = directory.path().join("node-watcher.db");
+        let repository = Repository::open(&database)
+            .await
+            .expect("repository should open");
+        let identity = symbol_identity();
+        for (id, name) in [
+            ("node-b", "Node B"),
+            ("node-a", "Node A"),
+            ("node-c", "Node C"),
+        ] {
+            repository
+                .upsert_node(
+                    id,
+                    &format!("http://{id}:3000"),
+                    name,
+                    &identity,
+                    true,
+                    false,
+                )
+                .await
+                .expect("node should be inserted");
+        }
+
+        assert_eq!(node_ids(&repository).await, ["node-b", "node-a", "node-c"]);
+        repository
+            .move_node("node-c", -1)
+            .await
+            .expect("node should move up");
+        assert_eq!(node_ids(&repository).await, ["node-b", "node-c", "node-a"]);
+
+        drop(repository);
+        let reopened = Repository::open(&database)
+            .await
+            .expect("repository should reopen");
+        assert_eq!(node_ids(&reopened).await, ["node-b", "node-c", "node-a"]);
+    }
+
+    #[tokio::test]
+    async fn move_node_handles_boundaries_and_unknown_nodes() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let repository = Repository::open(&directory.path().join("node-watcher.db"))
+            .await
+            .expect("repository should open");
+        repository
+            .upsert_node(
+                "node-a",
+                "http://node-a:3000",
+                "Node A",
+                &symbol_identity(),
+                true,
+                false,
+            )
+            .await
+            .expect("node should be inserted");
+
+        repository
+            .move_node("node-a", -1)
+            .await
+            .expect("moving the first node up should be a no-op");
+        assert_eq!(node_ids(&repository).await, ["node-a"]);
+        assert!(matches!(
+            repository.move_node("missing", 1).await,
+            Err(AppError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_peer_keys_do_not_abort_snapshot_replacement() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let repository = Repository::open(&directory.path().join("node-watcher.db"))
+            .await
+            .expect("repository should open");
+        repository
+            .upsert_node(
+                "node-a",
+                "http://node-a:3000",
+                "Node A",
+                &symbol_identity(),
+                true,
+                false,
+            )
+            .await
+            .expect("node should be inserted");
+        let peers = vec![
+            PeerInfo {
+                key: "duplicate-key".into(),
+                name: Some("Active peer".into()),
+                host: Some("192.0.2.1".into()),
+                port: Some(7900),
+                status: "active".into(),
+                version: None,
+            },
+            PeerInfo {
+                key: "duplicate-key".into(),
+                name: Some("Duplicate peer".into()),
+                host: Some("192.0.2.2".into()),
+                port: Some(7900),
+                status: "inactive".into(),
+                version: None,
+            },
+        ];
+
+        repository
+            .replace_peers("node-a", &peers, 1)
+            .await
+            .expect("duplicate peer keys should be accepted");
+        let detail = repository
+            .node_detail("node-a", false)
+            .await
+            .expect("node detail should load");
+
+        assert_eq!(detail.peers.len(), 1);
+        assert_eq!(detail.peers[0].name.as_deref(), Some("Active peer"));
+        assert_eq!(detail.peers[0].status, "active");
     }
 }

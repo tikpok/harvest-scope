@@ -7,8 +7,8 @@ pub enum AppError {
     InvalidUrl(String),
     #[error("ネットワークエラー: {0}")]
     Network(String),
-    #[error("ノードの種類を判定できませんでした")]
-    UnknownNode,
+    #[error("ノードの種類を判定できませんでした（Symbol: {symbol} / NIS1: {nis1}）")]
+    UnknownNode { symbol: String, nis1: String },
     #[error("APIレスポンスを解釈できません: {0}")]
     InvalidPayload(String),
     #[error("データベースエラー: {0}")]
