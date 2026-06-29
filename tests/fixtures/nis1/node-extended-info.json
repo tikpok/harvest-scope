@@ -1,0 +1,28 @@
+{
+  "node": {
+    "metaData": {
+      "features": 1,
+      "networkId": 104,
+      "application": "NIS",
+      "version": "0.6.101",
+      "platform": "OpenJDK on Linux"
+    },
+    "endpoint": {
+      "protocol": "http",
+      "port": 7890,
+      "host": "node.example.invalid"
+    },
+    "identity": {
+      "name": "Anonymous NIS1 Node",
+      "public-key": "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
+    }
+  },
+  "nisInfo": {
+    "currentTime": 1,
+    "application": "NIS",
+    "startTime": 1,
+    "version": "0.6.101",
+    "signer": null
+  }
+}
+

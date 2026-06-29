@@ -1,0 +1,35 @@
+node_modules/
+dist/
+.vite/
+coverage/
+*.tsbuildinfo
+*.log
+.env
+.env.*
+!.env.example
+
+# Rust / Tauri
+src-tauri/target/
+target/
+src-tauri/gen/
+
+# Local application data and secrets
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.pem
+*.key
+*.pfx
+*.p12
+*.crt
+
+# Generated installers and editor files
+*.msi
+*.msix
+*-setup.exe
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
