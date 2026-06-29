@@ -1,0 +1,77 @@
+mod nis1;
+mod symbol;
+
+use reqwest::Client;
+use url::Url;
+
+use crate::{
+    domain::{NodeAdapter, NodeKind},
+    error::{AppError, AppResult},
+};
+
+pub use nis1::Nis1Adapter;
+pub use symbol::SymbolAdapter;
+
+pub fn normalize_base_url(input: &str) -> AppResult<String> {
+    let mut url = Url::parse(input.trim())?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(AppError::InvalidUrl(
+            "HTTPまたはHTTPSだけを使用できます".into(),
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(AppError::InvalidUrl(
+            "URLに資格情報を含めることはできません".into(),
+        ));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(AppError::InvalidUrl(
+            "queryとfragmentは使用できません".into(),
+        ));
+    }
+    if url.host_str().is_none() {
+        return Err(AppError::InvalidUrl("ホスト名がありません".into()));
+    }
+    url.set_path("");
+    let normalized = url.as_str().trim_end_matches('/').to_string();
+    Ok(normalized)
+}
+
+pub fn adapter_for(kind: NodeKind, base_url: String, client: Client) -> Box<dyn NodeAdapter> {
+    match kind {
+        NodeKind::Symbol => Box::new(SymbolAdapter::new(base_url, client)),
+        NodeKind::Nis1 => Box::new(Nis1Adapter::new(base_url, client)),
+    }
+}
+
+pub async fn probe_endpoint(
+    base_url: &str,
+    client: Client,
+) -> AppResult<crate::domain::NodeIdentity> {
+    let base_url = normalize_base_url(base_url)?;
+    let symbol = SymbolAdapter::new(base_url.clone(), client.clone());
+    if let Ok(identity) = symbol.probe().await {
+        return Ok(identity);
+    }
+    let nis1 = Nis1Adapter::new(base_url, client);
+    if let Ok(identity) = nis1.probe().await {
+        return Ok(identity);
+    }
+    Err(AppError::UnknownNode)
+}
+
+pub(crate) fn string_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+pub(crate) fn u64_value(value: Option<&serde_json::Value>) -> Option<u64> {
+    value.and_then(|value| match value {
+        serde_json::Value::String(value) => value.parse().ok(),
+        serde_json::Value::Number(value) => value.as_u64(),
+        _ => None,
+    })
+}

@@ -1,0 +1,12 @@
+{
+  "scoreHigh": "1",
+  "scoreLow": "1000",
+  "height": "1000000",
+  "latestFinalizedBlock": {
+    "finalizationEpoch": 100,
+    "finalizationPoint": 20,
+    "height": "999900",
+    "hash": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+  }
+}
+

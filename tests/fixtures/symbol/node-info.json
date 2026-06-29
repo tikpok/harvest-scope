@@ -1,0 +1,11 @@
+{
+  "version": 16777984,
+  "publicKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  "networkGenerationHashSeed": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+  "roles": 3,
+  "port": 7900,
+  "networkIdentifier": 104,
+  "host": "node.example.invalid",
+  "friendlyName": "Anonymous Symbol Node"
+}
+
