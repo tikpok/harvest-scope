@@ -50,14 +50,19 @@ pub async fn probe_endpoint(
 ) -> AppResult<crate::domain::NodeIdentity> {
     let base_url = normalize_base_url(base_url)?;
     let symbol = SymbolAdapter::new(base_url.clone(), client.clone());
-    if let Ok(identity) = symbol.probe().await {
-        return Ok(identity);
-    }
+    let symbol_error = match symbol.probe().await {
+        Ok(identity) => return Ok(identity),
+        Err(error) => error,
+    };
     let nis1 = Nis1Adapter::new(base_url, client);
-    if let Ok(identity) = nis1.probe().await {
-        return Ok(identity);
-    }
-    Err(AppError::UnknownNode)
+    let nis1_error = match nis1.probe().await {
+        Ok(identity) => return Ok(identity),
+        Err(error) => error,
+    };
+    Err(AppError::UnknownNode {
+        symbol: symbol_error.to_string(),
+        nis1: nis1_error.to_string(),
+    })
 }
 
 pub(crate) fn string_value(value: &serde_json::Value) -> Option<String> {

@@ -74,6 +74,7 @@ pub fn run() {
             commands::get_dashboard,
             commands::upsert_node,
             commands::delete_node,
+            commands::move_node,
             commands::pause_node,
             commands::resume_node,
             commands::refresh_node,

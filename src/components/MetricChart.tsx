@@ -15,6 +15,7 @@ export function MetricChart({ data }: { data: MetricPoint[] }) {
     const chart = echarts.init(ref.current);
     chart.setOption({
       backgroundColor: "transparent",
+      color: ["#55d6be", "#73a9ff", "#ffca5c"],
       animationDuration: 350,
       tooltip: { trigger: "axis" },
       legend: { textStyle: { color: "#91a3b8" }, data: ["REST応答", "ピア数", "同期遅延"] },
