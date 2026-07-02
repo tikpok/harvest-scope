@@ -41,7 +41,7 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 ```powershell
 # package.json、package-lock.json、Cargo.toml、Cargo.lock、tauri.conf.jsonを一括更新
-npm run version:set -- 0.1.4
+npm run version:set -- 0.1.5
 
 # 5ファイルの版番号が一致していることを確認
 npm run version:check
