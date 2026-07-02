@@ -2,6 +2,8 @@ export type NodeKind = "symbol" | "nis1";
 export type NodeStatus = "unknown" | "healthy" | "warning" | "critical" | "offline";
 export type AlertSeverity = "warning" | "critical";
 export type AlertState = "open" | "acknowledged" | "resolved";
+export type DiagnosticStatus = "passed" | "warning" | "failed";
+export type DiagnosticCheckStatus = "pass" | "warning" | "fail" | "skipped";
 
 export interface NodeSummary {
   id: string;
@@ -38,6 +40,52 @@ export interface PeerInfo {
   port: number | null;
   status: string;
   version: string | null;
+}
+
+export interface TopologyNode {
+  id: string;
+  label: string;
+  kind: NodeKind;
+  network: string | null;
+  status: NodeStatus;
+  registered: boolean;
+  host: string | null;
+  port: number | null;
+  version: string | null;
+  roles: string[];
+  peerStatus: string | null;
+  websocketConnected: boolean;
+  apiStatus: string | null;
+  dbStatus: string | null;
+  nisStatusCode: number | null;
+  height: string | null;
+  finalizedHeight: string | null;
+  lag: string | null;
+}
+
+export interface TopologyEdge {
+  id: string;
+  source: string;
+  target: string;
+  status: string;
+}
+
+export interface TopologySnapshot {
+  nodes: TopologyNode[];
+  edges: TopologyEdge[];
+  observedAt: number;
+}
+
+export type NetworkEventKind = "block" | "finalizedBlock" | "pollUpdate";
+
+export interface NetworkEvent {
+  id: string;
+  nodeId: string;
+  kind: NetworkEventKind;
+  height: string | null;
+  hash: string | null;
+  observedAt: number;
+  source: "websocket" | "polling";
 }
 
 export interface NodeDetail {
@@ -78,6 +126,26 @@ export interface AlertRecord {
   occurrenceCount: number;
 }
 
+export interface DiagnosticCheck {
+  key: string;
+  label: string;
+  status: DiagnosticCheckStatus;
+  message: string;
+  recommendation: string | null;
+  durationMs: number;
+}
+
+export interface DiagnosticRun {
+  id: string;
+  nodeId: string;
+  alertId: string | null;
+  startedAt: number;
+  completedAt: number;
+  status: DiagnosticStatus;
+  summary: string;
+  checks: DiagnosticCheck[];
+}
+
 export interface AppSettings {
   healthIntervalSeconds: number;
   chainIntervalSeconds: number;
@@ -90,6 +158,7 @@ export interface AppSettings {
   notificationEnabled: boolean;
   backgroundMonitoring: boolean;
   autostartEnabled: boolean;
+  onboardingCompleted: boolean;
   theme: "system" | "dark" | "light";
 }
 
@@ -121,4 +190,3 @@ export interface UpsertNodeInput {
   enabled?: boolean;
   favorite?: boolean;
 }
-

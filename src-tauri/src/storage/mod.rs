@@ -1,14 +1,15 @@
-use std::{path::Path, str::FromStr, time::Duration};
+use std::{collections::HashMap, path::Path, str::FromStr, time::Duration};
 
 use sqlx::{
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow},
     Row, SqlitePool,
 };
 
 use crate::{
     domain::{
-        AlertRecord, AppSettings, MetricPoint, NodeDetail, NodeIdentity, NodeKind, NodeSample,
-        NodeStatus, NodeSummary, PeerInfo, StoredNode,
+        AlertMutation, AlertRecord, AppSettings, DiagnosticRun, DiagnosticStatus, MetricPoint,
+        NodeDetail, NodeIdentity, NodeKind, NodeSample, NodeStatus, NodeSummary, PeerInfo,
+        StoredNode,
     },
     error::{AppError, AppResult},
 };
@@ -16,6 +17,13 @@ use crate::{
 #[derive(Clone)]
 pub struct Repository {
     pool: SqlitePool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TopologyHealth {
+    pub api_status: Option<String>,
+    pub db_status: Option<String>,
+    pub nis_status_code: Option<i64>,
 }
 
 fn parse_kind(value: &str) -> AppResult<NodeKind> {
@@ -34,6 +42,38 @@ fn parse_status(value: &str) -> NodeStatus {
 
 fn to_i64(value: Option<u64>) -> Option<i64> {
     value.and_then(|value| i64::try_from(value).ok())
+}
+
+fn alert_from_row(row: &SqliteRow) -> AppResult<AlertRecord> {
+    Ok(AlertRecord {
+        id: row.try_get("id")?,
+        node_id: row.try_get("node_id")?,
+        node_name: row.try_get("display_name")?,
+        alert_type: row.try_get("alert_type")?,
+        severity: row.try_get("severity")?,
+        state: row.try_get("state")?,
+        message: row.try_get("message")?,
+        raised_at: row.try_get("raised_at")?,
+        updated_at: row.try_get("updated_at")?,
+        acknowledged_at: row.try_get("acknowledged_at")?,
+        resolved_at: row.try_get("resolved_at")?,
+        occurrence_count: row.try_get("occurrence_count")?,
+    })
+}
+
+fn diagnostic_from_row(row: &SqliteRow) -> AppResult<DiagnosticRun> {
+    let status = DiagnosticStatus::try_from(row.try_get::<String, _>("status")?.as_str())
+        .map_err(AppError::Configuration)?;
+    Ok(DiagnosticRun {
+        id: row.try_get("id")?,
+        node_id: row.try_get("node_id")?,
+        alert_id: row.try_get("alert_id")?,
+        started_at: row.try_get("started_at")?,
+        completed_at: row.try_get("completed_at")?,
+        status,
+        summary: row.try_get("summary")?,
+        checks: serde_json::from_str(&row.try_get::<String, _>("checks_json")?)?,
+    })
 }
 
 impl Repository {
@@ -273,6 +313,57 @@ impl Repository {
         Ok(())
     }
 
+    pub async fn list_peer_connections(&self) -> AppResult<Vec<(String, PeerInfo)>> {
+        let rows = sqlx::query(
+            "SELECT node_id, peer_key, name, host, port, status, version FROM peers_current ORDER BY node_id, status, name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("node_id")?,
+                    PeerInfo {
+                        key: row.try_get("peer_key")?,
+                        name: row.try_get("name")?,
+                        host: row.try_get("host")?,
+                        port: row
+                            .try_get::<Option<i64>, _>("port")?
+                            .and_then(|value| u16::try_from(value).ok()),
+                        status: row.try_get("status")?,
+                        version: row.try_get("version")?,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    pub async fn latest_topology_health(&self) -> AppResult<HashMap<String, TopologyHealth>> {
+        let rows = sqlx::query(
+            "SELECT sample.node_id, sample.api_status, sample.db_status, sample.nis_status_code
+             FROM node_samples sample
+             JOIN (
+               SELECT node_id, MAX(observed_at) AS observed_at
+               FROM node_samples
+               GROUP BY node_id
+             ) latest ON latest.node_id = sample.node_id AND latest.observed_at = sample.observed_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("node_id")?,
+                    TopologyHealth {
+                        api_status: row.try_get("api_status")?,
+                        db_status: row.try_get("db_status")?,
+                        nis_status_code: row.try_get("nis_status_code")?,
+                    },
+                ))
+            })
+            .collect()
+    }
+
     pub async fn node_detail(&self, id: &str, websocket_connected: bool) -> AppResult<NodeDetail> {
         let stored = self.get_stored_node(id).await?;
         let summary = self
@@ -367,9 +458,18 @@ impl Repository {
             .fetch_optional(&self.pool)
             .await?;
         match row {
-            Some(row) => Ok(
-                serde_json::from_str(&row.try_get::<String, _>("value_json")?).unwrap_or_default(),
-            ),
+            Some(row) => {
+                let raw = row.try_get::<String, _>("value_json")?;
+                let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+                // Existing installations predate onboarding. Mark only those
+                // records complete while preserving every previously saved setting.
+                if let Some(object) = value.as_object_mut() {
+                    object
+                        .entry("onboardingCompleted")
+                        .or_insert(serde_json::Value::Bool(true));
+                }
+                Ok(serde_json::from_value(value).unwrap_or_default())
+            }
             None => Ok(AppSettings::default()),
         }
     }
@@ -383,24 +483,16 @@ impl Repository {
     pub async fn list_alerts(&self) -> AppResult<Vec<AlertRecord>> {
         let rows = sqlx::query("SELECT a.*, n.display_name FROM alerts a JOIN nodes n ON n.id = a.node_id ORDER BY CASE a.state WHEN 'open' THEN 0 WHEN 'acknowledged' THEN 1 ELSE 2 END, a.updated_at DESC LIMIT 1000")
             .fetch_all(&self.pool).await?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(AlertRecord {
-                    id: row.try_get("id")?,
-                    node_id: row.try_get("node_id")?,
-                    node_name: row.try_get("display_name")?,
-                    alert_type: row.try_get("alert_type")?,
-                    severity: row.try_get("severity")?,
-                    state: row.try_get("state")?,
-                    message: row.try_get("message")?,
-                    raised_at: row.try_get("raised_at")?,
-                    updated_at: row.try_get("updated_at")?,
-                    acknowledged_at: row.try_get("acknowledged_at")?,
-                    resolved_at: row.try_get("resolved_at")?,
-                    occurrence_count: row.try_get("occurrence_count")?,
-                })
-            })
-            .collect()
+        rows.iter().map(alert_from_row).collect()
+    }
+
+    pub async fn get_alert(&self, id: &str) -> AppResult<AlertRecord> {
+        let row = sqlx::query("SELECT a.*, n.display_name FROM alerts a JOIN nodes n ON n.id = a.node_id WHERE a.id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| AppError::NotFound(id.into()))?;
+        alert_from_row(&row)
     }
 
     pub async fn acknowledge_alert(&self, id: &str) -> AppResult<()> {
@@ -416,27 +508,87 @@ impl Repository {
         alert_type: &str,
         severity: &str,
         message: &str,
-    ) -> AppResult<bool> {
+    ) -> AppResult<AlertMutation> {
         let now = chrono::Utc::now().timestamp_millis();
         if let Some(row) = sqlx::query("SELECT id, severity FROM alerts WHERE node_id=? AND alert_type=? AND state!='resolved' ORDER BY raised_at DESC LIMIT 1")
             .bind(node_id).bind(alert_type).fetch_optional(&self.pool).await? {
             let id: String = row.try_get("id")?;
             let old_severity: String = row.try_get("severity")?;
             sqlx::query("UPDATE alerts SET severity=?, message=?, updated_at=?, occurrence_count=occurrence_count+1 WHERE id=?")
-                .bind(severity).bind(message).bind(now).bind(id).execute(&self.pool).await?;
-            return Ok(old_severity != severity);
+                .bind(severity).bind(message).bind(now).bind(&id).execute(&self.pool).await?;
+            return Ok(AlertMutation {
+                alert_id: id,
+                changed: old_severity != severity,
+            });
         }
+        let id = uuid::Uuid::new_v4().to_string();
         sqlx::query("INSERT INTO alerts (id,node_id,alert_type,severity,state,message,raised_at,updated_at,occurrence_count) VALUES (?,?,?,?, 'open', ?,?,?,1)")
-            .bind(uuid::Uuid::new_v4().to_string()).bind(node_id).bind(alert_type).bind(severity).bind(message).bind(now).bind(now)
+            .bind(&id).bind(node_id).bind(alert_type).bind(severity).bind(message).bind(now).bind(now)
             .execute(&self.pool).await?;
-        Ok(true)
+        Ok(AlertMutation {
+            alert_id: id,
+            changed: true,
+        })
     }
 
-    pub async fn resolve_alert(&self, node_id: &str, alert_type: &str) -> AppResult<bool> {
+    pub async fn resolve_alert(
+        &self,
+        node_id: &str,
+        alert_type: &str,
+    ) -> AppResult<Option<String>> {
         let now = chrono::Utc::now().timestamp_millis();
+        let id = sqlx::query("SELECT id FROM alerts WHERE node_id=? AND alert_type=? AND state!='resolved' ORDER BY raised_at DESC LIMIT 1")
+            .bind(node_id)
+            .bind(alert_type)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| row.try_get::<String, _>("id"))
+            .transpose()?;
+        let Some(id) = id else {
+            return Ok(None);
+        };
         let result = sqlx::query("UPDATE alerts SET state='resolved', resolved_at=?, updated_at=? WHERE node_id=? AND alert_type=? AND state!='resolved'")
             .bind(now).bind(now).bind(node_id).bind(alert_type).execute(&self.pool).await?;
-        Ok(result.rows_affected() > 0)
+        Ok((result.rows_affected() > 0).then_some(id))
+    }
+
+    pub async fn save_diagnostic_run(&self, run: &DiagnosticRun) -> AppResult<()> {
+        sqlx::query("INSERT INTO diagnostic_runs (id,node_id,alert_id,started_at,completed_at,status,summary,checks_json) VALUES (?,?,?,?,?,?,?,?)")
+            .bind(&run.id)
+            .bind(&run.node_id)
+            .bind(&run.alert_id)
+            .bind(run.started_at)
+            .bind(run.completed_at)
+            .bind(run.status.as_str())
+            .bind(&run.summary)
+            .bind(serde_json::to_string(&run.checks)?)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_diagnostic_run(&self, id: &str) -> AppResult<DiagnosticRun> {
+        let row = sqlx::query("SELECT * FROM diagnostic_runs WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| AppError::NotFound(id.into()))?;
+        diagnostic_from_row(&row)
+    }
+
+    pub async fn list_node_diagnostics(
+        &self,
+        node_id: &str,
+        limit: usize,
+    ) -> AppResult<Vec<DiagnosticRun>> {
+        let rows = sqlx::query(
+            "SELECT * FROM diagnostic_runs WHERE node_id = ? ORDER BY completed_at DESC LIMIT ?",
+        )
+        .bind(node_id)
+        .bind(limit.min(100) as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(diagnostic_from_row).collect()
     }
 
     pub async fn compact(&self, settings: &AppSettings) -> AppResult<()> {
@@ -451,6 +603,10 @@ impl Repository {
              FROM node_samples WHERE observed_at < ? GROUP BY node_id, (observed_at / 3600000)"
         ).bind(raw_cutoff).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM node_samples WHERE observed_at < ?")
+            .bind(raw_cutoff)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM diagnostic_runs WHERE completed_at < ?")
             .bind(raw_cutoff)
             .execute(&mut *tx)
             .await?;
@@ -606,5 +762,110 @@ mod tests {
         assert_eq!(detail.peers.len(), 1);
         assert_eq!(detail.peers[0].name.as_deref(), Some("Active peer"));
         assert_eq!(detail.peers[0].status, "active");
+    }
+
+    #[tokio::test]
+    async fn alert_mutations_return_a_stable_alert_id() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let repository = Repository::open(&directory.path().join("node-watcher.db"))
+            .await
+            .expect("repository should open");
+        repository
+            .upsert_node(
+                "node-a",
+                "http://node-a:3000",
+                "Node A",
+                &symbol_identity(),
+                true,
+                false,
+            )
+            .await
+            .expect("node should be inserted");
+
+        let raised = repository
+            .raise_alert("node-a", "offline", "critical", "offline")
+            .await
+            .expect("alert should be raised");
+        assert!(raised.changed);
+        let repeated = repository
+            .raise_alert("node-a", "offline", "critical", "offline")
+            .await
+            .expect("alert should be updated");
+        assert!(!repeated.changed);
+        assert_eq!(repeated.alert_id, raised.alert_id);
+        assert_eq!(
+            repository.resolve_alert("node-a", "offline").await.unwrap(),
+            Some(raised.alert_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn preserves_legacy_settings_and_skips_onboarding() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let repository = Repository::open(&directory.path().join("node-watcher.db"))
+            .await
+            .expect("repository should open");
+        sqlx::query("INSERT INTO settings (key,value_json,updated_at) VALUES ('app', ?, 1)")
+            .bind(r#"{"healthIntervalSeconds":25,"backgroundMonitoring":false,"autostartEnabled":true}"#)
+            .execute(&repository.pool)
+            .await
+            .unwrap();
+
+        let settings = repository.load_settings().await.unwrap();
+        assert_eq!(settings.health_interval_seconds, 25);
+        assert!(!settings.background_monitoring);
+        assert!(settings.autostart_enabled);
+        assert!(settings.onboarding_completed);
+    }
+
+    #[tokio::test]
+    async fn persists_and_expires_diagnostic_runs() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let repository = Repository::open(&directory.path().join("node-watcher.db"))
+            .await
+            .expect("repository should open");
+        repository
+            .upsert_node(
+                "node-a",
+                "http://node-a:3000",
+                "Node A",
+                &symbol_identity(),
+                true,
+                false,
+            )
+            .await
+            .expect("node should be inserted");
+        let run = DiagnosticRun {
+            id: "run-a".into(),
+            node_id: "node-a".into(),
+            alert_id: None,
+            started_at: 0,
+            completed_at: 0,
+            status: DiagnosticStatus::Failed,
+            summary: "failed".into(),
+            checks: vec![],
+        };
+        repository.save_diagnostic_run(&run).await.unwrap();
+        assert_eq!(
+            repository
+                .list_node_diagnostics("node-a", 20)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        repository
+            .compact(&AppSettings {
+                raw_retention_days: 1,
+                ..AppSettings::default()
+            })
+            .await
+            .unwrap();
+        assert!(repository
+            .list_node_diagnostics("node-a", 20)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

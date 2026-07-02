@@ -5,10 +5,11 @@
 ## 主な機能
 
 - Symbol / NIS1 REST APIによるノード状態・チェーン高・ピア監視
-- Symbol WebSocketによるブロック・最終化イベントの即時反映
+- Symbol WebSocketによるブロック・ファイナライズイベントの即時反映
 - 明示したCIDRだけを対象にするLANスキャン
 - SQLiteによる履歴保存、時系列グラフ、アラート
-- Windows通知、トレイ常駐、自動起動設定
+- 状態別トレイ常駐、障害詳細へ移動できるWindows通知、自動起動設定
+- DNS / TCP / REST / WebSocket / StateHashのワンクリック診断と診断履歴
 - UTF-8 BOM付きCSVエクスポート
 
 秘密鍵、SSH資格情報、トランザクション送信、ホスト再起動は扱いません。
@@ -34,6 +35,20 @@ npm run build
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
+## バージョン管理
+
+アプリの版番号はSemantic Versioning（`MAJOR.MINOR.PATCH`）で管理します。現在の版はサイドバー下部に常時表示されます。
+
+```powershell
+# package.json、package-lock.json、Cargo.toml、Cargo.lock、tauri.conf.jsonを一括更新
+npm run version:set -- 0.1.4
+
+# 5ファイルの版番号が一致していることを確認
+npm run version:check
+```
+
+`npm run build`でもビルド前に版番号の一致を自動確認します。
+
 ## データ
 
 監視DBとログはリポジトリ外のWindowsローカルアプリケーションデータ領域へ保存します。実ノードの内部IPやAPIレスポンスはテストデータへ含めないでください。
@@ -43,4 +58,3 @@ cargo test --manifest-path src-tauri/Cargo.toml
 Copyright (c) 2026 tikpok. All rights reserved.
 
 このリポジトリは非公開です。明示的な許諾なく利用・複製・再配布できません。
-

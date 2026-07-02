@@ -1,17 +1,22 @@
-use std::{sync::atomic::Ordering, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::atomic::Ordering,
+    time::Instant,
+};
 
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_dialog::DialogExt;
 
 use crate::{
     adapters::{adapter_for, normalize_base_url, probe_endpoint},
     domain::{
-        AlertRecord, AppSettings, DashboardData, MetricPoint, NetworkInterfaceInfo, NodeDetail,
-        NodeSample, NodeStatus, NodeSummary, ScanCandidate, ScanRequest, UpsertNodeInput,
+        AlertRecord, AppSettings, DashboardData, DiagnosticRun, MetricPoint, NetworkEvent,
+        NetworkInterfaceInfo, NodeDetail, NodeSample, NodeStatus, NodeSummary, ScanCandidate,
+        ScanRequest, TopologyEdge, TopologyNode, TopologySnapshot, UpsertNodeInput,
     },
     error::{AppError, AppResult},
-    services::{discovery, monitor},
+    services::{desktop, diagnostic as diagnostic_service, discovery, monitor},
     state::AppState,
 };
 
@@ -43,6 +48,167 @@ pub async fn get_dashboard(state: State<'_, AppState>) -> AppResult<DashboardDat
             .count(),
         nodes,
     })
+}
+
+#[tauri::command]
+pub async fn get_topology(state: State<'_, AppState>) -> AppResult<TopologySnapshot> {
+    let summaries = state.repository.list_nodes().await?;
+    let stored = state.repository.list_stored_nodes(false).await?;
+    let connections = state.repository.list_peer_connections().await?;
+    let health_by_node = state.repository.latest_topology_health().await?;
+    let websocket_by_node = state
+        .runtime
+        .lock()
+        .await
+        .iter()
+        .map(|(id, runtime)| (id.clone(), runtime.websocket_connected))
+        .collect::<HashMap<_, _>>();
+
+    let stored_by_id = stored
+        .iter()
+        .map(|node| (node.id.clone(), node))
+        .collect::<HashMap<_, _>>();
+    let public_keys = stored
+        .iter()
+        .filter_map(|node| {
+            node.public_key
+                .as_ref()
+                .map(|key| (key.to_ascii_lowercase(), node.id.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut host_candidates: HashMap<String, Vec<String>> = HashMap::new();
+    for node in &stored {
+        if let Ok(url) = url::Url::parse(&node.base_url) {
+            if let Some(host) = url.host_str() {
+                host_candidates
+                    .entry(host.to_ascii_lowercase())
+                    .or_default()
+                    .push(node.id.clone());
+            }
+        }
+    }
+
+    let mut nodes = summaries
+        .into_iter()
+        .map(|node| {
+            let stored = stored_by_id.get(&node.id);
+            let parsed_url = stored.and_then(|stored| url::Url::parse(&stored.base_url).ok());
+            let host = parsed_url
+                .as_ref()
+                .and_then(|url| url.host_str().map(str::to_owned));
+            let port = parsed_url
+                .as_ref()
+                .and_then(url::Url::port_or_known_default);
+            let health = health_by_node.get(&node.id).cloned().unwrap_or_default();
+            TopologyNode {
+                websocket_connected: websocket_by_node.get(&node.id).copied().unwrap_or(false),
+                version: stored.and_then(|stored| stored.version.clone()),
+                roles: stored
+                    .map(|stored| stored.roles.clone())
+                    .unwrap_or_default(),
+                id: node.id,
+                label: node.display_name,
+                kind: node.kind,
+                network: node.network,
+                status: node.status,
+                registered: true,
+                host,
+                port,
+                peer_status: None,
+                api_status: health.api_status,
+                db_status: health.db_status,
+                nis_status_code: health.nis_status_code,
+                height: node.height,
+                finalized_height: node.finalized_height,
+                lag: node.lag,
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut external_nodes = HashSet::new();
+    let mut edge_ids = HashSet::new();
+    let mut edges = Vec::new();
+
+    for (source, peer) in connections {
+        let Some(source_node) = stored_by_id.get(&source) else {
+            continue;
+        };
+        let target = public_keys
+            .get(&peer.key.to_ascii_lowercase())
+            .cloned()
+            .or_else(|| {
+                peer.host.as_ref().and_then(|host| {
+                    let candidates = host_candidates.get(&host.to_ascii_lowercase())?;
+                    (candidates.len() == 1).then(|| candidates[0].clone())
+                })
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "external:{}:{}",
+                    source_node.kind.as_str(),
+                    peer.key.to_ascii_lowercase()
+                )
+            });
+        if target == source {
+            continue;
+        }
+        if target.starts_with("external:") && external_nodes.insert(target.clone()) {
+            let label = peer
+                .name
+                .clone()
+                .or_else(|| peer.host.clone())
+                .unwrap_or_else(|| peer.key.chars().take(12).collect());
+            nodes.push(TopologyNode {
+                id: target.clone(),
+                label,
+                kind: source_node.kind,
+                network: source_node.network.clone(),
+                status: NodeStatus::Unknown,
+                registered: false,
+                host: peer.host.clone(),
+                port: peer.port,
+                version: peer.version.clone(),
+                roles: Vec::new(),
+                peer_status: Some(peer.status.clone()),
+                websocket_connected: false,
+                api_status: None,
+                db_status: None,
+                nis_status_code: None,
+                height: None,
+                finalized_height: None,
+                lag: None,
+            });
+        }
+        let (left, right) = if source <= target {
+            (source.clone(), target.clone())
+        } else {
+            (target.clone(), source.clone())
+        };
+        let edge_id = format!("{left}|{right}");
+        if edge_ids.insert(edge_id.clone()) {
+            edges.push(TopologyEdge {
+                id: edge_id,
+                source: left,
+                target: right,
+                status: peer.status,
+            });
+        }
+    }
+
+    Ok(TopologySnapshot {
+        nodes,
+        edges,
+        observed_at: chrono::Utc::now().timestamp_millis(),
+    })
+}
+
+#[tauri::command]
+pub async fn get_recent_network_events(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> AppResult<Vec<NetworkEvent>> {
+    let events = state.network_events.lock().await;
+    let limit = limit.unwrap_or(50).min(200);
+    Ok(events.iter().rev().take(limit).cloned().collect())
 }
 
 #[tauri::command]
@@ -144,19 +310,27 @@ pub async fn upsert_node(
             tracing::warn!(%error, "initial node monitor failed");
         }
     });
-    state
+    let summary = state
         .repository
         .list_nodes()
         .await?
         .into_iter()
         .find(|node| node.id == id)
-        .ok_or_else(|| AppError::NotFound(id))
+        .ok_or_else(|| AppError::NotFound(id))?;
+    let _ = app.emit("topology-updated", &summary.id);
+    Ok(summary)
 }
 
 #[tauri::command]
-pub async fn delete_node(state: State<'_, AppState>, node_id: String) -> AppResult<()> {
+pub async fn delete_node(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    node_id: String,
+) -> AppResult<()> {
     state.repository.delete_node(&node_id).await?;
     state.runtime.lock().await.remove(&node_id);
+    let _ = app.emit("topology-updated", &node_id);
+    desktop::refresh_tray(&app, &state).await;
     Ok(())
 }
 
@@ -179,8 +353,14 @@ pub async fn move_node(
 }
 
 #[tauri::command]
-pub async fn pause_node(state: State<'_, AppState>, node_id: String) -> AppResult<()> {
-    state.repository.set_enabled(&node_id, false).await
+pub async fn pause_node(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    node_id: String,
+) -> AppResult<()> {
+    state.repository.set_enabled(&node_id, false).await?;
+    desktop::refresh_tray(&app, &state).await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -258,8 +438,47 @@ pub async fn list_alerts(state: State<'_, AppState>) -> AppResult<Vec<AlertRecor
 }
 
 #[tauri::command]
+pub async fn get_alert(state: State<'_, AppState>, alert_id: String) -> AppResult<AlertRecord> {
+    state.repository.get_alert(&alert_id).await
+}
+
+#[tauri::command]
 pub async fn acknowledge_alert(state: State<'_, AppState>, alert_id: String) -> AppResult<()> {
     state.repository.acknowledge_alert(&alert_id).await
+}
+
+#[tauri::command]
+pub async fn run_node_diagnostic(
+    state: State<'_, AppState>,
+    node_id: String,
+    alert_id: Option<String>,
+) -> AppResult<DiagnosticRun> {
+    diagnostic_service::run(state.inner().clone(), node_id, alert_id).await
+}
+
+#[tauri::command]
+pub async fn get_diagnostic_run(
+    state: State<'_, AppState>,
+    run_id: String,
+) -> AppResult<DiagnosticRun> {
+    state.repository.get_diagnostic_run(&run_id).await
+}
+
+#[tauri::command]
+pub async fn list_node_diagnostics(
+    state: State<'_, AppState>,
+    node_id: String,
+    limit: Option<usize>,
+) -> AppResult<Vec<DiagnosticRun>> {
+    state
+        .repository
+        .list_node_diagnostics(&node_id, limit.unwrap_or(20))
+        .await
+}
+
+#[tauri::command]
+pub async fn take_pending_navigation(state: State<'_, AppState>) -> AppResult<Option<String>> {
+    Ok(state.pending_navigation.lock().await.take())
 }
 
 #[tauri::command]
@@ -300,6 +519,7 @@ pub async fn update_settings(
     state.repository.save_settings(&settings).await?;
     state.set_background_monitoring(settings.background_monitoring);
     *state.settings.write().await = settings.clone();
+    desktop::refresh_tray(&app, &state).await;
     Ok(settings)
 }
 
@@ -395,7 +615,7 @@ pub async fn export_csv(
                 "時刻UTCms".into(),
                 "到達".into(),
                 "高さ".into(),
-                "最終化高".into(),
+                "ファイナライズ高".into(),
                 "同期遅延".into(),
                 "ピア数".into(),
                 "REST応答ms".into(),

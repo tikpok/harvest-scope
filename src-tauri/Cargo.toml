@@ -1,6 +1,6 @@
 [package]
 name = "node-watcher"
-version = "0.1.0"
+version = "0.1.4"
 description = "Windows GUI monitor for Symbol and NEM NIS1 nodes"
 authors = ["tikpok"]
 edition = "2021"
@@ -38,6 +38,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5"
 uuid = { version = "1", features = ["v4", "serde"] }
 
+[target.'cfg(windows)'.dependencies]
+tauri-winrt-notification = "0.7.2"
+
 [dev-dependencies]
 tempfile = "3"
-

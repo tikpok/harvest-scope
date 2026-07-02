@@ -5,21 +5,41 @@ use std::{
 
 use rand::Rng;
 use tauri::{AppHandle, Emitter};
-use tauri_plugin_notification::NotificationExt;
 
 use crate::{
     adapters::adapter_for,
-    domain::{NodeSample, NodeStatus, StoredNode},
+    domain::{NetworkEvent, NodeKind, NodeSample, NodeStatus, StoredNode},
     error::{AppError, AppResult},
     state::AppState,
 };
 
-use super::websocket;
+use super::{desktop, websocket};
 
-async fn notify(app: &AppHandle, state: &AppState, title: &str, body: &str) {
-    if state.settings.read().await.notification_enabled {
-        let _ = app.notification().builder().title(title).body(body).show();
+const RESUME_LATE_THRESHOLD_MS: i64 = 15_000;
+const RESUME_GRACE_MS: i64 = 90_000;
+const SUSPENDED_REQUEST_THRESHOLD: Duration = Duration::from_secs(10);
+
+fn wake_was_late(expected_at: i64, actual_at: i64) -> bool {
+    actual_at.saturating_sub(expected_at) >= RESUME_LATE_THRESHOLD_MS
+}
+
+fn latency_sample_is_slow(health_succeeded: bool, latency_ms: i64, warning_ms: u64) -> bool {
+    health_succeeded && latency_ms as u64 >= warning_ms
+}
+
+async fn enter_resume_grace(state: &AppState, now: i64, reason: &str) {
+    if !state.begin_resume_grace(now, RESUME_GRACE_MS) {
+        return;
     }
+
+    for runtime in state.runtime.lock().await.values_mut() {
+        runtime.reset_after_resume(now);
+    }
+    state.state_hash_mismatches.lock().await.clear();
+    tracing::info!(
+        reason,
+        "system resume detected; alert evaluation is temporarily paused"
+    );
 }
 
 async fn update_alert(
@@ -31,15 +51,16 @@ async fn update_alert(
     severity: &str,
     message: &str,
 ) -> AppResult<()> {
-    let changed = if active {
-        state
+    let mutation = if active {
+        let mutation = state
             .repository
             .raise_alert(&node.id, alert_type, severity, message)
-            .await?
+            .await?;
+        mutation.changed.then_some(mutation.alert_id)
     } else {
         state.repository.resolve_alert(&node.id, alert_type).await?
     };
-    if changed {
+    if let Some(alert_id) = mutation {
         let title = if active {
             format!(
                 "{}: {}",
@@ -53,8 +74,9 @@ async fn update_alert(
         } else {
             format!("復旧: {}", node.display_name)
         };
-        notify(app, state, &title, message).await;
+        desktop::notify_alert(app.clone(), state.clone(), &title, message, alert_id).await;
         let _ = app.emit("alert-changed", &node.id);
+        desktop::refresh_tray(app, state).await;
     }
     Ok(())
 }
@@ -78,7 +100,15 @@ async fn monitor_node_inner(
     }
     let started = Instant::now();
     let health_result = adapter.fetch_health().await;
-    let latency_ms = started.elapsed().as_millis() as i64;
+    let request_elapsed = started.elapsed();
+    let latency_ms = request_elapsed.as_millis() as i64;
+    let evaluation_now = chrono::Utc::now().timestamp_millis();
+    if request_elapsed >= SUSPENDED_REQUEST_THRESHOLD {
+        enter_resume_grace(&state, evaluation_now, "health request was suspended").await;
+    }
+    let resume_grace = state.in_resume_grace(evaluation_now);
+    let mut poll_event = None;
+    let mut topology_changed = false;
     let mut runtime_map = state.runtime.lock().await;
     let monitored_max = node.network.as_deref().and_then(|network| {
         network_nodes
@@ -95,13 +125,23 @@ async fn monitor_node_inner(
     let mut error = None;
     let health = match health_result {
         Ok(health) => {
-            runtime.consecutive_successes += 1;
-            runtime.consecutive_failures = 0;
+            if resume_grace {
+                runtime.consecutive_successes = 0;
+                runtime.consecutive_failures = 0;
+            } else {
+                runtime.consecutive_successes += 1;
+                runtime.consecutive_failures = 0;
+            }
             Some(health)
         }
         Err(err) => {
-            runtime.consecutive_failures += 1;
-            runtime.consecutive_successes = 0;
+            if resume_grace {
+                runtime.consecutive_failures = 0;
+                runtime.consecutive_successes = 0;
+            } else {
+                runtime.consecutive_failures += 1;
+                runtime.consecutive_successes = 0;
+            }
             error = Some(err.to_string());
             None
         }
@@ -111,6 +151,20 @@ async fn monitor_node_inner(
     if health.is_some() && chain_due {
         match adapter.fetch_chain().await {
             Ok(chain) => {
+                if runtime.chain.height.is_some()
+                    && runtime.chain.height != chain.height
+                    && (node.kind == NodeKind::Nis1 || !runtime.websocket_connected)
+                {
+                    poll_event = Some(NetworkEvent {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        node_id: node.id.clone(),
+                        kind: "pollUpdate".into(),
+                        height: chain.height.map(|height| height.to_string()),
+                        hash: None,
+                        observed_at: now,
+                        source: "polling".into(),
+                    });
+                }
                 if chain.finalized_height != runtime.last_finalized_height {
                     runtime.last_finalized_height = chain.finalized_height;
                     runtime.finalized_changed_at = Some(now);
@@ -128,6 +182,7 @@ async fn monitor_node_inner(
         match adapter.fetch_peers().await {
             Ok(peers) => match state.repository.replace_peers(&node.id, &peers, now).await {
                 Ok(()) => {
+                    topology_changed = runtime.peers != peers;
                     runtime.peers = peers;
                     runtime.last_peer_poll = now;
                 }
@@ -196,7 +251,10 @@ async fn monitor_node_inner(
     } else {
         NodeStatus::Healthy
     };
-    if latency_ms as u64 >= settings.latency_warning_ms {
+    if resume_grace || health.is_none() {
+        runtime.latency_failures = 0;
+        runtime.latency_successes = 0;
+    } else if latency_sample_is_slow(health.is_some(), latency_ms, settings.latency_warning_ms) {
         runtime.latency_failures += 1;
         runtime.latency_successes = 0;
     } else if latency_ms < 1_500 {
@@ -249,6 +307,13 @@ async fn monitor_node_inner(
     let nis_status_code = health.as_ref().and_then(|health| health.nis_status_code);
     drop(runtime_map);
 
+    if let Some(event) = poll_event {
+        websocket::publish_event(&app, &state, event).await;
+    }
+    if topology_changed {
+        let _ = app.emit("topology-updated", &node.id);
+    }
+
     let sample = NodeSample {
         observed_at: now,
         reachable,
@@ -266,7 +331,7 @@ async fn monitor_node_inner(
         last_error: error,
     };
     state.repository.save_sample(&node.id, &sample).await?;
-    if offline {
+    if !resume_grace && offline {
         update_alert(
             &app,
             &state,
@@ -277,7 +342,7 @@ async fn monitor_node_inner(
             "3回連続でノードへ接続できません。",
         )
         .await?;
-    } else if recovered {
+    } else if !resume_grace && recovered {
         update_alert(
             &app,
             &state,
@@ -289,7 +354,7 @@ async fn monitor_node_inner(
         )
         .await?;
     }
-    if latency_alert {
+    if !resume_grace && latency_alert {
         update_alert(
             &app,
             &state,
@@ -300,7 +365,7 @@ async fn monitor_node_inner(
             "REST APIの応答遅延が継続しています。",
         )
         .await?;
-    } else if latency_recovered {
+    } else if !resume_grace && latency_recovered {
         update_alert(
             &app,
             &state,
@@ -311,6 +376,11 @@ async fn monitor_node_inner(
             "REST APIの応答時間が正常に戻りました。",
         )
         .await?;
+    }
+    if resume_grace {
+        let _ = app.emit("node-updated", &node.id);
+        desktop::refresh_tray(&app, &state).await;
+        return Ok(());
     }
     update_alert(
         &app,
@@ -333,7 +403,7 @@ async fn monitor_node_inner(
         } else {
             "warning"
         },
-        "Symbolの最終化高が30分以上更新されていません。",
+        "Symbolのファイナライズ高が30分以上更新されていません。",
     )
     .await?;
     if let Some(lag) = lag {
@@ -355,6 +425,7 @@ async fn monitor_node_inner(
         .await?;
     }
     let _ = app.emit("node-updated", &node.id);
+    desktop::refresh_tray(&app, &state).await;
     Ok(())
 }
 
@@ -402,6 +473,9 @@ pub async fn monitor_node(
 }
 
 async fn compare_state_hashes(app: AppHandle, state: AppState) -> AppResult<()> {
+    if state.in_resume_grace(chrono::Utc::now().timestamp_millis()) {
+        return Ok(());
+    }
     let nodes = state.repository.list_stored_nodes(true).await?;
     let runtime = state.runtime.lock().await;
     let mut groups: HashMap<String, Vec<(StoredNode, u64)>> = HashMap::new();
@@ -440,31 +514,16 @@ async fn compare_state_hashes(app: AppHandle, state: AppState) -> AppResult<()> 
             *counter
         };
         for (node, _) in members {
-            if mismatch && consecutive >= 2 {
-                let changed = state
-                    .repository
-                    .raise_alert(
-                        &node.id,
-                        "state_hash_mismatch",
-                        "critical",
-                        &format!("最終化高{height}のStateHashが同一ネットワーク内で一致しません。"),
-                    )
-                    .await?;
-                if changed {
-                    notify(
-                        &app,
-                        &state,
-                        &format!("重大: {}", node.display_name),
-                        "StateHashの不一致を検出しました。",
-                    )
-                    .await;
-                }
-            } else if !mismatch {
-                state
-                    .repository
-                    .resolve_alert(&node.id, "state_hash_mismatch")
-                    .await?;
-            }
+            update_alert(
+                &app,
+                &state,
+                &node,
+                mismatch && consecutive >= 2,
+                "state_hash_mismatch",
+                "critical",
+                &format!("ファイナライズ高{height}のStateHashが同一ネットワーク内で一致しません。"),
+            )
+            .await?;
         }
     }
     Ok(())
@@ -475,7 +534,12 @@ pub fn start(app: AppHandle, state: AppState) {
         let initial_settings = state.settings.read().await.clone();
         let _ = state.repository.compact(&initial_settings).await;
         let mut last_state_hash_check = 0i64;
+        let mut expected_wake_at = None;
         loop {
+            let cycle_started_at = chrono::Utc::now().timestamp_millis();
+            if expected_wake_at.is_some_and(|expected| wake_was_late(expected, cycle_started_at)) {
+                enter_resume_grace(&state, cycle_started_at, "monitor loop woke late").await;
+            }
             let settings = state.settings.read().await.clone();
             let nodes = state
                 .repository
@@ -492,7 +556,7 @@ pub fn start(app: AppHandle, state: AppState) {
                 });
             }
             let now = chrono::Utc::now().timestamp_millis();
-            if now - last_state_hash_check >= 120_000 {
+            if !state.in_resume_grace(now) && now - last_state_hash_check >= 120_000 {
                 last_state_hash_check = now;
                 let app_for_hash = app.clone();
                 let state_for_hash = state.clone();
@@ -501,10 +565,30 @@ pub fn start(app: AppHandle, state: AppState) {
                 });
             }
             let jitter = rand::rng().random_range(90..=110) as u64;
-            tokio::time::sleep(Duration::from_millis(
-                settings.health_interval_seconds * 10 * jitter,
-            ))
-            .await;
+            let sleep_ms = settings.health_interval_seconds * 10 * jitter;
+            expected_wake_at = Some(
+                chrono::Utc::now()
+                    .timestamp_millis()
+                    .saturating_add(sleep_ms as i64),
+            );
+            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_a_monitor_loop_delayed_by_suspend() {
+        assert!(!wake_was_late(100_000, 114_999));
+        assert!(wake_was_late(100_000, 115_000));
+    }
+
+    #[test]
+    fn connection_failures_are_not_latency_samples() {
+        assert!(!latency_sample_is_slow(false, 5_000, 2_000));
+        assert!(latency_sample_is_slow(true, 5_000, 2_000));
+    }
 }
