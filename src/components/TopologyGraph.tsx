@@ -8,35 +8,92 @@ interface Props {
   edges: TopologyEdge[];
   events: NetworkEvent[];
   now: number;
+  wideView: boolean;
   selectedNodeId: string | null;
   onInspectNode: (nodeId: string) => void;
+}
+
+interface RingDefinition {
+  capacity: number;
+  radiusX: number;
+  radiusY: number;
+  nodeRadius?: number;
+}
+
+interface LayoutResult {
+  positions: Map<string, Position>;
+  externalRadii: Map<string, number>;
 }
 
 const WIDTH = 1000;
 const HEIGHT = 620;
 
-function ellipsePosition(index: number, count: number, radiusX: number, radiusY: number): Position {
-  const angle = -Math.PI / 2 + (index / Math.max(count, 1)) * Math.PI * 2;
+function ellipsePosition(index: number, count: number, radiusX: number, radiusY: number, offset = 0): Position {
+  const angle = -Math.PI / 2 + offset + (index / Math.max(count, 1)) * Math.PI * 2;
   return { x: WIDTH / 2 + Math.cos(angle) * radiusX, y: HEIGHT / 2 + Math.sin(angle) * radiusY };
 }
 
-function layout(nodes: TopologyNode[]) {
+function placeInRings(
+  nodes: TopologyNode[],
+  rings: RingDefinition[],
+  positions: Map<string, Position>,
+  externalRadii?: Map<string, number>,
+) {
+  let cursor = 0;
+  rings.forEach((ring, ringIndex) => {
+    const remaining = nodes.length - cursor;
+    if (remaining <= 0) return;
+    const count = Math.min(ring.capacity, remaining);
+    nodes.slice(cursor, cursor + count).forEach((node, index) => {
+      const offset = ringIndex % 2 === 0 ? 0 : Math.PI / Math.max(count, 1);
+      positions.set(node.id, ellipsePosition(index, count, ring.radiusX, ring.radiusY, offset));
+      if (externalRadii && ring.nodeRadius) externalRadii.set(node.id, ring.nodeRadius);
+    });
+    cursor += count;
+  });
+}
+
+function registeredRings(count: number, wideView: boolean): RingDefinition[] {
+  if (wideView) {
+    if (count <= 12) return [{ capacity: 12, radiusX: 180, radiusY: 110 }];
+    if (count <= 30) return [{ capacity: 12, radiusX: 145, radiusY: 90 }, { capacity: 18, radiusX: 275, radiusY: 170 }];
+    return [
+      { capacity: 12, radiusX: 145, radiusY: 90 },
+      { capacity: 18, radiusX: 270, radiusY: 165 },
+      { capacity: 32, radiusX: 395, radiusY: 245 },
+    ];
+  }
+  if (count <= 14) return [{ capacity: 14, radiusX: 420, radiusY: 250 }];
+  if (count <= 34) return [{ capacity: 14, radiusX: 230, radiusY: 140 }, { capacity: 20, radiusX: 430, radiusY: 265 }];
+  return [
+    { capacity: 12, radiusX: 170, radiusY: 105 },
+    { capacity: 18, radiusX: 300, radiusY: 185 },
+    { capacity: 36, radiusX: 450, radiusY: 280 },
+  ];
+}
+
+function externalRings(count: number): RingDefinition[] {
+  if (count <= 40) return [{ capacity: 40, radiusX: 700, radiusY: 430, nodeRadius: 4.5 }];
+  if (count <= 85) return [
+    { capacity: 36, radiusX: 560, radiusY: 345, nodeRadius: 6.5 },
+    { capacity: 49, radiusX: 700, radiusY: 430, nodeRadius: 4.5 },
+  ];
+  return [
+    { capacity: 34, radiusX: 500, radiusY: 310, nodeRadius: 7.5 },
+    { capacity: 42, radiusX: 610, radiusY: 375, nodeRadius: 6 },
+    { capacity: 60, radiusX: 720, radiusY: 445, nodeRadius: 4 },
+  ];
+}
+
+function layout(nodes: TopologyNode[], wideView: boolean): LayoutResult {
   const registered = nodes.filter((node) => node.registered);
   const external = nodes.filter((node) => !node.registered);
   const positions = new Map<string, Position>();
-  registered.forEach((node, index) => {
-    positions.set(node.id, registered.length === 1
-      ? { x: WIDTH / 2, y: HEIGHT / 2 }
-      : ellipsePosition(index, registered.length, 165, 105));
-  });
-  const perRing = 40;
-  external.forEach((node, index) => {
-    const ring = Math.floor(index / perRing);
-    const first = ring * perRing;
-    const count = Math.min(perRing, external.length - first);
-    positions.set(node.id, ellipsePosition(index - first, count, 450 - ring * 75, 275 - ring * 48));
-  });
-  return positions;
+  const externalRadii = new Map<string, number>();
+  if (registered.length === 1) positions.set(registered[0].id, { x: WIDTH / 2, y: HEIGHT / 2 });
+  else placeInRings(registered, registeredRings(registered.length, wideView), positions);
+  placeInRings(external, externalRings(external.length), positions, externalRadii);
+  return { positions, externalRadii };
 }
 
 function eventColor(kind: NetworkEvent["kind"]) {
@@ -48,8 +105,11 @@ function edgeStatus(status: string) {
   return ["active", "busy", "inactive", "failure"].includes(status) ? status : "unknown";
 }
 
-export function TopologyGraph({ nodes, edges, events, now, selectedNodeId, onInspectNode }: Props) {
-  const positions = useMemo(() => layout(nodes), [nodes]);
+export function TopologyGraph({ nodes, edges, events, now, wideView, selectedNodeId, onInspectNode }: Props) {
+  const { positions, externalRadii } = useMemo(() => layout(nodes, wideView), [nodes, wideView]);
+  const registeredCount = nodes.filter((node) => node.registered).length;
+  const externalCount = nodes.length - registeredCount;
+  const denseRegistered = registeredCount >= 30;
   const degree = useMemo(() => {
     const values = new Map<string, number>();
     edges.forEach((edge) => {
@@ -74,9 +134,10 @@ export function TopologyGraph({ nodes, edges, events, now, selectedNodeId, onIns
       });
   });
   const particles = [...particleByEdge.values()];
+  const viewBox = wideView ? "-300 -190 1600 1000" : `0 0 ${WIDTH} ${HEIGHT}`;
 
   return (
-    <svg className="topology-graph" viewBox={`0 0 ${WIDTH} ${HEIGHT}`} role="img" aria-label="監視ノードのネットワークトポロジー">
+    <svg className={`topology-graph${wideView ? " topology-graph--wide" : ""}`} viewBox={viewBox} role="img" aria-label="監視ノードのネットワークトポロジー">
       <defs>
         <filter id="node-glow"><feGaussianBlur stdDeviation="5" result="blur" /><feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge></filter>
         <filter id="particle-glow"><feGaussianBlur stdDeviation="2" result="blur" /><feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge></filter>
@@ -107,15 +168,20 @@ export function TopologyGraph({ nodes, edges, events, now, selectedNodeId, onIns
           if (!position) return null;
           const activeEvent = activeByNode.get(node.id);
           const connections = degree.get(node.id) ?? 0;
-          const radius = node.registered ? 24 + Math.min(connections, 8) : 7 + Math.min(connections, 4) * 1.5;
+          const radius = node.registered
+            ? (denseRegistered ? 19 + Math.min(connections, 8) * .7 : 24 + Math.min(connections, 8))
+            : (externalRadii.get(node.id) ?? 6) + Math.min(connections, 2) * .5;
           const shared = !node.registered && connections > 1;
+          const selected = selectedNodeId === node.id;
+          const showRegisteredDetails = node.registered && (!wideView || !denseRegistered || selected);
+          const showLabel = showRegisteredDetails || (!node.registered && (selected || shared || externalCount <= 40));
           const meta = node.kind === "symbol"
             ? [node.websocketConnected ? "WS" : null, ...node.roles.slice(0, 3).map((role) => role.slice(0, 1))].filter(Boolean).join(" · ")
             : `NIS${node.nisStatusCode !== null ? ` ${node.nisStatusCode}` : ""}`;
           const title = [node.label, node.host && `${node.host}${node.port ? `:${node.port}` : ""}`, node.version && `v${node.version}`, `${connections} 接続`, node.peerStatus].filter(Boolean).join(" · ");
           return <g
             key={node.id}
-            className={`topology-node topology-node--${node.status} ${node.registered ? "topology-node--registered" : "topology-node--external"}${selectedNodeId === node.id ? " topology-node--selected" : ""}`}
+            className={`topology-node topology-node--${node.status} ${node.registered ? "topology-node--registered" : "topology-node--external"}${denseRegistered && node.registered ? " topology-node--dense" : ""}${selectedNodeId === node.id ? " topology-node--selected" : ""}`}
             transform={`translate(${position.x} ${position.y})`}
             role="button"
             aria-label={`${node.label}の情報を表示`}
@@ -133,10 +199,10 @@ export function TopologyGraph({ nodes, edges, events, now, selectedNodeId, onIns
             {shared && <circle className="topology-node__shared" r={radius + 4} />}
             <circle className="topology-node__body" r={radius} />
             {node.websocketConnected && <circle className="topology-node__websocket" cx={radius * .72} cy={-radius * .72} r="4" />}
-            {node.registered && <text className="topology-node__meta" textAnchor="middle" y={-radius - 9}>{meta}</text>}
+            {showRegisteredDetails && <text className="topology-node__meta" textAnchor="middle" y={-radius - 9}>{meta}</text>}
             {node.registered && <text className="topology-node__kind" textAnchor="middle" dy="4">{node.kind === "symbol" ? "S" : "N"}</text>}
-            <text className="topology-node__label" textAnchor="middle" y={radius + 18}>{node.label.slice(0, 22)}</text>
-            {node.registered && <text className="topology-node__height" textAnchor="middle" y={radius + 32}>高 {node.height ?? "—"}</text>}
+            {showLabel && <text className="topology-node__label" textAnchor="middle" y={radius + 18}>{node.label.slice(0, denseRegistered ? 12 : 22)}</text>}
+            {showRegisteredDetails && <text className="topology-node__height" textAnchor="middle" y={radius + 32}>高 {node.height ?? "—"}</text>}
           </g>;
         })}
       </g>

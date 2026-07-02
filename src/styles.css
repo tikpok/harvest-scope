@@ -103,6 +103,10 @@ input, select { color:var(--text); background:#0b1727; border:1px solid var(--bo
 .topology-node__meta { fill:var(--muted); font:700 8px "Cascadia Mono",Consolas,monospace; letter-spacing:.4px; pointer-events:none; paint-order:stroke; stroke:var(--surface); stroke-width:3px; }
 .topology-node__kind { fill:var(--text); font:700 12px "Cascadia Mono",Consolas,monospace; pointer-events:none; }
 .topology-node__label { fill:var(--text); font:600 10px Inter,"Segoe UI",sans-serif; pointer-events:none; paint-order:stroke; stroke:var(--surface); stroke-width:4px; stroke-linejoin:round; }
+.topology-node--dense .topology-node__meta { font-size:7px; }
+.topology-node--dense .topology-node__kind { font-size:10px; }
+.topology-node--dense .topology-node__label { font-size:8px; }
+.topology-node--dense .topology-node__height { font-size:7px; }
 .topology-node--external .topology-node__label { fill:var(--muted); font-size:8px; opacity:.72; }
 .topology-node__height { fill:var(--muted); font:9px "Cascadia Mono",Consolas,monospace; pointer-events:none; paint-order:stroke; stroke:var(--surface); stroke-width:3px; }
 .topology-events { min-height:650px; overflow:hidden; }

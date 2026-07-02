@@ -46,8 +46,8 @@ export function TopologyPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [paused, setPaused] = useState(false);
-  const [showExternal, setShowExternal] = useState(true);
-  const [kind, setKind] = useState<NodeKind | "all">("all");
+  const [showExternal, setShowExternal] = useState(false);
+  const [kind, setKind] = useState<NodeKind | "all">("symbol");
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [now, setNow] = useState(Date.now());
   const events = useNetworkEvents(paused);
@@ -117,7 +117,7 @@ export function TopologyPage() {
       <div><h2>ネットワークトポロジー</h2><p>ピア関係と、各ノードで観測したブロック高更新をリアルタイム表示します。</p></div>
       <div className="actions">
         <select value={kind} onChange={(event) => setKind(event.target.value as NodeKind | "all")} aria-label="ノード種別">
-          <option value="all">Symbol / NIS1</option><option value="symbol">Symbol</option><option value="nis1">NIS1</option>
+          <option value="symbol">Symbol</option><option value="nis1">NEM</option><option value="all">Symbol / NEM</option>
         </select>
         <label className="topology-toggle"><input type="checkbox" checked={showExternal} onChange={(event) => setShowExternal(event.target.checked)} />外部ピア</label>
         <button className="button" onClick={() => setPaused((value) => !value)}>{paused ? <Play size={16} /> : <Pause size={16} />}{paused ? "再開" : "一時停止"}</button>
@@ -131,7 +131,7 @@ export function TopologyPage() {
     <div className="topology-layout">
       <section className="panel topology-canvas-panel">
         <div className="topology-legend"><span><i className="legend-node legend-node--registered" />監視ノード</span><span><i className="legend-node legend-node--shared" />共有ピア</span><span><i className="legend-line legend-line--active" />active</span><span><i className="legend-line legend-line--busy" />busy</span><span><i className="legend-line legend-line--failure" />failure</span><span><i className="legend-flow" />推定伝播</span></div>
-        {isLoading ? <div className="loading">トポロジーを読み込み中…</div> : graph.nodes.length === 0 ? <div className="empty-state"><h3>表示できるノードがありません</h3><p>ノードを登録し、最初のピア情報が取得されるまでお待ちください。</p></div> : <TopologyGraph nodes={graph.nodes} edges={graph.edges} events={paused ? [] : visibleEvents} now={now} selectedNodeId={selectedNodeId} onInspectNode={setSelectedNodeId} />}
+        {isLoading ? <div className="loading">トポロジーを読み込み中…</div> : graph.nodes.length === 0 ? <div className="empty-state"><h3>表示できるノードがありません</h3><p>ノードを登録し、最初のピア情報が取得されるまでお待ちください。</p></div> : <TopologyGraph nodes={graph.nodes} edges={graph.edges} events={paused ? [] : visibleEvents} now={now} wideView={showExternal} selectedNodeId={selectedNodeId} onInspectNode={setSelectedNodeId} />}
       </section>
       <aside className="panel topology-events">
         {selectedNode && <NodeInspector node={selectedNode} connections={summary.degrees.get(selectedNode.id) ?? 0} onOpen={() => navigate(`/nodes/${selectedNode.id}`)} />}
