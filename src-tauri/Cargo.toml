@@ -1,6 +1,6 @@
 [package]
 name = "node-watcher"
-version = "0.1.4"
+version = "0.1.5"
 description = "Windows GUI monitor for Symbol and NEM NIS1 nodes"
 authors = ["tikpok"]
 edition = "2021"
