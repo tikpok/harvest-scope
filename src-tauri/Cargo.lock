@@ -2447,7 +2447,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "node-watcher"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2466,6 +2466,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-notification",
  "tauri-plugin-single-instance",
+ "tauri-winrt-notification",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

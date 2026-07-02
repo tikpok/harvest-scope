@@ -1,19 +1,38 @@
 import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useQueryClient } from "@tanstack/react-query";
+import { useNavigate } from "react-router-dom";
+import { api } from "../services/ipc";
 
 export function useMonitorEvents() {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
 
   useEffect(() => {
-    const unlisteners = ["node-updated", "alert-changed", "monitor-state-changed"].map((event) =>
-      listen(event, () => {
-        void queryClient.invalidateQueries();
-      }).catch(() => () => undefined),
-    );
+    const unlisteners = [
+      listen<string>("node-updated", ({ payload: nodeId }) => {
+        void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+        void queryClient.invalidateQueries({ queryKey: ["node", nodeId] });
+      }),
+      listen<string>("alert-changed", ({ payload: nodeId }) => {
+        void queryClient.invalidateQueries({ queryKey: ["alerts"] });
+        void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+        void queryClient.invalidateQueries({ queryKey: ["node", nodeId] });
+      }),
+      listen<string>("monitor-state-changed", ({ payload: nodeId }) => {
+        void queryClient.invalidateQueries({ queryKey: ["node", nodeId] });
+      }),
+      listen("navigate-requested", () => {
+        void api.takePendingNavigation().then((path) => {
+          if (path) navigate(path);
+        });
+      }),
+    ].map((unlistener) => unlistener.catch(() => () => undefined));
+    void api.takePendingNavigation().then((path) => {
+      if (path) navigate(path);
+    });
     return () => {
       void Promise.all(unlisteners).then((items) => items.forEach((unlisten) => unlisten()));
     };
-  }, [queryClient]);
+  }, [navigate, queryClient]);
 }
-

@@ -5,10 +5,14 @@ import {
   ArrowDown,
   ArrowUp,
   Bell,
+  CheckCircle2,
   ChevronRight,
+  CircleAlert,
+  CircleDashed,
   CircleGauge,
   Download,
   Menu,
+  Moon,
   Network,
   Pause,
   Play,
@@ -16,9 +20,13 @@ import {
   RefreshCw,
   Search,
   Settings as SettingsIcon,
+  Share2,
   ShieldCheck,
+  Stethoscope,
+  Sun,
   Trash2,
   X,
+  XCircle,
 } from "lucide-react";
 import { NavLink, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import { api, defaultSettings } from "./services/ipc";
@@ -26,7 +34,9 @@ import { useMonitorEvents } from "./hooks/useMonitorEvents";
 import { useUiStore } from "./store/ui";
 import { StatusBadge } from "./components/StatusBadge";
 import { MetricChart } from "./components/MetricChart";
-import type { AppSettings, NodeStatus, ScanCandidate } from "./types";
+import { TopologyPage } from "./components/TopologyPage";
+import packageJson from "../package.json";
+import type { AppSettings, DiagnosticRun, NodeStatus, ScanCandidate } from "./types";
 
 function formatTime(value: number | null) {
   return value ? new Intl.DateTimeFormat("ja-JP", { dateStyle: "short", timeStyle: "medium" }).format(value) : "—";
@@ -46,10 +56,66 @@ function EmptyState({ title, children }: { title: string; children: React.ReactN
   );
 }
 
+const diagnosticStatusLabel = {
+  passed: "正常",
+  warning: "注意あり",
+  failed: "異常あり",
+};
+
+function DiagnosticResult({ run }: { run: DiagnosticRun | undefined }) {
+  if (!run) return <EmptyState title="診断履歴はありません">「今すぐ診断」でネットワークとノードAPIをまとめて確認できます。</EmptyState>;
+  return <div className="diagnostic-result">
+    <div className={`diagnostic-summary diagnostic-summary--${run.status}`}>
+      <div>{run.status === "passed" ? <CheckCircle2 /> : run.status === "warning" ? <CircleAlert /> : <XCircle />}</div>
+      <div><strong>{diagnosticStatusLabel[run.status]}</strong><p>{run.summary}</p><small>{formatTime(run.completedAt)}</small></div>
+    </div>
+    <div className="diagnostic-checks">{run.checks.map((item) => <article className={`diagnostic-check diagnostic-check--${item.status}`} key={item.key}>
+      <div className="diagnostic-check__icon">{item.status === "pass" ? <CheckCircle2 size={17} /> : item.status === "skipped" ? <CircleDashed size={17} /> : item.status === "warning" ? <CircleAlert size={17} /> : <XCircle size={17} />}</div>
+      <div><strong>{item.label}</strong><p>{item.message}</p>{item.recommendation && <small>{item.recommendation}</small>}</div>
+      <span>{item.durationMs} ms</span>
+    </article>)}</div>
+  </div>;
+}
+
+function DiagnosticPanel({
+  latest,
+  history,
+  isPending,
+  error,
+  onRun,
+}: {
+  latest: DiagnosticRun | undefined;
+  history: DiagnosticRun[];
+  isPending: boolean;
+  error: Error | null;
+  onRun: () => void;
+}) {
+  return <section className="panel">
+    <div className="panel__header"><div><h2>ワンクリック診断</h2><p>通常監視を変更せず、接続・API・同期状態を再検査します</p></div><button className="button button--primary" onClick={onRun} disabled={isPending}><Stethoscope size={16} />{isPending ? "診断中…" : "今すぐ診断"}</button></div>
+    {error && <div className="notice notice--error">診断を実行できません: {String(error)}</div>}
+    <DiagnosticResult run={latest} />
+    {history.length > 1 && <details className="diagnostic-history"><summary>過去の診断 {history.length - 1}件</summary><ul>{history.slice(1).map((run) => <li key={run.id}><span className={`diagnostic-history__status diagnostic-history__status--${run.status}`}>{diagnosticStatusLabel[run.status]}</span><span>{formatTime(run.completedAt)}</span><span>{run.summary}</span></li>)}</ul></details>}
+  </section>;
+}
+
 function Layout({ children }: { children: React.ReactNode }) {
   const { sidebarOpen, setSidebarOpen } = useUiStore();
+  const queryClient = useQueryClient();
+  const { data: appSettings } = useQuery({ queryKey: ["settings"], queryFn: api.settings });
+  const theme = appSettings?.theme ?? "system";
+  const systemDark = typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia("(prefers-color-scheme: dark)").matches;
+  const dark = theme === "dark" || (theme === "system" && systemDark);
+  const changeTheme = useMutation({
+    mutationFn: (nextTheme: "light" | "dark") => api.updateSettings({ ...(appSettings ?? defaultSettings), theme: nextTheme }),
+    onSuccess: (settings) => queryClient.setQueryData(["settings"], settings),
+  });
+  useEffect(() => {
+    if (theme === "system") document.documentElement.removeAttribute("data-theme");
+    else document.documentElement.dataset.theme = theme;
+  }, [theme]);
   const nav = [
     { to: "/", label: "ダッシュボード", icon: CircleGauge },
+    { to: "/topology", label: "ネットワーク", icon: Share2 },
     { to: "/discovery", label: "ノード検出", icon: Network },
     { to: "/alerts", label: "アラート", icon: Bell },
     { to: "/settings", label: "設定", icon: SettingsIcon },
@@ -69,7 +135,10 @@ function Layout({ children }: { children: React.ReactNode }) {
             </NavLink>
           ))}
         </nav>
-        <div className="sidebar__footer"><ShieldCheck size={17} /> 読み取り専用監視</div>
+        <div className="sidebar__footer">
+          <span><ShieldCheck size={17} /> 読み取り専用監視</span>
+          <small aria-label="アプリバージョン">v{packageJson.version}</small>
+        </div>
       </aside>
       {sidebarOpen && <button className="scrim" onClick={() => setSidebarOpen(false)} aria-label="メニューを閉じる" />}
       <main className="main">
@@ -77,6 +146,7 @@ function Layout({ children }: { children: React.ReactNode }) {
           <button className="icon-button mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="メニューを開く"><Menu /></button>
           <div><h1>ノード監視</h1><p>ローカルネットワークの状態をひと目で確認</p></div>
           <div className="live-indicator"><span />監視エンジン稼働中</div>
+          <button className="icon-button theme-toggle" aria-label={dark ? "ライトテーマに切り替え" : "ダークテーマに切り替え"} title={dark ? "ライトテーマ" : "ダークテーマ"} disabled={changeTheme.isPending} onClick={() => changeTheme.mutate(dark ? "light" : "dark")}>{dark ? <Sun size={17} /> : <Moon size={17} />}</button>
         </header>
         <div className="page">{children}</div>
       </main>
@@ -149,7 +219,7 @@ function DashboardPage() {
           <EmptyState title="監視ノードがありません">「ノード追加」からURLを登録するか、LAN内をスキャンしてください。</EmptyState>
         ) : (
           <div className="table-wrap"><table>
-            <thead><tr><th>ノード</th><th>種別</th><th>状態</th><th>チェーン高</th><th>最終化高</th><th>遅延</th><th>ピア</th><th>REST</th><th>最終確認</th><th aria-label="操作" /></tr></thead>
+            <thead><tr><th>ノード</th><th>種別</th><th>状態</th><th>チェーン高</th><th>ファイナライズ高</th><th>遅延</th><th>ピア</th><th>REST</th><th>最終確認</th><th aria-label="操作" /></tr></thead>
             <tbody>{nodes.map((node, index) => <tr key={node.id} className="clickable" onClick={() => navigate(`/nodes/${node.id}`)}>
               <td><strong>{node.displayName}</strong><small>{node.baseUrl}</small></td>
               <td><span className={`kind kind--${node.kind}`}>{node.kind === "symbol" ? "Symbol" : "NIS1"}</span></td>
@@ -176,16 +246,19 @@ function NodeDetailPage() {
   const now = Date.now();
   const { data, isLoading, error } = useQuery({ queryKey: ["node", nodeId], queryFn: () => api.nodeDetail(nodeId), refetchInterval: 10_000 });
   const { data: metrics = [] } = useQuery({ queryKey: ["metrics", nodeId], queryFn: () => api.metrics(nodeId, now - 24 * 60 * 60 * 1000, now), refetchInterval: 30_000 });
+  const { data: diagnostics = [], refetch: refetchDiagnostics } = useQuery({ queryKey: ["diagnostics", nodeId], queryFn: () => api.nodeDiagnostics(nodeId) });
+  const diagnose = useMutation({ mutationFn: () => api.runNodeDiagnostic(nodeId), onSuccess: () => void refetchDiagnostics() });
   const remove = useMutation({ mutationFn: () => api.deleteNode(nodeId), onSuccess: () => navigate("/") });
   if (isLoading) return <div className="loading">ノード詳細を読み込み中…</div>;
   if (error || !data) return <div className="notice notice--error">ノード情報を取得できません。</div>;
   return <>
     <div className="page-heading"><div><button className="link-button" onClick={() => navigate("/")}>← ダッシュボード</button><h2>{data.node.displayName}</h2><p>{data.node.baseUrl}</p></div><div className="actions"><StatusBadge status={data.node.status} /><button className="button button--danger" onClick={() => remove.mutate()}><Trash2 size={16} />削除</button></div></div>
     <section className="detail-grid">
-      <article className="panel detail-card"><h3>チェーン</h3><dl><div><dt>高さ</dt><dd>{data.node.height ?? "—"}</dd></div><div><dt>最終化高</dt><dd>{data.node.finalizedHeight ?? "対象外"}</dd></div><div><dt>同期遅延</dt><dd>{data.node.lag ?? "—"}</dd></div><div><dt>チェーンスコア</dt><dd className="mono text-truncate">{data.chainScore ?? "—"}</dd></div></dl></article>
+      <article className="panel detail-card"><h3>チェーン</h3><dl><div><dt>高さ</dt><dd>{data.node.height ?? "—"}</dd></div><div><dt>ファイナライズ高</dt><dd>{data.node.finalizedHeight ?? "対象外"}</dd></div><div><dt>同期遅延</dt><dd>{data.node.lag ?? "—"}</dd></div><div><dt>チェーンスコア</dt><dd className="mono text-truncate">{data.chainScore ?? "—"}</dd></div></dl></article>
       <article className="panel detail-card"><h3>ノード</h3><dl><div><dt>種別</dt><dd>{data.node.kind === "symbol" ? "Symbol" : "NIS1"}</dd></div><div><dt>ネットワーク</dt><dd>{data.node.network ?? "—"}</dd></div><div><dt>バージョン</dt><dd>{data.node.version ?? "—"}</dd></div><div><dt>REST</dt><dd>{data.restVersion ?? "—"}</dd></div></dl></article>
       <article className="panel detail-card"><h3>接続</h3><dl><div><dt>REST応答</dt><dd>{formatLatency(data.node.latencyMs)}</dd></div><div><dt>ピア</dt><dd>{data.node.peerCount ?? "—"}</dd></div><div><dt>API / DB</dt><dd>{[data.apiStatus, data.dbStatus].filter(Boolean).join(" / ") || "—"}</dd></div><div><dt>WebSocket</dt><dd>{data.node.kind === "symbol" ? (data.websocketConnected ? "接続中" : "RESTへフォールバック") : "対象外"}</dd></div></dl></article>
     </section>
+    <DiagnosticPanel latest={diagnose.data ?? diagnostics[0]} history={diagnostics} isPending={diagnose.isPending} error={diagnose.error} onRun={() => diagnose.mutate()} />
     <section className="panel"><div className="panel__header"><div><h2>24時間メトリクス</h2><p>REST応答、ピア数、同期遅延</p></div><button className="button" onClick={() => api.exportCsv("metrics", nodeId)}><Download size={16} />CSV</button></div>{metrics.length ? <MetricChart data={metrics} /> : <EmptyState title="履歴を収集中">最初の監視サンプルが保存されるとグラフが表示されます。</EmptyState>}</section>
     <section className="panel"><div className="panel__header"><div><h2>現在のピア</h2><p>{data.peers.length}件</p></div></div>{data.peers.length ? <div className="table-wrap"><table><thead><tr><th>名前</th><th>ホスト</th><th>ポート</th><th>状態</th><th>バージョン</th></tr></thead><tbody>{data.peers.map((peer) => <tr key={peer.key}><td>{peer.name ?? "—"}</td><td>{peer.host ?? "—"}</td><td>{peer.port ?? "—"}</td><td>{peer.status}</td><td>{peer.version ?? "—"}</td></tr>)}</tbody></table></div> : <EmptyState title="ピア情報がありません">次回のピアポーリング後に表示されます。</EmptyState>}</section>
   </>;
@@ -197,31 +270,59 @@ function DiscoveryPage() {
   const [cidr, setCidr] = useState("");
   const [ports, setPorts] = useState("3000,3001,7890");
   const [manualUrl, setManualUrl] = useState("");
-  const [manualName, setManualName] = useState("");
   const scan = useMutation({ mutationFn: api.scan });
   const add = useMutation({ mutationFn: api.upsertNode, onSuccess: () => queryClient.invalidateQueries({ queryKey: ["dashboard"] }) });
   useEffect(() => {
     if (!cidr && interfaces.length > 0) setCidr(interfaces[0].cidr);
   }, [cidr, interfaces]);
   function submitScan(event: FormEvent) { event.preventDefault(); scan.mutate({ cidr, ports: ports.split(",").map(Number).filter((port) => Number.isInteger(port)) }); }
-  function addManual(event: FormEvent) { event.preventDefault(); add.mutate({ baseUrl: manualUrl, displayName: manualName || undefined }); setManualUrl(""); setManualName(""); }
+  function addManual(event: FormEvent) { event.preventDefault(); add.mutate({ baseUrl: manualUrl }, { onSuccess: () => setManualUrl("") }); }
   function addCandidate(candidate: ScanCandidate) { add.mutate({ baseUrl: candidate.baseUrl, displayName: candidate.name ?? undefined, kind: candidate.kind }); }
   return <>
     <div className="page-heading"><div><h2>ノード検出</h2><p>選択したCIDRだけを明示的にスキャンします。候補は確認後に登録されます。</p></div></div>
     <section className="split-grid">
       <form className="panel form-card" onSubmit={submitScan}><h3>LANをスキャン</h3><label>ネットワーク候補<select value={cidr} onChange={(event) => setCidr(event.target.value)}>{!cidr && <option value="">ネットワークを選択</option>}{cidr && !interfaces.some((item) => item.cidr === cidr) && <option value={cidr}>{cidr}</option>}{interfaces.map((item) => <option key={`${item.name}-${item.cidr}`} value={item.cidr}>{item.name} — {item.cidr}</option>)}</select></label><label>CIDR<input value={cidr} onChange={(event) => setCidr(event.target.value)} required /></label><label>ポート（カンマ区切り）<input value={ports} onChange={(event) => setPorts(event.target.value)} required /></label><div className="actions"><button className="button button--primary" disabled={scan.isPending}><Search size={16} />{scan.isPending ? "スキャン中…" : "スキャン開始"}</button>{scan.isPending && <button type="button" className="button" onClick={() => api.cancelScan()}>キャンセル</button>}</div><p className="form-hint">最大1,024アドレス、既定ポート3000 / 3001 / 7890</p></form>
-      <form className="panel form-card" onSubmit={addManual}><h3>URLを手動登録</h3><label>表示名<input value={manualName} onChange={(event) => setManualName(event.target.value)} placeholder="例: Symbol Main API" /></label><label>REST URL<input type="url" value={manualUrl} onChange={(event) => setManualUrl(event.target.value)} placeholder="http://192.0.2.10:3000" required /></label><button className="button button--primary" disabled={add.isPending}><Plus size={16} />接続確認して登録</button><p className="form-hint">HTTP/HTTPSのみ。秘密鍵やログイン情報は入力しないでください。</p></form>
+      <form className="panel form-card" onSubmit={addManual}><h3>URLを手動登録</h3><label>REST URL<input type="url" value={manualUrl} onChange={(event) => { setManualUrl(event.target.value); if (add.isSuccess || add.isError) add.reset(); }} placeholder="http://192.0.2.10:3000" required /></label><button className="button button--primary" disabled={add.isPending}><Plus size={16} />{add.isPending ? "接続確認中…" : "接続確認して登録"}</button><p className="form-hint">表示名はノード情報から自動取得します。HTTP/HTTPSのみ指定できます。</p></form>
     </section>
     {(scan.error || add.error) && <div className="notice notice--error">{String(scan.error ?? add.error)}</div>}
+    {add.isSuccess && <div className="notice notice--success">「{add.data.displayName}」を登録しました。<small>{add.data.baseUrl}</small></div>}
     <section className="panel"><div className="panel__header"><div><h2>検出候補</h2><p>{scan.data?.length ?? 0}件のノードを検出</p></div></div>{scan.data?.length ? <div className="candidate-grid">{scan.data.map((candidate) => <article className="candidate" key={candidate.baseUrl}><div><span className={`kind kind--${candidate.kind}`}>{candidate.kind === "symbol" ? "Symbol" : "NIS1"}</span><h3>{candidate.name || candidate.baseUrl}</h3><p>{candidate.baseUrl}</p><small>{candidate.network ?? "ネットワーク未確認"} · {candidate.latencyMs} ms</small></div><button className="button" onClick={() => addCandidate(candidate)}><Plus size={16} />登録</button></article>)}</div> : <EmptyState title="まだスキャンしていません">CIDRとポートを確認して、スキャンを開始してください。</EmptyState>}</section>
   </>;
 }
 
 function AlertsPage() {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const { data = [], isLoading } = useQuery({ queryKey: ["alerts"], queryFn: api.alerts, refetchInterval: 10_000 });
   const ack = useMutation({ mutationFn: api.acknowledgeAlert, onSuccess: () => queryClient.invalidateQueries({ queryKey: ["alerts"] }) });
-  return <section className="panel"><div className="panel__header"><div><h2>アラート</h2><p>継続中の障害と復旧履歴</p></div><button className="button" onClick={() => api.exportCsv("alerts")}><Download size={16} />CSV</button></div>{isLoading ? <div className="loading">読み込み中…</div> : data.length ? <div className="alert-list">{data.map((alert) => <article className={`alert-item alert-item--${alert.severity}`} key={alert.id}><div className="alert-item__icon"><Bell size={18} /></div><div><div className="alert-item__heading"><strong>{alert.nodeName}</strong><span>{alert.severity === "critical" ? "重大" : "警告"}</span><span className="muted">{alert.state === "resolved" ? "復旧" : alert.state === "acknowledged" ? "確認済み" : "未確認"}</span></div><p>{alert.message}</p><small>{formatTime(alert.updatedAt)} · 発生{alert.occurrenceCount}回</small></div>{alert.state === "open" && <button className="button" onClick={() => ack.mutate(alert.id)}>確認</button>}</article>)}</div> : <EmptyState title="アラートはありません">異常を検出するとWindows通知とここに表示されます。</EmptyState>}</section>;
+  return <section className="panel"><div className="panel__header"><div><h2>アラート</h2><p>継続中の障害と復旧履歴</p></div><button className="button" onClick={() => api.exportCsv("alerts")}><Download size={16} />CSV</button></div>{isLoading ? <div className="loading">読み込み中…</div> : data.length ? <div className="alert-list">{data.map((alert) => <article className={`alert-item alert-item--${alert.severity}`} key={alert.id} onClick={() => navigate(`/alerts/${alert.id}`)}><div className="alert-item__icon"><Bell size={18} /></div><div><div className="alert-item__heading"><strong>{alert.nodeName}</strong><span>{alert.severity === "critical" ? "重大" : "警告"}</span><span className="muted">{alert.state === "resolved" ? "復旧" : alert.state === "acknowledged" ? "確認済み" : "未確認"}</span></div><p>{alert.message}</p><small>{formatTime(alert.updatedAt)} · 発生{alert.occurrenceCount}回</small></div><div className="actions">{alert.state === "open" && <button className="button" onClick={(event) => { event.stopPropagation(); ack.mutate(alert.id); }}>確認</button>}<ChevronRight size={17} /></div></article>)}</div> : <EmptyState title="アラートはありません">異常を検出するとWindows通知とここに表示されます。</EmptyState>}</section>;
+}
+
+function AlertDetailPage() {
+  const { alertId = "" } = useParams();
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const { data: alert, isLoading, error } = useQuery({ queryKey: ["alert", alertId], queryFn: () => api.alert(alertId) });
+  const { data: diagnostics = [], refetch: refetchDiagnostics } = useQuery({ queryKey: ["diagnostics", alert?.nodeId], queryFn: () => api.nodeDiagnostics(alert!.nodeId), enabled: Boolean(alert) });
+  const diagnose = useMutation({ mutationFn: () => api.runNodeDiagnostic(alert!.nodeId, alertId), onSuccess: () => void refetchDiagnostics() });
+  const acknowledge = useMutation({ mutationFn: () => api.acknowledgeAlert(alertId), onSuccess: async () => { await queryClient.invalidateQueries({ queryKey: ["alert", alertId] }); await queryClient.invalidateQueries({ queryKey: ["alerts"] }); } });
+  if (isLoading) return <div className="loading">障害情報を読み込み中…</div>;
+  if (error || !alert) return <div className="notice notice--error">障害情報を取得できません。</div>;
+  const related = diagnostics.filter((run) => run.alertId === alert.id);
+  const latest = diagnose.data ?? related[0] ?? diagnostics[0];
+  return <>
+    <div className="page-heading"><div><button className="link-button" onClick={() => navigate("/alerts")}>← アラート</button><h2>{alert.nodeName}</h2><p>{alert.message}</p></div><div className="actions"><span className={`status status--${alert.severity === "critical" ? "critical" : "warning"}`}>{alert.severity === "critical" ? "重大" : "警告"}</span>{alert.state === "open" && <button className="button" onClick={() => acknowledge.mutate()}>確認済みにする</button>}</div></div>
+    <section className="panel alert-detail"><dl><div><dt>状態</dt><dd>{alert.state === "resolved" ? "復旧" : alert.state === "acknowledged" ? "確認済み" : "未確認"}</dd></div><div><dt>種別</dt><dd>{alert.alertType}</dd></div><div><dt>発生</dt><dd>{formatTime(alert.raisedAt)}</dd></div><div><dt>更新</dt><dd>{formatTime(alert.updatedAt)}</dd></div><div><dt>復旧</dt><dd>{formatTime(alert.resolvedAt)}</dd></div><div><dt>発生回数</dt><dd>{alert.occurrenceCount}</dd></div></dl><button className="link-button" onClick={() => navigate(`/nodes/${alert.nodeId}`)}>ノード詳細を表示 →</button></section>
+    <DiagnosticPanel latest={latest} history={related.length ? related : diagnostics} isPending={diagnose.isPending} error={diagnose.error} onRun={() => diagnose.mutate()} />
+  </>;
+}
+
+function Onboarding() {
+  const queryClient = useQueryClient();
+  const { data } = useQuery({ queryKey: ["settings"], queryFn: api.settings });
+  const save = useMutation({ mutationFn: (autostartEnabled: boolean) => api.updateSettings({ ...(data ?? defaultSettings), backgroundMonitoring: true, autostartEnabled, onboardingCompleted: true }), onSuccess: () => queryClient.invalidateQueries({ queryKey: ["settings"] }) });
+  if (!data || data.onboardingCompleted) return null;
+  return <div className="modal-backdrop"><section className="onboarding" role="dialog" aria-modal="true" aria-labelledby="onboarding-title"><ShieldCheck size={34} /><h2 id="onboarding-title">バックグラウンド監視を開始します</h2><p>ウィンドウを閉じてもトレイで監視を続け、異常時にWindows通知でお知らせします。</p><div className="actions"><button className="button button--primary" disabled={save.isPending} onClick={() => save.mutate(true)}>ログオン時に起動する</button><button className="button" disabled={save.isPending} onClick={() => save.mutate(false)}>今はしない</button></div>{save.error && <div className="notice notice--error">設定を保存できません: {String(save.error)}</div>}</section></div>;
 }
 
 function SettingsPage() {
@@ -236,6 +337,7 @@ function SettingsPage() {
     <div className="settings-section"><h3>監視</h3><div className="settings-grid"><label>ヘルス間隔（秒）<input type="number" min="5" max="300" value={value.healthIntervalSeconds} onChange={(event) => update("healthIntervalSeconds", Number(event.target.value))} /></label><label>チェーン間隔（秒）<input type="number" min="10" max="600" value={value.chainIntervalSeconds} onChange={(event) => update("chainIntervalSeconds", Number(event.target.value))} /></label><label>ピア間隔（秒）<input type="number" min="30" max="1800" value={value.peerIntervalSeconds} onChange={(event) => update("peerIntervalSeconds", Number(event.target.value))} /></label><label>REST警告（ms）<input type="number" min="250" max="30000" value={value.latencyWarningMs} onChange={(event) => update("latencyWarningMs", Number(event.target.value))} /></label></div></div>
     <div className="settings-section"><h3>同期アラート</h3><div className="settings-grid"><label>警告ブロック差<input type="number" min="1" value={value.lagWarningBlocks} onChange={(event) => update("lagWarningBlocks", Number(event.target.value))} /></label><label>重大ブロック差<input type="number" min="2" value={value.lagCriticalBlocks} onChange={(event) => update("lagCriticalBlocks", Number(event.target.value))} /></label></div></div>
     <div className="settings-section"><h3>データ保持</h3><div className="settings-grid"><label>生データ（日）<input type="number" min="1" max="90" value={value.rawRetentionDays} onChange={(event) => update("rawRetentionDays", Number(event.target.value))} /></label><label>集約データ（日）<input type="number" min="30" max="1825" value={value.aggregateRetentionDays} onChange={(event) => update("aggregateRetentionDays", Number(event.target.value))} /></label></div></div>
+    <div className="settings-section"><h3>表示</h3><div className="settings-grid"><label>テーマ<select value={value.theme} onChange={(event) => update("theme", event.target.value as AppSettings["theme"])}><option value="system">Windowsの設定に合わせる</option><option value="light">ライト</option><option value="dark">ダーク</option></select></label></div></div>
     <div className="settings-section"><h3>Windows</h3><div className="toggle-list"><label><span><strong>Windows通知</strong><small>障害発生・重大化・復旧を通知します</small></span><input type="checkbox" checked={value.notificationEnabled} onChange={(event) => update("notificationEnabled", event.target.checked)} /></label><label><span><strong>バックグラウンド監視</strong><small>ウィンドウを閉じてもトレイで監視を続けます</small></span><input type="checkbox" checked={value.backgroundMonitoring} onChange={(event) => update("backgroundMonitoring", event.target.checked)} /></label><label><span><strong>Windowsログオン時に起動</strong><small>既定では無効です</small></span><input type="checkbox" checked={value.autostartEnabled} onChange={(event) => update("autostartEnabled", event.target.checked)} /></label></div></div>
     {save.isSuccess && <div className="notice notice--success">設定を保存しました。</div>}
   </section>;
@@ -243,5 +345,5 @@ function SettingsPage() {
 
 export default function App() {
   useMonitorEvents();
-  return <Layout><Routes><Route path="/" element={<DashboardPage />} /><Route path="/nodes/:nodeId" element={<NodeDetailPage />} /><Route path="/discovery" element={<DiscoveryPage />} /><Route path="/alerts" element={<AlertsPage />} /><Route path="/settings" element={<SettingsPage />} /></Routes></Layout>;
+  return <><Layout><Routes><Route path="/" element={<DashboardPage />} /><Route path="/topology" element={<TopologyPage />} /><Route path="/nodes/:nodeId" element={<NodeDetailPage />} /><Route path="/discovery" element={<DiscoveryPage />} /><Route path="/alerts" element={<AlertsPage />} /><Route path="/alerts/:alertId" element={<AlertDetailPage />} /><Route path="/settings" element={<SettingsPage />} /></Routes></Layout><Onboarding /></>;
 }

@@ -9,7 +9,7 @@ mod storage;
 use std::time::Duration;
 
 use state::AppState;
-use tauri::{tray::TrayIconBuilder, Manager, WindowEvent};
+use tauri::{Manager, WindowEvent};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -41,20 +41,12 @@ pub fn run() {
             let repository = tauri::async_runtime::block_on(storage::Repository::open(&data_dir))?;
             let state = tauri::async_runtime::block_on(AppState::new(repository, client))?;
             app.manage(state.clone());
-            services::monitor::start(app.handle().clone(), state);
-
-            if let Some(icon) = app.default_window_icon().cloned() {
-                let _tray = TrayIconBuilder::new()
-                    .icon(icon)
-                    .tooltip("Node Watcher")
-                    .on_tray_icon_event(|tray, _| {
-                        if let Some(window) = tray.app_handle().get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-                    })
-                    .build(app)?;
-            }
+            services::desktop::setup(app, state.clone())?;
+            services::monitor::start(app.handle().clone(), state.clone());
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                services::desktop::refresh_tray(&handle, &state).await;
+            });
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -72,6 +64,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::list_nodes,
             commands::get_dashboard,
+            commands::get_topology,
+            commands::get_recent_network_events,
             commands::upsert_node,
             commands::delete_node,
             commands::move_node,
@@ -84,7 +78,12 @@ pub fn run() {
             commands::scan_subnet,
             commands::cancel_scan,
             commands::list_alerts,
+            commands::get_alert,
             commands::acknowledge_alert,
+            commands::run_node_diagnostic,
+            commands::get_diagnostic_run,
+            commands::list_node_diagnostics,
+            commands::take_pending_navigation,
             commands::get_settings,
             commands::update_settings,
             commands::export_csv,

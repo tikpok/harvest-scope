@@ -3,12 +3,15 @@ import type {
   AlertRecord,
   AppSettings,
   DashboardData,
+  DiagnosticRun,
   MetricPoint,
+  NetworkEvent,
   NetworkInterfaceInfo,
   NodeDetail,
   NodeSummary,
   ScanCandidate,
   ScanRequest,
+  TopologySnapshot,
   UpsertNodeInput,
 } from "../types";
 
@@ -22,8 +25,9 @@ export const defaultSettings: AppSettings = {
   lagCriticalBlocks: 20,
   latencyWarningMs: 2000,
   notificationEnabled: true,
-  backgroundMonitoring: false,
+  backgroundMonitoring: true,
   autostartEnabled: false,
+  onboardingCompleted: false,
   theme: "system",
 };
 
@@ -42,8 +46,13 @@ const emptyDashboard: DashboardData = {
   nodes: [],
 };
 
+const emptyTopology: TopologySnapshot = { nodes: [], edges: [], observedAt: 0 };
+
 export const api = {
   dashboard: () => call("get_dashboard", undefined, emptyDashboard),
+  topology: () => call<TopologySnapshot>("get_topology", undefined, emptyTopology),
+  recentNetworkEvents: (limit = 50) =>
+    call<NetworkEvent[]>("get_recent_network_events", { limit }, []),
   nodes: () => call<NodeSummary[]>("list_nodes", undefined, []),
   nodeDetail: (nodeId: string) => call<NodeDetail | null>("get_node_detail", { nodeId }, null).then((value) => {
     if (!value) throw new Error("ノード情報はTauriアプリで確認できます");
@@ -62,7 +71,14 @@ export const api = {
   scan: (request: ScanRequest) => invoke<ScanCandidate[]>("scan_subnet", { request }),
   cancelScan: () => invoke<void>("cancel_scan"),
   alerts: () => call<AlertRecord[]>("list_alerts", undefined, []),
+  alert: (alertId: string) => invoke<AlertRecord>("get_alert", { alertId }),
   acknowledgeAlert: (alertId: string) => invoke<void>("acknowledge_alert", { alertId }),
+  runNodeDiagnostic: (nodeId: string, alertId?: string) =>
+    invoke<DiagnosticRun>("run_node_diagnostic", { nodeId, alertId }),
+  diagnosticRun: (runId: string) => invoke<DiagnosticRun>("get_diagnostic_run", { runId }),
+  nodeDiagnostics: (nodeId: string, limit = 20) =>
+    call<DiagnosticRun[]>("list_node_diagnostics", { nodeId, limit }, []),
+  takePendingNavigation: () => call<string | null>("take_pending_navigation", undefined, null),
   settings: () => call("get_settings", undefined, defaultSettings),
   updateSettings: (settings: AppSettings) => invoke<AppSettings>("update_settings", { settings }),
   exportCsv: (dataset: "nodes" | "metrics" | "alerts", nodeId?: string) =>

@@ -80,7 +80,7 @@ pub struct ChainSnapshot {
     pub chain_score: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PeerInfo {
     pub key: String,
@@ -95,6 +95,58 @@ pub struct PeerInfo {
 pub struct WebSocketSpec {
     pub url: String,
     pub topics: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopologyNode {
+    pub id: String,
+    pub label: String,
+    pub kind: NodeKind,
+    pub network: Option<String>,
+    pub status: NodeStatus,
+    pub registered: bool,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub version: Option<String>,
+    pub roles: Vec<String>,
+    pub peer_status: Option<String>,
+    pub websocket_connected: bool,
+    pub api_status: Option<String>,
+    pub db_status: Option<String>,
+    pub nis_status_code: Option<i64>,
+    pub height: Option<String>,
+    pub finalized_height: Option<String>,
+    pub lag: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopologyEdge {
+    pub id: String,
+    pub source: String,
+    pub target: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopologySnapshot {
+    pub nodes: Vec<TopologyNode>,
+    pub edges: Vec<TopologyEdge>,
+    pub observed_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkEvent {
+    pub id: String,
+    pub node_id: String,
+    pub kind: String,
+    pub height: Option<String>,
+    pub hash: Option<String>,
+    pub observed_at: i64,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,7 +280,7 @@ pub struct NetworkInterfaceInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct AppSettings {
     pub health_interval_seconds: u64,
     pub chain_interval_seconds: u64,
@@ -241,6 +293,7 @@ pub struct AppSettings {
     pub notification_enabled: bool,
     pub background_monitoring: bool,
     pub autostart_enabled: bool,
+    pub onboarding_completed: bool,
     pub theme: String,
 }
 
@@ -256,8 +309,9 @@ impl Default for AppSettings {
             lag_critical_blocks: 20,
             latency_warning_ms: 2_000,
             notification_enabled: true,
-            background_monitoring: false,
+            background_monitoring: true,
             autostart_enabled: false,
+            onboarding_completed: false,
             theme: "system".into(),
         }
     }
@@ -278,6 +332,67 @@ pub struct AlertRecord {
     pub acknowledged_at: Option<i64>,
     pub resolved_at: Option<i64>,
     pub occurrence_count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AlertMutation {
+    pub alert_id: String,
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiagnosticStatus {
+    Passed,
+    Warning,
+    Failed,
+}
+
+impl DiagnosticStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Warning => "warning",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl TryFrom<&str> for DiagnosticStatus {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "passed" => Ok(Self::Passed),
+            "warning" => Ok(Self::Warning),
+            "failed" => Ok(Self::Failed),
+            _ => Err(format!("不明な診断状態です: {value}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticCheck {
+    pub key: String,
+    pub label: String,
+    pub status: String,
+    pub message: String,
+    pub recommendation: Option<String>,
+    pub duration_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticRun {
+    pub id: String,
+    pub node_id: String,
+    pub alert_id: Option<String>,
+    pub started_at: i64,
+    pub completed_at: i64,
+    pub status: DiagnosticStatus,
+    pub summary: String,
+    pub checks: Vec<DiagnosticCheck>,
 }
 
 #[derive(Debug, Clone, Serialize)]
