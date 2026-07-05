@@ -42,6 +42,11 @@ async fn enter_resume_grace(state: &AppState, now: i64, reason: &str) {
     );
 }
 
+pub(crate) async fn handle_system_resume(state: &AppState, reason: &str) {
+    let now = chrono::Utc::now().timestamp_millis();
+    enter_resume_grace(state, now, reason).await;
+}
+
 async fn update_alert(
     app: &AppHandle,
     state: &AppState,
@@ -106,7 +111,7 @@ async fn monitor_node_inner(
     if request_elapsed >= SUSPENDED_REQUEST_THRESHOLD {
         enter_resume_grace(&state, evaluation_now, "health request was suspended").await;
     }
-    let resume_grace = state.in_resume_grace(evaluation_now);
+    let resume_grace = state.is_system_suspended() || state.in_resume_grace(evaluation_now);
     let mut poll_event = None;
     let mut topology_changed = false;
     let mut runtime_map = state.runtime.lock().await;
@@ -331,7 +336,13 @@ async fn monitor_node_inner(
         last_error: error,
     };
     state.repository.save_sample(&node.id, &sample).await?;
-    if !resume_grace && offline {
+    // Power events can arrive while a request or database write is in flight.
+    // Recheck immediately before mutating alerts so a suspend transition can
+    // never race a stale health result into an offline notification.
+    let evaluation_paused = resume_grace
+        || state.is_system_suspended()
+        || state.in_resume_grace(chrono::Utc::now().timestamp_millis());
+    if !evaluation_paused && offline {
         update_alert(
             &app,
             &state,
@@ -342,7 +353,7 @@ async fn monitor_node_inner(
             "3回連続でノードへ接続できません。",
         )
         .await?;
-    } else if !resume_grace && recovered {
+    } else if !evaluation_paused && recovered {
         update_alert(
             &app,
             &state,
@@ -354,7 +365,7 @@ async fn monitor_node_inner(
         )
         .await?;
     }
-    if !resume_grace && latency_alert {
+    if !evaluation_paused && latency_alert {
         update_alert(
             &app,
             &state,
@@ -365,7 +376,7 @@ async fn monitor_node_inner(
             "REST APIの応答遅延が継続しています。",
         )
         .await?;
-    } else if !resume_grace && latency_recovered {
+    } else if !evaluation_paused && latency_recovered {
         update_alert(
             &app,
             &state,
@@ -377,7 +388,7 @@ async fn monitor_node_inner(
         )
         .await?;
     }
-    if resume_grace {
+    if evaluation_paused {
         let _ = app.emit("node-updated", &node.id);
         desktop::refresh_tray(&app, &state).await;
         return Ok(());
@@ -435,6 +446,9 @@ pub async fn monitor_node(
     node: StoredNode,
     force: bool,
 ) -> AppResult<()> {
+    if state.is_system_suspended() {
+        return Ok(());
+    }
     let node_id = node.id.clone();
     {
         let mut active = state.monitoring_nodes.lock().await;
