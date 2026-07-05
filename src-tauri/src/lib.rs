@@ -41,6 +41,15 @@ pub fn run() {
             let repository = tauri::async_runtime::block_on(storage::Repository::open(&data_dir))?;
             let state = tauri::async_runtime::block_on(AppState::new(repository, client))?;
             app.manage(state.clone());
+            #[cfg(target_os = "windows")]
+            match services::power::register(state.clone()) {
+                Ok(listener) => {
+                    app.manage(listener);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "failed to register Windows suspend/resume notifications");
+                }
+            }
             services::desktop::setup(app, state.clone())?;
             services::monitor::start(app.handle().clone(), state.clone());
             let handle = app.handle().clone();

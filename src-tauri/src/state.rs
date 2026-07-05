@@ -64,6 +64,7 @@ pub struct AppState {
     pub network_events: Arc<Mutex<VecDeque<NetworkEvent>>>,
     pub pending_navigation: Arc<Mutex<Option<String>>>,
     pub resume_grace_until: Arc<AtomicI64>,
+    pub system_suspended: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -84,6 +85,7 @@ impl AppState {
             network_events: Arc::new(Mutex::new(VecDeque::with_capacity(500))),
             pending_navigation: Arc::new(Mutex::new(None)),
             resume_grace_until: Arc::new(AtomicI64::new(0)),
+            system_suspended: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -102,6 +104,14 @@ impl AppState {
 
     pub fn in_resume_grace(&self, now: i64) -> bool {
         now < self.resume_grace_until.load(Ordering::Relaxed)
+    }
+
+    pub fn set_system_suspended(&self, suspended: bool) {
+        self.system_suspended.store(suspended, Ordering::Release);
+    }
+
+    pub fn is_system_suspended(&self) -> bool {
+        self.system_suspended.load(Ordering::Acquire)
     }
 }
 

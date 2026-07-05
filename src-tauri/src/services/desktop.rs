@@ -13,6 +13,16 @@ use crate::{
 };
 
 const TRAY_ID: &str = "monitor-center";
+static TRAY_REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct TrayMenuState {
+    status: MenuItem<tauri::Wry>,
+}
+
+struct TrayMenu {
+    menu: Menu<tauri::Wry>,
+    status: MenuItem<tauri::Wry>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayStatus {
@@ -133,22 +143,23 @@ async fn refresh_all(app: AppHandle, state: AppState) {
     }
 }
 
-fn build_menu(app: &AppHandle, summary: &str) -> tauri::Result<Menu<tauri::Wry>> {
+fn build_menu(app: &AppHandle, summary: &str) -> tauri::Result<TrayMenu> {
     let status = MenuItem::with_id(app, "status", summary, false, None::<&str>)?;
     let latest = MenuItem::with_id(app, "latest-alert", "最新の障害を表示", true, None::<&str>)?;
     let refresh = MenuItem::with_id(app, "refresh-all", "全ノードを更新", true, None::<&str>)?;
     let open = MenuItem::with_id(app, "open", "Node Watcherを開く", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "設定", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "終了", true, None::<&str>)?;
-    Menu::with_items(app, &[&status, &latest, &refresh, &open, &settings, &quit])
+    let menu = Menu::with_items(app, &[&status, &latest, &refresh, &open, &settings, &quit])?;
+    Ok(TrayMenu { menu, status })
 }
 
 pub fn setup(app: &tauri::App, state: AppState) -> tauri::Result<()> {
-    let menu = build_menu(app.handle(), "状態を確認中")?;
+    let tray_menu = build_menu(app.handle(), "状態を確認中")?;
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon(TrayStatus::Inactive))
         .tooltip("Node Watcher - 状態を確認中")
-        .menu(&menu)
+        .menu(&tray_menu.menu)
         .show_menu_on_left_click(false)
         .on_tray_icon_event(|tray, event| {
             if matches!(
@@ -183,10 +194,14 @@ pub fn setup(app: &tauri::App, state: AppState) -> tauri::Result<()> {
             _ => {}
         })
         .build(app)?;
+    app.manage(TrayMenuState {
+        status: tray_menu.status,
+    });
     Ok(())
 }
 
 pub async fn refresh_tray(app: &AppHandle, state: &AppState) {
+    let _guard = TRAY_REFRESH_LOCK.lock().await;
     let Ok(nodes) = state.repository.list_nodes().await else {
         if let Some(tray) = app.tray_by_id(TRAY_ID) {
             let _ = tray.set_icon(Some(icon(TrayStatus::Inactive)));
@@ -199,8 +214,14 @@ pub async fn refresh_tray(app: &AppHandle, state: &AppState) {
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         let _ = tray.set_icon(Some(icon(status)));
         let _ = tray.set_tooltip(Some(format!("Node Watcher - {summary}")));
-        if let Ok(menu) = build_menu(app, &summary) {
-            let _ = tray.set_menu(Some(menu));
+        if let Some(menu) = app.try_state::<TrayMenuState>() {
+            let should_update = menu
+                .status
+                .text()
+                .map_or(true, |current| current != summary);
+            if should_update {
+                let _ = menu.status.set_text(&summary);
+            }
         }
     }
 }
