@@ -65,6 +65,8 @@ pub struct AppState {
     pub pending_navigation: Arc<Mutex<Option<String>>>,
     pub resume_grace_until: Arc<AtomicI64>,
     pub system_suspended: Arc<AtomicBool>,
+    pub all_nodes_rechecking: Arc<AtomicBool>,
+    pub all_nodes_refresh_lock: Arc<Mutex<()>>,
 }
 
 impl AppState {
@@ -86,6 +88,8 @@ impl AppState {
             pending_navigation: Arc::new(Mutex::new(None)),
             resume_grace_until: Arc::new(AtomicI64::new(0)),
             system_suspended: Arc::new(AtomicBool::new(false)),
+            all_nodes_rechecking: Arc::new(AtomicBool::new(false)),
+            all_nodes_refresh_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -112,6 +116,15 @@ impl AppState {
 
     pub fn is_system_suspended(&self) -> bool {
         self.system_suspended.load(Ordering::Acquire)
+    }
+
+    pub fn set_all_nodes_rechecking(&self, rechecking: bool) {
+        self.all_nodes_rechecking
+            .store(rechecking, Ordering::Release);
+    }
+
+    pub fn is_all_nodes_rechecking(&self) -> bool {
+        self.all_nodes_rechecking.load(Ordering::Acquire)
     }
 }
 

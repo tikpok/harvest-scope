@@ -2447,7 +2447,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "node-watcher"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2459,6 +2459,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tauri",
  "tauri-build",

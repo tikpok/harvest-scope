@@ -166,6 +166,10 @@ async fn monitor_node_inner(
                         kind: "pollUpdate".into(),
                         height: chain.height.map(|height| height.to_string()),
                         hash: None,
+                        signer_public_key: None,
+                        harvester_public_key: None,
+                        harvested_node_id: None,
+                        observer_node_id: None,
                         observed_at: now,
                         source: "polling".into(),
                     });
@@ -194,6 +198,40 @@ async fn monitor_node_inner(
                 Err(err) => error = Some(err.to_string()),
             },
             Err(err) => error = Some(err.to_string()),
+        }
+    }
+    let mut delegated_harvester_count = None;
+    let mut delegated_harvester_delta = None;
+    let mut total_importance = None;
+    let mut total_balance_micro_xym = None;
+    let mut harvest_metric_error = None;
+    if node.kind == NodeKind::Symbol && health.is_some() && peers_due {
+        match adapter.fetch_harvest_metrics().await {
+            Ok(harvest) if harvest.supported => {
+                delegated_harvester_count = harvest.delegated_harvester_count;
+                total_importance = harvest.total_importance;
+                total_balance_micro_xym = harvest.total_balance_micro_xym;
+                harvest_metric_error = harvest.error;
+                if let Some(count) = delegated_harvester_count {
+                    let cutoff = now.saturating_sub(24 * 60 * 60 * 1_000);
+                    if let Ok(Some(previous)) = state
+                        .repository
+                        .harvester_count_at_or_before(&node.id, cutoff)
+                        .await
+                    {
+                        delegated_harvester_delta = Some(count.saturating_sub(previous));
+                    }
+                }
+                if let Err(err) = state
+                    .repository
+                    .replace_harvesters(&node.id, &harvest.harvester_public_keys, now)
+                    .await
+                {
+                    harvest_metric_error = Some(err.to_string());
+                }
+            }
+            Ok(_) => {}
+            Err(err) => harvest_metric_error = Some(err.to_string()),
         }
     }
     let static_due = force || now - runtime.last_static_poll >= 15 * 60 * 1_000;
@@ -245,7 +283,9 @@ async fn monitor_node_inner(
         .lag_critical_since
         .is_some_and(|since| now - since >= 10 * 60 * 1_000);
     let health_degraded = health.as_ref().is_some_and(|health| !health.healthy);
-    let status = if runtime.consecutive_failures >= 3 {
+    let status = if resume_grace && health.is_none() {
+        NodeStatus::Unknown
+    } else if runtime.consecutive_failures >= 3 {
         NodeStatus::Offline
     } else if runtime.consecutive_failures > 0 || health_degraded {
         NodeStatus::Warning
@@ -334,6 +374,11 @@ async fn monitor_node_inner(
         db_status,
         nis_status_code,
         last_error: error,
+        delegated_harvester_count,
+        delegated_harvester_delta,
+        total_importance,
+        total_balance_micro_xym,
+        harvest_metric_error,
     };
     state.repository.save_sample(&node.id, &sample).await?;
     // Power events can arrive while a request or database write is in flight.
@@ -486,6 +531,33 @@ pub async fn monitor_node(
     result
 }
 
+pub async fn refresh_all_nodes(app: AppHandle, state: AppState) -> AppResult<()> {
+    let Ok(_refresh_guard) = state.all_nodes_refresh_lock.try_lock() else {
+        return Ok(());
+    };
+    state.set_all_nodes_rechecking(true);
+    let _ = app.emit("refresh-all-state-changed", true);
+
+    let result = async {
+        let nodes = state.repository.list_stored_nodes(true).await?;
+        let results = futures_util::future::join_all(nodes.into_iter().map(|node| {
+            let app = app.clone();
+            let state = state.clone();
+            async move { monitor_node(app, state, node, true).await }
+        }))
+        .await;
+        results
+            .into_iter()
+            .collect::<AppResult<Vec<_>>>()
+            .map(|_| ())
+    }
+    .await;
+
+    state.set_all_nodes_rechecking(false);
+    let _ = app.emit("refresh-all-state-changed", false);
+    result
+}
+
 async fn compare_state_hashes(app: AppHandle, state: AppState) -> AppResult<()> {
     if state.in_resume_grace(chrono::Utc::now().timestamp_millis()) {
         return Ok(());
@@ -553,6 +625,15 @@ pub fn start(app: AppHandle, state: AppState) {
             let cycle_started_at = chrono::Utc::now().timestamp_millis();
             if expected_wake_at.is_some_and(|expected| wake_was_late(expected, cycle_started_at)) {
                 enter_resume_grace(&state, cycle_started_at, "monitor loop woke late").await;
+                state.set_system_suspended(false);
+                let app_for_refresh = app.clone();
+                let state_for_refresh = state.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = refresh_all_nodes(app_for_refresh, state_for_refresh).await
+                    {
+                        tracing::warn!(%error, "post-resume node refresh failed");
+                    }
+                });
             }
             let settings = state.settings.read().await.clone();
             let nodes = state

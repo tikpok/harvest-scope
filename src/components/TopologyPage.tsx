@@ -12,6 +12,7 @@ const labels: Record<NetworkEventKind, string> = {
   block: "ブロック高更新",
   finalizedBlock: "ファイナライズ高更新",
   pollUpdate: "ブロック高更新",
+  harvestedBlock: "ハーベスト検知",
 };
 
 const peerStatusLabels: Record<string, string> = {
@@ -35,6 +36,8 @@ function NodeInspector({ node, connections, onOpen }: { node: TopologyNode; conn
       {node.registered && <div><dt>ブロック高</dt><dd>{node.height ?? "—"}{node.kind === "symbol" && node.finalizedHeight ? ` / F ${node.finalizedHeight}` : ""}</dd></div>}
       {node.kind === "symbol" && node.registered && <div><dt>ライブ接続</dt><dd className={node.websocketConnected ? "text-good" : "muted"}>{node.websocketConnected ? "WebSocket接続中" : "RESTフォールバック"}</dd></div>}
       {node.kind === "symbol" && node.registered && <div><dt>API / DB</dt><dd>{[node.apiStatus, node.dbStatus].filter(Boolean).join(" / ") || "—"}</dd></div>}
+      {node.kind === "symbol" && node.registered && <div><dt>委任者</dt><dd>{node.showHarvestMetrics ? node.delegatedHarvesterCount ?? "—" : "非表示"}</dd></div>}
+      {node.kind === "symbol" && node.registered && <div><dt>最新ハーベスト</dt><dd>{node.latestHarvestAt ? new Date(node.latestHarvestAt).toLocaleTimeString("ja-JP") : "—"}</dd></div>}
       {node.kind === "nis1" && node.registered && <div><dt>NIS状態コード</dt><dd>{node.nisStatusCode ?? "—"}</dd></div>}
     </dl>
     {node.roles.length > 0 && <div className="topology-role-list">{node.roles.map((role) => <span key={role}>{role}</span>)}</div>}
@@ -131,24 +134,38 @@ export function TopologyPage() {
     <div className="topology-layout">
       <section className="panel topology-canvas-panel">
         <div className="topology-legend"><span><i className="legend-node legend-node--registered" />監視ノード</span><span><i className="legend-node legend-node--shared" />共有ピア</span><span><i className="legend-line legend-line--active" />active</span><span><i className="legend-line legend-line--busy" />busy</span><span><i className="legend-line legend-line--failure" />failure</span><span><i className="legend-flow" />推定伝播</span></div>
-        {isLoading ? <div className="loading">トポロジーを読み込み中…</div> : graph.nodes.length === 0 ? <div className="empty-state"><h3>表示できるノードがありません</h3><p>ノードを登録し、最初のピア情報が取得されるまでお待ちください。</p></div> : <TopologyGraph nodes={graph.nodes} edges={graph.edges} events={paused ? [] : visibleEvents} now={now} wideView={showExternal} selectedNodeId={selectedNodeId} onInspectNode={setSelectedNodeId} />}
+        {isLoading ? <div className="loading">トポロジーを読み込み中…</div> : graph.nodes.length === 0 ? <div className="empty-state"><h3>表示できるノードがありません</h3><p>ノードを登録し、最初のピア情報が取得されるまでお待ちください。</p></div> : <TopologyGraph nodes={graph.nodes} edges={graph.edges} events={paused ? [] : visibleEvents} now={now} wideView={showExternal} selectedNodeId={selectedNodeId} onInspectNode={setSelectedNodeId} onClearSelection={() => setSelectedNodeId(null)} />}
       </section>
-      <aside className="panel topology-events">
-        {selectedNode && <NodeInspector node={selectedNode} connections={summary.degrees.get(selectedNode.id) ?? 0} onOpen={() => navigate(`/nodes/${selectedNode.id}`)} />}
-        <section className="topology-network-summary">
-          <h3>ネットワーク構成</h3>
-          <div className="topology-version-list">{summary.versions.length ? summary.versions.map(([version, count]) => <span key={version}>v{version}<strong>{count}</strong></span>) : <small>バージョン情報を収集中…</small>}</div>
-        </section>
-        <div className="panel__header"><div><h2>観測イベント</h2><p>直近1分・最大80件</p></div></div>
-        <div className="topology-event-list">
-          {visibleEvents.length === 0 ? <p className="topology-event-empty">イベントを待っています…</p> : visibleEvents.slice(0, 16).map((event) => {
-            const node = data.nodes.find((item) => item.id === event.nodeId);
-            return <article key={event.id} className={`topology-event topology-event--${event.kind}`}>
-              <i /><div><strong>{labels[event.kind]}</strong><span>{node?.label ?? event.nodeId}</span><small>{event.height ? `高さ ${event.height} · ` : ""}{event.source === "websocket" ? "WebSocket" : "ポーリング"} · {new Date(event.observedAt).toLocaleTimeString("ja-JP")}</small></div>
-            </article>;
-          })}
-        </div>
-        <p className="topology-disclaimer">粒子は観測順と現在のピア関係から描く推定表現です。実際の送信元やパケット経路を示すものではありません。</p>
+      <aside className={`panel topology-events${selectedNode ? " topology-events--inspecting" : ""}`}>
+        {selectedNode ? (
+          <NodeInspector node={selectedNode} connections={summary.degrees.get(selectedNode.id) ?? 0} onOpen={() => navigate(`/nodes/${selectedNode.id}`)} />
+        ) : <>
+          <section className="topology-network-summary">
+            <h3>ネットワーク構成</h3>
+            <div className="topology-version-list">{summary.versions.length ? summary.versions.map(([version, count]) => <span key={version}>v{version}<strong>{count}</strong></span>) : <small>バージョン情報を収集中…</small>}</div>
+          </section>
+          <div className="panel__header"><div><h2>観測イベント</h2><p>直近1分・最大80件</p></div></div>
+          <div className="topology-event-list">
+            {visibleEvents.length === 0 ? <p className="topology-event-empty">イベントを待っています…</p> : visibleEvents.slice(0, 80).map((event) => {
+              const targetNodeId = event.harvestedNodeId ?? event.nodeId;
+              const node = data.nodes.find((item) => item.id === targetNodeId);
+              const detail = event.kind === "harvestedBlock"
+                ? `${event.harvesterPublicKey ? `${event.harvesterPublicKey.slice(0, 6)}…${event.harvesterPublicKey.slice(-6)} · ` : ""}${event.observerNodeId ? `観測 ${data.nodes.find((item) => item.id === event.observerNodeId)?.label ?? event.observerNodeId}` : "WebSocket"}`
+                : event.source === "websocket" ? "WebSocket" : "ポーリング";
+              return <article
+                key={event.id}
+                className={`topology-event topology-event--${event.kind}`}
+                role="button"
+                tabIndex={0}
+                onClick={() => setSelectedNodeId(targetNodeId)}
+                onKeyDown={(keyboardEvent) => { if (keyboardEvent.key === "Enter" || keyboardEvent.key === " ") setSelectedNodeId(targetNodeId); }}
+              >
+                <i /><div><strong>{labels[event.kind]}</strong><span>{node?.label ?? targetNodeId}</span><small>{event.height ? `高さ ${event.height} · ` : ""}{detail} · {new Date(event.observedAt).toLocaleTimeString("ja-JP")}</small></div>
+              </article>;
+            })}
+          </div>
+          <p className="topology-disclaimer">粒子は観測順と現在のピア関係から描く推定表現です。実際の送信元やパケット経路を示すものではありません。</p>
+        </>}
       </aside>
     </div>
   </>;

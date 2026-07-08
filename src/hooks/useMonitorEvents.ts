@@ -22,6 +22,9 @@ export function useMonitorEvents() {
       listen<string>("monitor-state-changed", ({ payload: nodeId }) => {
         void queryClient.invalidateQueries({ queryKey: ["node", nodeId] });
       }),
+      listen("refresh-all-state-changed", () => {
+        void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+      }),
       listen("navigate-requested", () => {
         void api.takePendingNavigation().then((path) => {
           if (path) navigate(path);
