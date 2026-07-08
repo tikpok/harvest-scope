@@ -6,7 +6,7 @@ use tauri::{AppHandle, Emitter};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
-    domain::{NetworkEvent, WebSocketSpec},
+    domain::{HarvestEvent, NetworkEvent, WebSocketSpec},
     state::AppState,
 };
 
@@ -33,15 +33,81 @@ fn parse_network_event(node_id: &str, text: &str) -> Option<NetworkEvent> {
             .or_else(|| data.get("hash"))
             .or_else(|| block.get("hash")),
     );
+    let signer_public_key = value_string(
+        block
+            .get("signerPublicKey")
+            .or_else(|| data.get("signerPublicKey"))
+            .or_else(|| {
+                block
+                    .get("signer")
+                    .and_then(|signer| signer.get("publicKey"))
+            }),
+    )
+    .map(|value| value.to_ascii_uppercase());
     Some(NetworkEvent {
         id: uuid::Uuid::new_v4().to_string(),
         node_id: node_id.to_owned(),
         kind: kind.to_owned(),
         height,
         hash,
+        signer_public_key,
+        harvester_public_key: None,
+        harvested_node_id: None,
+        observer_node_id: None,
         observed_at: chrono::Utc::now().timestamp_millis(),
         source: "websocket".into(),
     })
+}
+
+async fn publish_harvest_events(app: &AppHandle, state: &AppState, event: &NetworkEvent) {
+    if event.kind != "block" {
+        return;
+    }
+    let Some(signer_public_key) = event.signer_public_key.as_ref() else {
+        return;
+    };
+    let Ok(node_ids) = state
+        .repository
+        .harvest_nodes_for_public_key(signer_public_key)
+        .await
+    else {
+        return;
+    };
+    for node_id in node_ids {
+        let harvest = HarvestEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            node_id: node_id.clone(),
+            observer_node_id: event.node_id.clone(),
+            harvester_public_key: signer_public_key.clone(),
+            height: event.height.clone(),
+            hash: event.hash.clone(),
+            observed_at: event.observed_at,
+        };
+        let Ok(inserted) = state.repository.record_harvest_event(&harvest).await else {
+            continue;
+        };
+        if !inserted {
+            continue;
+        }
+        publish_event(
+            app,
+            state,
+            NetworkEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                node_id: node_id.clone(),
+                kind: "harvestedBlock".into(),
+                height: event.height.clone(),
+                hash: event.hash.clone(),
+                signer_public_key: event.signer_public_key.clone(),
+                harvester_public_key: Some(signer_public_key.clone()),
+                harvested_node_id: Some(node_id),
+                observer_node_id: Some(event.node_id.clone()),
+                observed_at: event.observed_at,
+                source: "websocket".into(),
+            },
+        )
+        .await;
+    }
 }
 
 pub async fn publish_event(app: &AppHandle, state: &AppState, event: NetworkEvent) {
@@ -104,6 +170,7 @@ pub async fn ensure_started(app: AppHandle, state: AppState, node_id: String, sp
                         match message {
                             Ok(Message::Text(text)) => {
                                 if let Some(event) = parse_network_event(&node_id, &text) {
+                                    publish_harvest_events(&app, &state, &event).await;
                                     publish_event(&app, &state, event).await;
                                 }
                                 let _ = app.emit("node-updated", &node_id);
@@ -151,6 +218,17 @@ mod tests {
         assert_eq!(event.kind, "block");
         assert_eq!(event.height.as_deref(), Some("123"));
         assert_eq!(event.hash.as_deref(), Some("ABC"));
+    }
+
+    #[test]
+    fn parses_block_signer_public_key() {
+        let event = parse_network_event(
+            "node-a",
+            r#"{"topic":"block","data":{"block":{"height":"123","signerPublicKey":"abc"}}}"#,
+        )
+        .expect("block event should parse");
+
+        assert_eq!(event.signer_public_key.as_deref(), Some("ABC"));
     }
 
     #[test]

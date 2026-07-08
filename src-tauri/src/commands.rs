@@ -11,9 +11,9 @@ use tauri_plugin_dialog::DialogExt;
 use crate::{
     adapters::{adapter_for, normalize_base_url, probe_endpoint},
     domain::{
-        AlertRecord, AppSettings, DashboardData, DiagnosticRun, MetricPoint, NetworkEvent,
-        NetworkInterfaceInfo, NodeDetail, NodeSample, NodeStatus, NodeSummary, ScanCandidate,
-        ScanRequest, TopologyEdge, TopologyNode, TopologySnapshot, UpsertNodeInput,
+        AlertRecord, AppSettings, DashboardData, DiagnosticRun, HarvestEvent, MetricPoint,
+        NetworkEvent, NetworkInterfaceInfo, NodeDetail, NodeSample, NodeStatus, NodeSummary,
+        ScanCandidate, ScanRequest, TopologyEdge, TopologyNode, TopologySnapshot, UpsertNodeInput,
     },
     error::{AppError, AppResult},
     services::{desktop, diagnostic as diagnostic_service, discovery, monitor},
@@ -46,13 +46,20 @@ pub async fn get_dashboard(state: State<'_, AppState>) -> AppResult<DashboardDat
             .iter()
             .filter(|node| node.status == NodeStatus::Offline)
             .count(),
+        rechecking: state.is_all_nodes_rechecking(),
         nodes,
     })
 }
 
 #[tauri::command]
 pub async fn get_topology(state: State<'_, AppState>) -> AppResult<TopologySnapshot> {
-    let summaries = state.repository.list_nodes().await?;
+    let summaries = state
+        .repository
+        .list_nodes()
+        .await?
+        .into_iter()
+        .filter(|node| node.enabled)
+        .collect::<Vec<_>>();
     let stored = state.repository.list_stored_nodes(false).await?;
     let connections = state.repository.list_peer_connections().await?;
     let health_by_node = state.repository.latest_topology_health().await?;
@@ -112,6 +119,7 @@ pub async fn get_topology(state: State<'_, AppState>) -> AppResult<TopologySnaps
                 network: node.network,
                 status: node.status,
                 registered: true,
+                enabled: node.enabled,
                 host,
                 port,
                 peer_status: None,
@@ -121,6 +129,9 @@ pub async fn get_topology(state: State<'_, AppState>) -> AppResult<TopologySnaps
                 height: node.height,
                 finalized_height: node.finalized_height,
                 lag: node.lag,
+                show_harvest_metrics: node.show_harvest_metrics,
+                delegated_harvester_count: node.delegated_harvester_count,
+                latest_harvest_at: node.latest_harvest_at,
             }
         })
         .collect::<Vec<_>>();
@@ -132,6 +143,9 @@ pub async fn get_topology(state: State<'_, AppState>) -> AppResult<TopologySnaps
         let Some(source_node) = stored_by_id.get(&source) else {
             continue;
         };
+        if !source_node.enabled {
+            continue;
+        }
         let target = public_keys
             .get(&peer.key.to_ascii_lowercase())
             .cloned()
@@ -164,6 +178,7 @@ pub async fn get_topology(state: State<'_, AppState>) -> AppResult<TopologySnaps
                 network: source_node.network.clone(),
                 status: NodeStatus::Unknown,
                 registered: false,
+                enabled: true,
                 host: peer.host.clone(),
                 port: peer.port,
                 version: peer.version.clone(),
@@ -176,6 +191,9 @@ pub async fn get_topology(state: State<'_, AppState>) -> AppResult<TopologySnaps
                 height: None,
                 finalized_height: None,
                 lag: None,
+                show_harvest_metrics: false,
+                delegated_harvester_count: None,
+                latest_harvest_at: None,
             });
         }
         let (left, right) = if source <= target {
@@ -209,6 +227,17 @@ pub async fn get_recent_network_events(
     let events = state.network_events.lock().await;
     let limit = limit.unwrap_or(50).min(200);
     Ok(events.iter().rev().take(limit).cloned().collect())
+}
+
+#[tauri::command]
+pub async fn get_recent_harvest_events(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> AppResult<Vec<HarvestEvent>> {
+    state
+        .repository
+        .recent_harvest_events(limit.unwrap_or(50))
+        .await
 }
 
 #[tauri::command]
@@ -270,6 +299,11 @@ pub async fn upsert_node(
             db_status: health.db_status,
             nis_status_code: health.nis_status_code,
             last_error: None,
+            delegated_harvester_count: None,
+            delegated_harvester_delta: None,
+            total_importance: None,
+            total_balance_micro_xym: None,
+            harvest_metric_error: None,
         },
         Err(error) => NodeSample {
             observed_at,
@@ -286,6 +320,11 @@ pub async fn upsert_node(
             db_status: None,
             nis_status_code: None,
             last_error: Some(error.to_string()),
+            delegated_harvester_count: None,
+            delegated_harvester_delta: None,
+            total_importance: None,
+            total_balance_micro_xym: None,
+            harvest_metric_error: None,
         },
     };
     state
@@ -379,6 +418,22 @@ pub async fn resume_node(
 }
 
 #[tauri::command]
+pub async fn set_node_harvest_metrics_visible(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    node_id: String,
+    visible: bool,
+) -> AppResult<()> {
+    state
+        .repository
+        .set_harvest_metrics_visible(&node_id, visible)
+        .await?;
+    let _ = app.emit("node-updated", &node_id);
+    let _ = app.emit("topology-updated", &node_id);
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn refresh_node(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -386,6 +441,14 @@ pub async fn refresh_node(
 ) -> AppResult<()> {
     let node = state.repository.get_stored_node(&node_id).await?;
     monitor::monitor_node(app, state.inner().clone(), node, true).await
+}
+
+#[tauri::command]
+pub async fn refresh_all_nodes(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
+    // A user clicking this button is definitive proof that Windows is awake.
+    // This also recovers if a resume notification was missed by the OS.
+    state.set_system_suspended(false);
+    monitor::refresh_all_nodes(app, state.inner().clone()).await
 }
 
 #[tauri::command]
@@ -553,6 +616,9 @@ pub async fn export_csv(
                 "高さ".into(),
                 "遅延".into(),
                 "REST応答ms".into(),
+                "委任者数".into(),
+                "24時間増減".into(),
+                "合計XYM(micro)".into(),
             ]];
             rows.extend(
                 state
@@ -572,6 +638,13 @@ pub async fn export_csv(
                             node.latency_ms
                                 .map(|value| value.to_string())
                                 .unwrap_or_default(),
+                            node.delegated_harvester_count
+                                .map(|value| value.to_string())
+                                .unwrap_or_default(),
+                            node.delegated_harvester_delta
+                                .map(|value| value.to_string())
+                                .unwrap_or_default(),
+                            node.total_balance_micro_xym.unwrap_or_default(),
                         ]
                     }),
             );
@@ -619,6 +692,10 @@ pub async fn export_csv(
                 "同期遅延".into(),
                 "ピア数".into(),
                 "REST応答ms".into(),
+                "委任者数".into(),
+                "24時間増減".into(),
+                "合計XYM(micro)".into(),
+                "合計importance".into(),
             ]];
             let metrics = state
                 .repository
@@ -639,6 +716,16 @@ pub async fn export_csv(
                         .latency_ms
                         .map(|value| value.to_string())
                         .unwrap_or_default(),
+                    point
+                        .delegated_harvester_count
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                    point
+                        .delegated_harvester_delta
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                    point.total_balance_micro_xym.unwrap_or_default(),
+                    point.total_importance.unwrap_or_default(),
                 ]
             }));
             rows

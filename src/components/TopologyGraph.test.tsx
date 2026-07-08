@@ -3,29 +3,33 @@ import { TopologyGraph } from "./TopologyGraph";
 import type { NetworkEvent, TopologyEdge, TopologyNode } from "../types";
 
 const nodes: TopologyNode[] = [
-  { id: "node-a", label: "Node A", kind: "symbol", network: "Symbol-104", status: "healthy", registered: true, host: "192.0.2.10", port: 3000, version: "1.0.3.7", roles: ["Peer", "API"], peerStatus: null, websocketConnected: true, apiStatus: "up", dbStatus: "up", nisStatusCode: null, height: "123", finalizedHeight: "120", lag: "0" },
-  { id: "external:symbol:peer-b", label: "Peer B", kind: "symbol", network: "Symbol-104", status: "unknown", registered: false, host: "192.0.2.10", port: 7900, version: "1.0.3.7", roles: [], peerStatus: "active", websocketConnected: false, apiStatus: null, dbStatus: null, nisStatusCode: null, height: null, finalizedHeight: null, lag: null },
-  { id: "external:symbol:peer-c", label: "Peer C", kind: "symbol", network: "Symbol-104", status: "unknown", registered: false, host: "192.0.2.10", port: 7900, version: "1.0.3.6", roles: [], peerStatus: "active", websocketConnected: false, apiStatus: null, dbStatus: null, nisStatusCode: null, height: null, finalizedHeight: null, lag: null },
+  { id: "node-a", label: "Node A", kind: "symbol", network: "Symbol-104", status: "healthy", registered: true, enabled: true, host: "192.0.2.10", port: 3000, version: "1.0.3.7", roles: ["Peer", "API"], peerStatus: null, websocketConnected: true, apiStatus: "up", dbStatus: "up", nisStatusCode: null, height: "123", finalizedHeight: "120", lag: "0", showHarvestMetrics: true, delegatedHarvesterCount: 2, latestHarvestAt: 1_800 },
+  { id: "external:symbol:peer-b", label: "Peer B", kind: "symbol", network: "Symbol-104", status: "unknown", registered: false, enabled: true, host: "192.0.2.10", port: 7900, version: "1.0.3.7", roles: [], peerStatus: "active", websocketConnected: false, apiStatus: null, dbStatus: null, nisStatusCode: null, height: null, finalizedHeight: null, lag: null, showHarvestMetrics: false, delegatedHarvesterCount: null, latestHarvestAt: null },
+  { id: "external:symbol:peer-c", label: "Peer C", kind: "symbol", network: "Symbol-104", status: "unknown", registered: false, enabled: true, host: "192.0.2.10", port: 7900, version: "1.0.3.6", roles: [], peerStatus: "active", websocketConnected: false, apiStatus: null, dbStatus: null, nisStatusCode: null, height: null, finalizedHeight: null, lag: null, showHarvestMetrics: false, delegatedHarvesterCount: null, latestHarvestAt: null },
 ];
 const edges: TopologyEdge[] = [
   { id: "node-a|peer-b", source: "node-a", target: "external:symbol:peer-b", status: "active" },
   { id: "node-a|peer-c", source: "node-a", target: "external:symbol:peer-c", status: "active" },
 ];
 const events: NetworkEvent[] = [
-  { id: "event-1", nodeId: "node-a", kind: "block", height: "123", hash: "ABC", observedAt: 1_000, source: "websocket" },
-  { id: "event-2", nodeId: "node-a", kind: "block", height: "124", hash: "DEF", observedAt: 1_500, source: "websocket" },
-  { id: "event-3", nodeId: "external:symbol:peer-b", kind: "pollUpdate", height: "124", hash: null, observedAt: 1_200, source: "polling" },
+  { id: "event-1", nodeId: "node-a", kind: "block", height: "123", hash: "ABC", signerPublicKey: null, harvesterPublicKey: null, harvestedNodeId: null, observerNodeId: null, observedAt: 1_000, source: "websocket" },
+  { id: "event-2", nodeId: "node-a", kind: "block", height: "124", hash: "DEF", signerPublicKey: null, harvesterPublicKey: null, harvestedNodeId: null, observerNodeId: null, observedAt: 1_500, source: "websocket" },
+  { id: "event-3", nodeId: "external:symbol:peer-b", kind: "pollUpdate", height: "124", hash: null, signerPublicKey: null, harvesterPublicKey: null, harvestedNodeId: null, observerNodeId: null, observedAt: 1_200, source: "polling" },
 ];
 
 test("トポロジーを描画し登録ノードを選択できる", () => {
   const onInspectNode = vi.fn();
-  render(<TopologyGraph nodes={nodes} edges={edges} events={events} now={2_000} wideView={false} selectedNodeId={null} onInspectNode={onInspectNode} />);
+  const onClearSelection = vi.fn();
+  render(<TopologyGraph nodes={nodes} edges={edges} events={events} now={2_000} wideView={false} selectedNodeId={null} onInspectNode={onInspectNode} onClearSelection={onClearSelection} />);
 
-  expect(screen.getByRole("img", { name: "監視ノードのネットワークトポロジー" })).toBeInTheDocument();
+  const graph = screen.getByRole("img", { name: "監視ノードのネットワークトポロジー" });
+  expect(graph).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Node Aの情報を表示" }));
   expect(onInspectNode).toHaveBeenCalledWith("node-a");
   fireEvent.click(screen.getByRole("button", { name: "Peer Bの情報を表示" }));
   expect(onInspectNode).toHaveBeenCalledWith("external:symbol:peer-b");
+  fireEvent.click(graph);
+  expect(onClearSelection).toHaveBeenCalledOnce();
   expect(document.querySelector("animateMotion")).toBeInTheDocument();
   expect(document.querySelectorAll(".topology-particle")).toHaveLength(2);
   expect(document.querySelectorAll(".topology-edge--status-active")).toHaveLength(2);
@@ -53,7 +57,7 @@ function externalNode(index: number): TopologyNode {
 
 test("監視ノード50台を重複しない多重リングへ配置する", () => {
   const manyNodes = Array.from({ length: 50 }, (_, index) => registeredNode(index));
-  const { container } = render(<TopologyGraph nodes={manyNodes} edges={[]} events={[]} now={2_000} wideView={false} selectedNodeId={null} onInspectNode={vi.fn()} />);
+  const { container } = render(<TopologyGraph nodes={manyNodes} edges={[]} events={[]} now={2_000} wideView={false} selectedNodeId={null} onInspectNode={vi.fn()} onClearSelection={vi.fn()} />);
   const svg = screen.getByRole("img", { name: "監視ノードのネットワークトポロジー" });
   const renderedNodes = [...container.querySelectorAll<SVGGElement>(".topology-node--registered")];
   const positions = renderedNodes.map((node) => {
@@ -72,7 +76,7 @@ test("監視ノード50台を重複しない多重リングへ配置する", () 
 test("外部ピア表示では広角化し外周ほどノードを小さくする", () => {
   const manyRegistered = Array.from({ length: 50 }, (_, index) => registeredNode(index));
   const externalNodes = Array.from({ length: 90 }, (_, index) => externalNode(index));
-  const { container } = render(<TopologyGraph nodes={[...manyRegistered, ...externalNodes]} edges={[]} events={[]} now={2_000} wideView selectedNodeId={null} onInspectNode={vi.fn()} />);
+  const { container } = render(<TopologyGraph nodes={[...manyRegistered, ...externalNodes]} edges={[]} events={[]} now={2_000} wideView selectedNodeId={null} onInspectNode={vi.fn()} onClearSelection={vi.fn()} />);
   const svg = screen.getByRole("img", { name: "監視ノードのネットワークトポロジー" });
   const radius = (name: string) => Number(screen.getByRole("button", { name }).querySelector(".topology-node__body")?.getAttribute("r"));
 
@@ -80,4 +84,24 @@ test("外部ピア表示では広角化し外周ほどノードを小さくす�
   expect(radius("External Peer 1の情報を表示")).toBeGreaterThan(radius("External Peer 35の情報を表示"));
   expect(radius("External Peer 35の情報を表示")).toBeGreaterThan(radius("External Peer 77の情報を表示"));
   expect(container.querySelectorAll(".topology-node--registered .topology-node__label")).toHaveLength(0);
+});
+
+test("ハーベストイベントはノードを強調し伝播粒子は増やさない", () => {
+  const harvest: NetworkEvent = {
+    id: "harvest-1",
+    nodeId: "node-a",
+    kind: "harvestedBlock",
+    height: "125",
+    hash: "HARVEST",
+    signerPublicKey: "ABC",
+    harvesterPublicKey: "ABC",
+    harvestedNodeId: "node-a",
+    observerNodeId: "node-a",
+    observedAt: 1_800,
+    source: "websocket",
+  };
+  const { container } = render(<TopologyGraph nodes={nodes} edges={edges} events={[harvest]} now={2_000} wideView={false} selectedNodeId={null} onInspectNode={vi.fn()} onClearSelection={vi.fn()} />);
+
+  expect(container.querySelector(".topology-node__harvest")).toBeInTheDocument();
+  expect(container.querySelectorAll(".topology-particle")).toHaveLength(0);
 });

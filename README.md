@@ -1,4 +1,4 @@
-# Node Watcher
+# Harvest Scope
 
 同一LAN内のSymbol（Catapult）ノードとNEM（NIS1）ノードを監視する、Windows向けデスクトップアプリです。
 

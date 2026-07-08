@@ -7,6 +7,7 @@ use std::{
     },
 };
 
+use tauri::AppHandle;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use windows_sys::Win32::{
     Foundation::HANDLE,
@@ -65,6 +66,7 @@ unsafe extern "system" fn power_callback(
             // This is intentionally synchronous. On Modern Standby the process
             // may keep running after the network is suspended.
             context.state.set_system_suspended(true);
+            context.state.set_all_nodes_rechecking(false);
             tracing::info!("Windows suspend notification received; monitoring is paused");
         }
         Some(PowerTransition::Resume) => {
@@ -74,6 +76,7 @@ unsafe extern "system" fn power_callback(
                 .wrapping_add(1);
             // Keep monitoring paused until the async reset has completed.
             context.state.set_system_suspended(true);
+            context.state.set_all_nodes_rechecking(true);
             let _ = context.resume_tx.send((event_type, generation));
         }
         None => {}
@@ -104,7 +107,7 @@ impl Drop for PowerResumeListener {
     }
 }
 
-pub fn register(state: AppState) -> io::Result<PowerResumeListener> {
+pub fn register(app: AppHandle, state: AppState) -> io::Result<PowerResumeListener> {
     let (resume_tx, mut resume_rx) = mpsc::unbounded_channel();
     let generation = Arc::new(AtomicU64::new(0));
     let context = Box::new(CallbackContext {
@@ -139,6 +142,9 @@ pub fn register(state: AppState) -> io::Result<PowerResumeListener> {
             let is_latest_transition = generation.load(Ordering::Acquire) == resume_generation;
             if is_latest_transition {
                 state.set_system_suspended(false);
+                if let Err(error) = monitor::refresh_all_nodes(app.clone(), state.clone()).await {
+                    tracing::warn!(%error, "post-resume node refresh failed");
+                }
             }
             tracing::info!(
                 event_type,

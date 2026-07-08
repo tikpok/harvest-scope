@@ -4,6 +4,7 @@ import type {
   AppSettings,
   DashboardData,
   DiagnosticRun,
+  HarvestEvent,
   MetricPoint,
   NetworkEvent,
   NetworkInterfaceInfo,
@@ -43,6 +44,7 @@ const emptyDashboard: DashboardData = {
   warning: 0,
   critical: 0,
   offline: 0,
+  rechecking: false,
   nodes: [],
 };
 
@@ -53,6 +55,8 @@ export const api = {
   topology: () => call<TopologySnapshot>("get_topology", undefined, emptyTopology),
   recentNetworkEvents: (limit = 50) =>
     call<NetworkEvent[]>("get_recent_network_events", { limit }, []),
+  recentHarvestEvents: (limit = 50) =>
+    call<HarvestEvent[]>("get_recent_harvest_events", { limit }, []),
   nodes: () => call<NodeSummary[]>("list_nodes", undefined, []),
   nodeDetail: (nodeId: string) => call<NodeDetail | null>("get_node_detail", { nodeId }, null).then((value) => {
     if (!value) throw new Error("ノード情報はTauriアプリで確認できます");
@@ -66,7 +70,10 @@ export const api = {
     invoke<void>("move_node", { nodeId, direction }),
   pauseNode: (nodeId: string) => invoke<void>("pause_node", { nodeId }),
   resumeNode: (nodeId: string) => invoke<void>("resume_node", { nodeId }),
+  setNodeHarvestMetricsVisible: (nodeId: string, visible: boolean) =>
+    invoke<void>("set_node_harvest_metrics_visible", { nodeId, visible }),
   refreshNode: (nodeId: string) => invoke<void>("refresh_node", { nodeId }),
+  refreshAllNodes: () => invoke<void>("refresh_all_nodes"),
   interfaces: () => call<NetworkInterfaceInfo[]>("list_network_interfaces", undefined, []),
   scan: (request: ScanRequest) => invoke<ScanCandidate[]>("scan_subnet", { request }),
   cancelScan: () => invoke<void>("cancel_scan"),

@@ -7,9 +7,9 @@ use sqlx::{
 
 use crate::{
     domain::{
-        AlertMutation, AlertRecord, AppSettings, DiagnosticRun, DiagnosticStatus, MetricPoint,
-        NodeDetail, NodeIdentity, NodeKind, NodeSample, NodeStatus, NodeSummary, PeerInfo,
-        StoredNode,
+        AlertMutation, AlertRecord, AppSettings, DiagnosticRun, DiagnosticStatus, HarvestEvent,
+        MetricPoint, NodeDetail, NodeIdentity, NodeKind, NodeSample, NodeStatus, NodeSummary,
+        PeerInfo, StoredNode,
     },
     error::{AppError, AppResult},
 };
@@ -24,6 +24,15 @@ pub struct TopologyHealth {
     pub api_status: Option<String>,
     pub db_status: Option<String>,
     pub nis_status_code: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HarvestMetricSnapshot {
+    delegated_harvester_count: Option<i64>,
+    delegated_harvester_delta: Option<i64>,
+    total_importance: Option<String>,
+    total_balance_micro_xym: Option<String>,
+    harvest_metric_error: Option<String>,
 }
 
 fn parse_kind(value: &str) -> AppResult<NodeKind> {
@@ -121,6 +130,7 @@ impl Repository {
                     rest_version: row.try_get("rest_version")?,
                     enabled: row.try_get::<i64, _>("enabled")? != 0,
                     favorite: row.try_get::<i64, _>("favorite")? != 0,
+                    show_harvest_metrics: row.try_get::<i64, _>("show_harvest_metrics")? != 0,
                 })
             })
             .collect()
@@ -137,65 +147,103 @@ impl Repository {
     pub async fn list_nodes(&self) -> AppResult<Vec<NodeSummary>> {
         let nodes = self.list_stored_nodes(false).await?;
         let mut summaries = Vec::with_capacity(nodes.len());
-        for node in nodes {
-            let sample = sqlx::query(
-                "SELECT * FROM node_samples WHERE node_id = ? ORDER BY observed_at DESC LIMIT 1",
-            )
-            .bind(&node.id)
-            .fetch_optional(&self.pool)
-            .await?;
-            let summary = if let Some(row) = sample {
-                NodeSummary {
-                    id: node.id,
-                    display_name: node.display_name,
-                    kind: node.kind,
-                    base_url: node.base_url,
-                    network: node.network,
-                    version: node.version,
-                    enabled: node.enabled,
-                    favorite: node.favorite,
-                    status: if node.enabled {
-                        parse_status(row.try_get::<String, _>("status")?.as_str())
-                    } else {
-                        NodeStatus::Unknown
-                    },
-                    height: row
-                        .try_get::<Option<i64>, _>("height")?
-                        .map(|value| value.to_string()),
-                    finalized_height: row
-                        .try_get::<Option<i64>, _>("finalized_height")?
-                        .map(|value| value.to_string()),
-                    lag: row
-                        .try_get::<Option<i64>, _>("lag")?
-                        .map(|value| value.to_string()),
-                    peer_count: row.try_get("peer_count")?,
-                    latency_ms: row.try_get("latency_ms")?,
-                    last_seen_at: Some(row.try_get("observed_at")?),
-                    last_error: row.try_get("last_error")?,
-                }
-            } else {
-                NodeSummary {
-                    id: node.id,
-                    display_name: node.display_name,
-                    kind: node.kind,
-                    base_url: node.base_url,
-                    network: node.network,
-                    version: node.version,
-                    enabled: node.enabled,
-                    favorite: node.favorite,
-                    status: NodeStatus::Unknown,
-                    height: None,
-                    finalized_height: None,
-                    lag: None,
-                    peer_count: None,
-                    latency_ms: None,
-                    last_seen_at: None,
-                    last_error: None,
-                }
-            };
-            summaries.push(summary);
+        for node in &nodes {
+            summaries.push(self.node_summary(node).await?);
         }
         Ok(summaries)
+    }
+
+    async fn node_summary(&self, node: &StoredNode) -> AppResult<NodeSummary> {
+        let sample = sqlx::query(
+            "SELECT * FROM node_samples WHERE node_id = ? ORDER BY observed_at DESC LIMIT 1",
+        )
+        .bind(&node.id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let harvest = if node.show_harvest_metrics {
+            self.latest_harvest_metrics(&node.id).await?
+        } else {
+            HarvestMetricSnapshot::default()
+        };
+        let latest_harvest_at = if node.show_harvest_metrics {
+            self.latest_harvest_at(&node.id).await?
+        } else {
+            None
+        };
+        let summary = if let Some(row) = sample {
+            NodeSummary {
+                id: node.id.clone(),
+                display_name: node.display_name.clone(),
+                kind: node.kind,
+                base_url: node.base_url.clone(),
+                network: node.network.clone(),
+                version: node.version.clone(),
+                enabled: node.enabled,
+                favorite: node.favorite,
+                status: if node.enabled {
+                    parse_status(row.try_get::<String, _>("status")?.as_str())
+                } else {
+                    NodeStatus::Unknown
+                },
+                height: row
+                    .try_get::<Option<i64>, _>("height")?
+                    .map(|value| value.to_string()),
+                finalized_height: row
+                    .try_get::<Option<i64>, _>("finalized_height")?
+                    .map(|value| value.to_string()),
+                lag: row
+                    .try_get::<Option<i64>, _>("lag")?
+                    .map(|value| value.to_string()),
+                peer_count: row.try_get("peer_count")?,
+                latency_ms: row.try_get("latency_ms")?,
+                last_seen_at: Some(row.try_get("observed_at")?),
+                last_error: row.try_get("last_error")?,
+                show_harvest_metrics: node.show_harvest_metrics,
+                delegated_harvester_count: row
+                    .try_get::<Option<i64>, _>("delegated_harvester_count")?
+                    .or(harvest.delegated_harvester_count),
+                delegated_harvester_delta: row
+                    .try_get::<Option<i64>, _>("delegated_harvester_delta")?
+                    .or(harvest.delegated_harvester_delta),
+                total_importance: row
+                    .try_get::<Option<String>, _>("total_importance")?
+                    .or(harvest.total_importance),
+                total_balance_micro_xym: row
+                    .try_get::<Option<String>, _>("total_balance_micro_xym")?
+                    .or(harvest.total_balance_micro_xym),
+                harvest_metric_error: row
+                    .try_get::<Option<String>, _>("harvest_metric_error")?
+                    .or(harvest.harvest_metric_error),
+                latest_harvest_at,
+            }
+        } else {
+            NodeSummary {
+                id: node.id.clone(),
+                display_name: node.display_name.clone(),
+                kind: node.kind,
+                base_url: node.base_url.clone(),
+                network: node.network.clone(),
+                version: node.version.clone(),
+                enabled: node.enabled,
+                favorite: node.favorite,
+                status: NodeStatus::Unknown,
+                height: None,
+                finalized_height: None,
+                lag: None,
+                peer_count: None,
+                latency_ms: None,
+                last_seen_at: None,
+                last_error: None,
+                show_harvest_metrics: node.show_harvest_metrics,
+                delegated_harvester_count: harvest.delegated_harvester_count,
+                delegated_harvester_delta: harvest.delegated_harvester_delta,
+                total_importance: harvest.total_importance,
+                total_balance_micro_xym: harvest.total_balance_micro_xym,
+                harvest_metric_error: harvest.harvest_metric_error,
+                latest_harvest_at,
+            }
+        };
+        Ok(summary)
     }
 
     pub async fn upsert_node(
@@ -228,6 +276,20 @@ impl Repository {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::NotFound(id.into()));
+        }
+        Ok(())
+    }
+
+    pub async fn set_harvest_metrics_visible(&self, id: &str, visible: bool) -> AppResult<()> {
+        let result =
+            sqlx::query("UPDATE nodes SET show_harvest_metrics = ?, updated_at = ? WHERE id = ?")
+                .bind(visible as i64)
+                .bind(chrono::Utc::now().timestamp_millis())
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
         if result.rows_affected() == 0 {
             return Err(AppError::NotFound(id.into()));
         }
@@ -280,14 +342,211 @@ impl Repository {
 
     pub async fn save_sample(&self, node_id: &str, sample: &NodeSample) -> AppResult<()> {
         sqlx::query(
-            "INSERT INTO node_samples (node_id, observed_at, reachable, status, latency_ms, height, finalized_height, network_height, lag, peer_count, chain_score, api_status, db_status, nis_status_code, last_error)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO node_samples (node_id, observed_at, reachable, status, latency_ms, height, finalized_height, network_height, lag, peer_count, chain_score, api_status, db_status, nis_status_code, last_error, delegated_harvester_count, delegated_harvester_delta, total_importance, total_balance_micro_xym, harvest_metric_error)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         ).bind(node_id).bind(sample.observed_at).bind(sample.reachable as i64).bind(sample.status.as_str())
             .bind(sample.latency_ms).bind(to_i64(sample.height)).bind(to_i64(sample.finalized_height))
             .bind(to_i64(sample.network_height)).bind(to_i64(sample.lag)).bind(sample.peer_count)
             .bind(&sample.chain_score).bind(&sample.api_status).bind(&sample.db_status).bind(sample.nis_status_code)
-            .bind(&sample.last_error).execute(&self.pool).await?;
+            .bind(&sample.last_error).bind(sample.delegated_harvester_count).bind(sample.delegated_harvester_delta)
+            .bind(&sample.total_importance).bind(&sample.total_balance_micro_xym).bind(&sample.harvest_metric_error)
+            .execute(&self.pool).await?;
         Ok(())
+    }
+
+    pub async fn harvester_count_at_or_before(
+        &self,
+        node_id: &str,
+        observed_at: i64,
+    ) -> AppResult<Option<i64>> {
+        let row = sqlx::query(
+            "SELECT delegated_harvester_count FROM node_samples WHERE node_id = ? AND observed_at <= ? AND delegated_harvester_count IS NOT NULL ORDER BY observed_at DESC LIMIT 1",
+        )
+        .bind(node_id)
+        .bind(observed_at)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| row.try_get("delegated_harvester_count"))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    async fn latest_harvest_metrics(&self, node_id: &str) -> AppResult<HarvestMetricSnapshot> {
+        let row = sqlx::query(
+            "SELECT delegated_harvester_count, delegated_harvester_delta, total_importance, total_balance_micro_xym, harvest_metric_error
+             FROM node_samples
+             WHERE node_id = ?
+               AND (delegated_harvester_count IS NOT NULL OR total_importance IS NOT NULL OR total_balance_micro_xym IS NOT NULL OR harvest_metric_error IS NOT NULL)
+             ORDER BY observed_at DESC
+             LIMIT 1",
+        )
+        .bind(node_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(HarvestMetricSnapshot::default());
+        };
+        Ok(HarvestMetricSnapshot {
+            delegated_harvester_count: row.try_get("delegated_harvester_count")?,
+            delegated_harvester_delta: row.try_get("delegated_harvester_delta")?,
+            total_importance: row.try_get("total_importance")?,
+            total_balance_micro_xym: row.try_get("total_balance_micro_xym")?,
+            harvest_metric_error: row.try_get("harvest_metric_error")?,
+        })
+    }
+
+    async fn latest_harvest_metrics_at_or_before(
+        &self,
+        node_id: &str,
+        observed_at: i64,
+    ) -> AppResult<HarvestMetricSnapshot> {
+        let row = sqlx::query(
+            "SELECT delegated_harvester_count, delegated_harvester_delta, total_importance, total_balance_micro_xym, harvest_metric_error
+             FROM node_samples
+             WHERE node_id = ?
+               AND observed_at <= ?
+               AND (delegated_harvester_count IS NOT NULL OR total_importance IS NOT NULL OR total_balance_micro_xym IS NOT NULL OR harvest_metric_error IS NOT NULL)
+             ORDER BY observed_at DESC
+             LIMIT 1",
+        )
+        .bind(node_id)
+        .bind(observed_at)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(HarvestMetricSnapshot::default());
+        };
+        Ok(HarvestMetricSnapshot {
+            delegated_harvester_count: row.try_get("delegated_harvester_count")?,
+            delegated_harvester_delta: row.try_get("delegated_harvester_delta")?,
+            total_importance: row.try_get("total_importance")?,
+            total_balance_micro_xym: row.try_get("total_balance_micro_xym")?,
+            harvest_metric_error: row.try_get("harvest_metric_error")?,
+        })
+    }
+
+    pub async fn replace_harvesters(
+        &self,
+        node_id: &str,
+        public_keys: &[String],
+        observed_at: i64,
+    ) -> AppResult<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM node_harvesters_current WHERE node_id = ?")
+            .bind(node_id)
+            .execute(&mut *tx)
+            .await?;
+        for public_key in public_keys {
+            sqlx::query("INSERT OR IGNORE INTO node_harvesters_current (node_id, public_key, observed_at) VALUES (?, ?, ?)")
+                .bind(node_id)
+                .bind(public_key.to_ascii_uppercase())
+                .bind(observed_at)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn harvest_nodes_for_public_key(&self, public_key: &str) -> AppResult<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT node_id FROM node_harvesters_current WHERE public_key = ? ORDER BY node_id",
+        )
+        .bind(public_key.to_ascii_uppercase())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| row.try_get("node_id").map_err(Into::into))
+            .collect()
+    }
+
+    pub async fn record_harvest_event(&self, event: &HarvestEvent) -> AppResult<bool> {
+        let event_key = event
+            .hash
+            .clone()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| {
+                format!(
+                    "{}:{}",
+                    event.height.clone().unwrap_or_default(),
+                    event.harvester_public_key
+                )
+            });
+        let result = sqlx::query("INSERT OR IGNORE INTO harvest_events (id, event_key, node_id, observer_node_id, harvester_public_key, height, hash, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(&event.id)
+            .bind(event_key)
+            .bind(&event.node_id)
+            .bind(&event.observer_node_id)
+            .bind(&event.harvester_public_key)
+            .bind(&event.height)
+            .bind(&event.hash)
+            .bind(event.observed_at)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn recent_harvest_events(&self, limit: usize) -> AppResult<Vec<HarvestEvent>> {
+        self.harvest_events_query(
+            "SELECT * FROM harvest_events ORDER BY observed_at DESC LIMIT ?",
+            None,
+            limit,
+        )
+        .await
+    }
+
+    pub async fn recent_harvest_events_for_node(
+        &self,
+        node_id: &str,
+        limit: usize,
+    ) -> AppResult<Vec<HarvestEvent>> {
+        self.harvest_events_query(
+            "SELECT * FROM harvest_events WHERE node_id = ? ORDER BY observed_at DESC LIMIT ?",
+            Some(node_id),
+            limit,
+        )
+        .await
+    }
+
+    async fn harvest_events_query(
+        &self,
+        sql: &str,
+        node_id: Option<&str>,
+        limit: usize,
+    ) -> AppResult<Vec<HarvestEvent>> {
+        let mut query = sqlx::query(sql);
+        if let Some(node_id) = node_id {
+            query = query.bind(node_id);
+        }
+        let rows = query
+            .bind(limit.min(200) as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(HarvestEvent {
+                    id: row.try_get("id")?,
+                    node_id: row.try_get("node_id")?,
+                    observer_node_id: row.try_get("observer_node_id")?,
+                    harvester_public_key: row.try_get("harvester_public_key")?,
+                    height: row.try_get("height")?,
+                    hash: row.try_get("hash")?,
+                    observed_at: row.try_get("observed_at")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn latest_harvest_at(&self, node_id: &str) -> AppResult<Option<i64>> {
+        let row = sqlx::query(
+            "SELECT observed_at FROM harvest_events WHERE node_id = ? ORDER BY observed_at DESC LIMIT 1",
+        )
+        .bind(node_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| row.try_get("observed_at"))
+            .transpose()
+            .map_err(Into::into)
     }
 
     pub async fn replace_peers(
@@ -366,12 +625,7 @@ impl Repository {
 
     pub async fn node_detail(&self, id: &str, websocket_connected: bool) -> AppResult<NodeDetail> {
         let stored = self.get_stored_node(id).await?;
-        let summary = self
-            .list_nodes()
-            .await?
-            .into_iter()
-            .find(|node| node.id == id)
-            .ok_or_else(|| AppError::NotFound(id.into()))?;
+        let summary = self.node_summary(&stored).await?;
         let latest = sqlx::query(
             "SELECT * FROM node_samples WHERE node_id = ? ORDER BY observed_at DESC LIMIT 1",
         )
@@ -398,6 +652,11 @@ impl Repository {
                 })
             })
             .collect::<AppResult<Vec<_>>>()?;
+        let recent_harvests = if summary.show_harvest_metrics {
+            self.recent_harvest_events_for_node(id, 1).await?
+        } else {
+            Vec::new()
+        };
         Ok(NodeDetail {
             node: summary,
             public_key: stored.public_key,
@@ -421,6 +680,7 @@ impl Repository {
                 .flatten(),
             peers,
             websocket_connected,
+            recent_harvests,
         })
     }
 
@@ -432,8 +692,23 @@ impl Repository {
     ) -> AppResult<Vec<MetricPoint>> {
         let rows = sqlx::query("SELECT * FROM node_samples WHERE node_id = ? AND observed_at BETWEEN ? AND ? ORDER BY observed_at")
             .bind(node_id).bind(from).bind(to).fetch_all(&self.pool).await?;
+        let mut harvest = self
+            .latest_harvest_metrics_at_or_before(node_id, from)
+            .await?;
         rows.into_iter()
             .map(|row| {
+                harvest.delegated_harvester_count = row
+                    .try_get::<Option<i64>, _>("delegated_harvester_count")?
+                    .or(harvest.delegated_harvester_count);
+                harvest.delegated_harvester_delta = row
+                    .try_get::<Option<i64>, _>("delegated_harvester_delta")?
+                    .or(harvest.delegated_harvester_delta);
+                harvest.total_importance = row
+                    .try_get::<Option<String>, _>("total_importance")?
+                    .or_else(|| harvest.total_importance.clone());
+                harvest.total_balance_micro_xym = row
+                    .try_get::<Option<String>, _>("total_balance_micro_xym")?
+                    .or_else(|| harvest.total_balance_micro_xym.clone());
                 Ok(MetricPoint {
                     observed_at: row.try_get("observed_at")?,
                     height: row
@@ -448,6 +723,10 @@ impl Repository {
                     peer_count: row.try_get("peer_count")?,
                     latency_ms: row.try_get("latency_ms")?,
                     reachable: row.try_get::<i64, _>("reachable")? != 0,
+                    delegated_harvester_count: harvest.delegated_harvester_count,
+                    delegated_harvester_delta: harvest.delegated_harvester_delta,
+                    total_importance: harvest.total_importance.clone(),
+                    total_balance_micro_xym: harvest.total_balance_micro_xym.clone(),
                 })
             })
             .collect()
@@ -645,6 +924,30 @@ mod tests {
             .collect()
     }
 
+    fn sample_at(observed_at: i64) -> NodeSample {
+        NodeSample {
+            observed_at,
+            reachable: true,
+            status: NodeStatus::Healthy,
+            latency_ms: Some(100),
+            height: Some(100),
+            finalized_height: Some(90),
+            network_height: Some(100),
+            lag: Some(0),
+            peer_count: Some(5),
+            chain_score: None,
+            api_status: None,
+            db_status: None,
+            nis_status_code: None,
+            last_error: None,
+            delegated_harvester_count: None,
+            delegated_harvester_delta: None,
+            total_importance: None,
+            total_balance_micro_xym: None,
+            harvest_metric_error: None,
+        }
+    }
+
     #[tokio::test]
     async fn persists_manual_node_order() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
@@ -762,6 +1065,70 @@ mod tests {
         assert_eq!(detail.peers.len(), 1);
         assert_eq!(detail.peers[0].name.as_deref(), Some("Active peer"));
         assert_eq!(detail.peers[0].status, "active");
+    }
+
+    #[tokio::test]
+    async fn latest_node_summary_keeps_previous_harvest_metrics_when_new_sample_has_none() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let repository = Repository::open(&directory.path().join("node-watcher.db"))
+            .await
+            .expect("repository should open");
+        repository
+            .upsert_node(
+                "node-a",
+                "http://node-a:3000",
+                "Node A",
+                &symbol_identity(),
+                true,
+                false,
+            )
+            .await
+            .expect("node should be inserted");
+        repository
+            .set_harvest_metrics_visible("node-a", true)
+            .await
+            .expect("harvest metrics should be enabled");
+
+        let mut harvest_sample = sample_at(1);
+        harvest_sample.delegated_harvester_count = Some(3);
+        harvest_sample.delegated_harvester_delta = Some(1);
+        harvest_sample.total_importance = Some("123".into());
+        harvest_sample.total_balance_micro_xym = Some("9876543210".into());
+        repository
+            .save_sample("node-a", &harvest_sample)
+            .await
+            .expect("harvest sample should be saved");
+
+        let regular_sample = sample_at(2);
+        repository
+            .save_sample("node-a", &regular_sample)
+            .await
+            .expect("regular sample should be saved");
+
+        let summary = repository
+            .list_nodes()
+            .await
+            .expect("nodes should be listed")
+            .pop()
+            .expect("node should exist");
+        assert_eq!(summary.delegated_harvester_count, Some(3));
+        assert_eq!(summary.delegated_harvester_delta, Some(1));
+        assert_eq!(summary.total_importance.as_deref(), Some("123"));
+        assert_eq!(
+            summary.total_balance_micro_xym.as_deref(),
+            Some("9876543210")
+        );
+        let metrics = repository
+            .query_metrics("node-a", 1, 2)
+            .await
+            .expect("metrics should be listed");
+        assert_eq!(metrics.len(), 2);
+        assert_eq!(metrics[0].delegated_harvester_count, Some(3));
+        assert_eq!(metrics[1].delegated_harvester_count, Some(3));
+        assert_eq!(
+            metrics[1].total_balance_micro_xym.as_deref(),
+            Some("9876543210")
+        );
     }
 
     #[tokio::test]

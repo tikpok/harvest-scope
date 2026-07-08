@@ -6,13 +6,29 @@ mod services;
 mod state;
 mod storage;
 
-use std::time::Duration;
+use std::{
+    any::Any,
+    panic::{catch_unwind, AssertUnwindSafe},
+    path::PathBuf,
+    time::Duration,
+};
 
 use state::AppState;
 use tauri::{Manager, WindowEvent};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let result = catch_unwind(AssertUnwindSafe(run_app));
+    let failure = match result {
+        Ok(Ok(())) => return,
+        Ok(Err(error)) => error.to_string(),
+        Err(payload) => panic_message(payload.as_ref()),
+    };
+    report_startup_failure(&failure);
+    std::process::exit(1);
+}
+
+fn run_app() -> tauri::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
@@ -42,7 +58,7 @@ pub fn run() {
             let state = tauri::async_runtime::block_on(AppState::new(repository, client))?;
             app.manage(state.clone());
             #[cfg(target_os = "windows")]
-            match services::power::register(state.clone()) {
+            match services::power::register(app.handle().clone(), state.clone()) {
                 Ok(listener) => {
                     app.manage(listener);
                 }
@@ -75,12 +91,15 @@ pub fn run() {
             commands::get_dashboard,
             commands::get_topology,
             commands::get_recent_network_events,
+            commands::get_recent_harvest_events,
             commands::upsert_node,
             commands::delete_node,
             commands::move_node,
             commands::pause_node,
             commands::resume_node,
+            commands::set_node_harvest_metrics_visible,
             commands::refresh_node,
+            commands::refresh_all_nodes,
             commands::get_node_detail,
             commands::query_metrics,
             commands::list_network_interfaces,
@@ -98,5 +117,74 @@ pub fn run() {
             commands::export_csv,
         ])
         .run(tauri::generate_context!())
-        .expect("Node Watcherの起動に失敗しました");
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|value| (*value).to_owned())
+        })
+        .unwrap_or_else(|| "不明な起動エラーが発生しました".to_owned())
+}
+
+fn report_startup_failure(message: &str) {
+    let log_path = startup_error_log_path();
+    let log_contents = format!(
+        "{} Harvest Scope startup failure\n{}\n",
+        chrono::Utc::now().to_rfc3339(),
+        message
+    );
+    let saved_path = log_path.as_ref().and_then(|path| {
+        path.parent()
+            .and_then(|parent| std::fs::create_dir_all(parent).ok())?;
+        std::fs::write(path, log_contents.as_bytes()).ok()?;
+        Some(path.display().to_string())
+    });
+    let details = match saved_path {
+        Some(path) => {
+            format!("Harvest Scopeの起動に失敗しました。\n\n{message}\n\n診断ログ: {path}")
+        }
+        None => format!("Harvest Scopeの起動に失敗しました。\n\n{message}"),
+    };
+    show_startup_error(&details);
+}
+
+fn startup_error_log_path() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|root| {
+        PathBuf::from(root)
+            .join("com.tikpok.node-watcher")
+            .join("startup-error.log")
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn show_startup_error(message: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
+    let title = "Harvest Scope - 起動エラー"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let body = message
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: both UTF-16 buffers are NUL-terminated and live for the call.
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            body.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn show_startup_error(message: &str) {
+    eprintln!("{message}");
 }

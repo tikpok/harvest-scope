@@ -6,7 +6,7 @@ import packageJson from "../package.json";
 import { api, defaultSettings } from "./services/ipc";
 import type { AlertRecord, DashboardData, DiagnosticRun, NodeSummary } from "./types";
 
-const emptyDashboard: DashboardData = { total: 0, healthy: 0, warning: 0, critical: 0, offline: 0, nodes: [] };
+const emptyDashboard: DashboardData = { total: 0, healthy: 0, warning: 0, critical: 0, offline: 0, rechecking: false, nodes: [] };
 
 vi.mock("./services/ipc", async () => {
   const mod = await vi.importActual<typeof import("./services/ipc")>("./services/ipc");
@@ -14,7 +14,8 @@ vi.mock("./services/ipc", async () => {
     ...mod,
     api: {
       ...mod.api,
-      dashboard: vi.fn().mockResolvedValue({ total: 0, healthy: 0, warning: 0, critical: 0, offline: 0, nodes: [] }),
+      dashboard: vi.fn().mockResolvedValue({ total: 0, healthy: 0, warning: 0, critical: 0, offline: 0, rechecking: false, nodes: [] }),
+      refreshAllNodes: vi.fn().mockResolvedValue(undefined),
       moveNode: vi.fn().mockResolvedValue(undefined),
       deleteNode: vi.fn().mockResolvedValue(undefined),
       upsertNode: vi.fn(),
@@ -58,6 +59,13 @@ function node(id: string, displayName: string): NodeSummary {
     latencyMs: 20,
     lastSeenAt: 1_700_000_000_000,
     lastError: null,
+    showHarvestMetrics: false,
+    delegatedHarvesterCount: null,
+    delegatedHarvesterDelta: null,
+    totalImportance: null,
+    totalBalanceMicroXym: null,
+    harvestMetricError: null,
+    latestHarvestAt: null,
   };
 }
 
@@ -66,6 +74,7 @@ beforeEach(() => {
   vi.mocked(api.dashboard).mockResolvedValue(emptyDashboard);
   vi.mocked(api.moveNode).mockResolvedValue(undefined);
   vi.mocked(api.deleteNode).mockResolvedValue(undefined);
+  vi.mocked(api.refreshAllNodes).mockResolvedValue(undefined);
   vi.mocked(api.upsertNode).mockReset();
   vi.mocked(api.settings).mockResolvedValue({ ...defaultSettings, onboardingCompleted: true });
   vi.mocked(api.nodeDiagnostics).mockResolvedValue([]);
@@ -76,7 +85,7 @@ beforeEach(() => {
 
 test("日本語ダッシュボードを表示する", async () => {
   renderApp();
-  expect(await screen.findByText("ノード監視")).toBeInTheDocument();
+  expect(await screen.findByRole("heading", { name: "Harvest Scope" })).toBeInTheDocument();
   expect(screen.getByLabelText("アプリバージョン")).toHaveTextContent(`v${packageJson.version}`);
 });
 
@@ -87,6 +96,7 @@ test("一覧からノードを上下に移動できる", async () => {
     warning: 0,
     critical: 0,
     offline: 0,
+    rechecking: false,
     nodes: [node("1", "Node A"), node("2", "Node B")],
   });
   renderApp();
@@ -99,6 +109,25 @@ test("一覧からノードを上下に移動できる", async () => {
   await waitFor(() => expect(api.moveNode).toHaveBeenCalledWith("2", "up"));
 });
 
+test("全ノードを手動で再確認できる", async () => {
+  vi.mocked(api.refreshAllNodes).mockImplementation(() => new Promise(() => undefined));
+  vi.mocked(api.dashboard).mockResolvedValue({
+    total: 1,
+    healthy: 0,
+    warning: 0,
+    critical: 0,
+    offline: 1,
+    rechecking: false,
+    nodes: [{ ...node("1", "Node A"), status: "offline" }],
+  });
+  renderApp();
+
+  fireEvent.click(await screen.findByRole("button", { name: "全ノード再確認" }));
+
+  await waitFor(() => expect(api.refreshAllNodes).toHaveBeenCalledOnce());
+  expect(await screen.findByText("再確認中")).toBeInTheDocument();
+});
+
 test("確認後に一覧からノードの登録を解除できる", async () => {
   vi.mocked(api.dashboard).mockResolvedValue({
     total: 1,
@@ -106,6 +135,7 @@ test("確認後に一覧からノードの登録を解除できる", async () =>
     warning: 0,
     critical: 0,
     offline: 0,
+    rechecking: false,
     nodes: [node("1", "Node A")],
   });
   const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
