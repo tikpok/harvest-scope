@@ -2,7 +2,9 @@ use async_trait::async_trait;
 
 use crate::error::AppResult;
 
-use super::{ChainSnapshot, HealthSnapshot, NodeIdentity, PeerInfo, WebSocketSpec};
+use super::{
+    ChainSnapshot, HarvestSnapshot, HealthSnapshot, NodeIdentity, PeerInfo, WebSocketSpec,
+};
 
 #[async_trait]
 pub trait NodeAdapter: Send + Sync {
@@ -10,6 +12,9 @@ pub trait NodeAdapter: Send + Sync {
     async fn fetch_health(&self) -> AppResult<HealthSnapshot>;
     async fn fetch_chain(&self) -> AppResult<ChainSnapshot>;
     async fn fetch_peers(&self) -> AppResult<Vec<PeerInfo>>;
+    async fn fetch_harvest_metrics(&self) -> AppResult<HarvestSnapshot> {
+        Ok(HarvestSnapshot::default())
+    }
     async fn fetch_static_info(&self) -> AppResult<NodeIdentity> {
         self.probe().await
     }

@@ -11,6 +11,7 @@ interface Props {
   wideView: boolean;
   selectedNodeId: string | null;
   onInspectNode: (nodeId: string) => void;
+  onClearSelection: () => void;
 }
 
 interface RingDefinition {
@@ -97,6 +98,7 @@ function layout(nodes: TopologyNode[], wideView: boolean): LayoutResult {
 }
 
 function eventColor(kind: NetworkEvent["kind"]) {
+  if (kind === "harvestedBlock") return "#f5d36f";
   if (kind === "finalizedBlock") return "#d58cff";
   return "#73a9ff";
 }
@@ -105,7 +107,7 @@ function edgeStatus(status: string) {
   return ["active", "busy", "inactive", "failure"].includes(status) ? status : "unknown";
 }
 
-export function TopologyGraph({ nodes, edges, events, now, wideView, selectedNodeId, onInspectNode }: Props) {
+export function TopologyGraph({ nodes, edges, events, now, wideView, selectedNodeId, onInspectNode, onClearSelection }: Props) {
   const { positions, externalRadii } = useMemo(() => layout(nodes, wideView), [nodes, wideView]);
   const registeredCount = nodes.filter((node) => node.registered).length;
   const externalCount = nodes.length - registeredCount;
@@ -126,6 +128,7 @@ export function TopologyGraph({ nodes, edges, events, now, wideView, selectedNod
   });
   const particleByEdge = new Map<string, { event: NetworkEvent; edge: TopologyEdge }>();
   activeByNode.forEach((event) => {
+    if (event.kind === "harvestedBlock") return;
     edges
       .filter((edge) => edge.status === "active" && (edge.source === event.nodeId || edge.target === event.nodeId))
       .forEach((edge) => {
@@ -137,7 +140,7 @@ export function TopologyGraph({ nodes, edges, events, now, wideView, selectedNod
   const viewBox = wideView ? "-300 -190 1600 1000" : `0 0 ${WIDTH} ${HEIGHT}`;
 
   return (
-    <svg className={`topology-graph${wideView ? " topology-graph--wide" : ""}`} viewBox={viewBox} role="img" aria-label="監視ノードのネットワークトポロジー">
+    <svg className={`topology-graph${wideView ? " topology-graph--wide" : ""}`} viewBox={viewBox} role="img" aria-label="監視ノードのネットワークトポロジー" onClick={onClearSelection}>
       <defs>
         <filter id="node-glow"><feGaussianBlur stdDeviation="5" result="blur" /><feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge></filter>
         <filter id="particle-glow"><feGaussianBlur stdDeviation="2" result="blur" /><feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge></filter>
@@ -186,7 +189,7 @@ export function TopologyGraph({ nodes, edges, events, now, wideView, selectedNod
             role="button"
             aria-label={`${node.label}の情報を表示`}
             tabIndex={0}
-            onClick={() => onInspectNode(node.id)}
+            onClick={(event) => { event.stopPropagation(); onInspectNode(node.id); }}
             onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") onInspectNode(node.id); }}
           >
             <title>{title}</title>
@@ -194,6 +197,10 @@ export function TopologyGraph({ nodes, edges, events, now, wideView, selectedNod
             {activeEvent && <circle className="topology-node__pulse" r={radius} fill="none" stroke={eventColor(activeEvent.kind)}>
               <animate attributeName="r" values={`${radius};${radius + 22}`} dur="1.2s" repeatCount="3" />
               <animate attributeName="opacity" values=".9;0" dur="1.2s" repeatCount="3" />
+            </circle>}
+            {activeEvent?.kind === "harvestedBlock" && <circle className="topology-node__harvest" r={radius + 12}>
+              <animate attributeName="r" values={`${radius + 7};${radius + 20};${radius + 10}`} dur="1.2s" repeatCount="2" />
+              <animate attributeName="opacity" values=".95;.18;.7" dur="1.2s" repeatCount="2" />
             </circle>}
             {selectedNodeId === node.id && <circle className="topology-node__selection" r={radius + 7} />}
             {shared && <circle className="topology-node__shared" r={radius + 4} />}

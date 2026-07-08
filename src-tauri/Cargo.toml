@@ -1,6 +1,6 @@
 [package]
 name = "node-watcher"
-version = "0.1.5"
+version = "0.1.7"
 description = "Windows GUI monitor for Symbol and NEM NIS1 nodes"
 authors = ["tikpok"]
 edition = "2021"
@@ -11,6 +11,7 @@ name = "node_watcher_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
+sha2 = "0.10"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]

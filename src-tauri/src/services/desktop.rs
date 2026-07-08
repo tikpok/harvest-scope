@@ -147,7 +147,7 @@ fn build_menu(app: &AppHandle, summary: &str) -> tauri::Result<TrayMenu> {
     let status = MenuItem::with_id(app, "status", summary, false, None::<&str>)?;
     let latest = MenuItem::with_id(app, "latest-alert", "最新の障害を表示", true, None::<&str>)?;
     let refresh = MenuItem::with_id(app, "refresh-all", "全ノードを更新", true, None::<&str>)?;
-    let open = MenuItem::with_id(app, "open", "Node Watcherを開く", true, None::<&str>)?;
+    let open = MenuItem::with_id(app, "open", "Harvest Scopeを開く", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "設定", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "終了", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&status, &latest, &refresh, &open, &settings, &quit])?;
@@ -158,7 +158,7 @@ pub fn setup(app: &tauri::App, state: AppState) -> tauri::Result<()> {
     let tray_menu = build_menu(app.handle(), "状態を確認中")?;
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon(TrayStatus::Inactive))
-        .tooltip("Node Watcher - 状態を確認中")
+        .tooltip("Harvest Scope - 状態を確認中")
         .menu(&tray_menu.menu)
         .show_menu_on_left_click(false)
         .on_tray_icon_event(|tray, event| {
@@ -205,7 +205,7 @@ pub async fn refresh_tray(app: &AppHandle, state: &AppState) {
     let Ok(nodes) = state.repository.list_nodes().await else {
         if let Some(tray) = app.tray_by_id(TRAY_ID) {
             let _ = tray.set_icon(Some(icon(TrayStatus::Inactive)));
-            let _ = tray.set_tooltip(Some("Node Watcher - 監視データを取得できません"));
+            let _ = tray.set_tooltip(Some("Harvest Scope - 監視データを取得できません"));
         }
         return;
     };
@@ -213,7 +213,7 @@ pub async fn refresh_tray(app: &AppHandle, state: &AppState) {
     let summary = status_text(&nodes);
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         let _ = tray.set_icon(Some(icon(status)));
-        let _ = tray.set_tooltip(Some(format!("Node Watcher - {summary}")));
+        let _ = tray.set_tooltip(Some(format!("Harvest Scope - {summary}")));
         if let Some(menu) = app.try_state::<TrayMenuState>() {
             let should_update = menu
                 .status
@@ -287,6 +287,13 @@ mod tests {
             latency_ms: None,
             last_seen_at: None,
             last_error: None,
+            show_harvest_metrics: false,
+            delegated_harvester_count: None,
+            delegated_harvester_delta: None,
+            total_importance: None,
+            total_balance_micro_xym: None,
+            harvest_metric_error: None,
+            latest_harvest_at: None,
         }
     }
 

@@ -22,6 +22,13 @@ export interface NodeSummary {
   latencyMs: number | null;
   lastSeenAt: number | null;
   lastError: string | null;
+  showHarvestMetrics: boolean;
+  delegatedHarvesterCount: number | null;
+  delegatedHarvesterDelta: number | null;
+  totalImportance: string | null;
+  totalBalanceMicroXym: string | null;
+  harvestMetricError: string | null;
+  latestHarvestAt: number | null;
 }
 
 export interface DashboardData {
@@ -30,6 +37,7 @@ export interface DashboardData {
   warning: number;
   critical: number;
   offline: number;
+  rechecking: boolean;
   nodes: NodeSummary[];
 }
 
@@ -49,6 +57,7 @@ export interface TopologyNode {
   network: string | null;
   status: NodeStatus;
   registered: boolean;
+  enabled: boolean;
   host: string | null;
   port: number | null;
   version: string | null;
@@ -61,6 +70,9 @@ export interface TopologyNode {
   height: string | null;
   finalizedHeight: string | null;
   lag: string | null;
+  showHarvestMetrics: boolean;
+  delegatedHarvesterCount: number | null;
+  latestHarvestAt: number | null;
 }
 
 export interface TopologyEdge {
@@ -76,7 +88,7 @@ export interface TopologySnapshot {
   observedAt: number;
 }
 
-export type NetworkEventKind = "block" | "finalizedBlock" | "pollUpdate";
+export type NetworkEventKind = "block" | "finalizedBlock" | "pollUpdate" | "harvestedBlock";
 
 export interface NetworkEvent {
   id: string;
@@ -84,8 +96,22 @@ export interface NetworkEvent {
   kind: NetworkEventKind;
   height: string | null;
   hash: string | null;
+  signerPublicKey: string | null;
+  harvesterPublicKey: string | null;
+  harvestedNodeId: string | null;
+  observerNodeId: string | null;
   observedAt: number;
   source: "websocket" | "polling";
+}
+
+export interface HarvestEvent {
+  id: string;
+  nodeId: string;
+  observerNodeId: string;
+  harvesterPublicKey: string;
+  height: string | null;
+  hash: string | null;
+  observedAt: number;
 }
 
 export interface NodeDetail {
@@ -99,6 +125,7 @@ export interface NodeDetail {
   nisStatusCode: number | null;
   peers: PeerInfo[];
   websocketConnected: boolean;
+  recentHarvests: HarvestEvent[];
 }
 
 export interface MetricPoint {
@@ -109,6 +136,10 @@ export interface MetricPoint {
   peerCount: number | null;
   latencyMs: number | null;
   reachable: boolean;
+  delegatedHarvesterCount: number | null;
+  delegatedHarvesterDelta: number | null;
+  totalImportance: string | null;
+  totalBalanceMicroXym: string | null;
 }
 
 export interface AlertRecord {

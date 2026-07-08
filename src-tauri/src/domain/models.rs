@@ -80,6 +80,17 @@ pub struct ChainSnapshot {
     pub chain_score: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct HarvestSnapshot {
+    pub supported: bool,
+    pub harvester_public_keys: Vec<String>,
+    pub delegated_harvester_count: Option<i64>,
+    pub total_importance: Option<String>,
+    pub total_balance_micro_xym: Option<String>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PeerInfo {
@@ -106,6 +117,7 @@ pub struct TopologyNode {
     pub network: Option<String>,
     pub status: NodeStatus,
     pub registered: bool,
+    pub enabled: bool,
     pub host: Option<String>,
     pub port: Option<u16>,
     pub version: Option<String>,
@@ -118,6 +130,9 @@ pub struct TopologyNode {
     pub height: Option<String>,
     pub finalized_height: Option<String>,
     pub lag: Option<String>,
+    pub show_harvest_metrics: bool,
+    pub delegated_harvester_count: Option<i64>,
+    pub latest_harvest_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +160,10 @@ pub struct NetworkEvent {
     pub kind: String,
     pub height: Option<String>,
     pub hash: Option<String>,
+    pub signer_public_key: Option<String>,
+    pub harvester_public_key: Option<String>,
+    pub harvested_node_id: Option<String>,
+    pub observer_node_id: Option<String>,
     pub observed_at: i64,
     pub source: String,
 }
@@ -168,6 +187,13 @@ pub struct NodeSummary {
     pub latency_ms: Option<i64>,
     pub last_seen_at: Option<i64>,
     pub last_error: Option<String>,
+    pub show_harvest_metrics: bool,
+    pub delegated_harvester_count: Option<i64>,
+    pub delegated_harvester_delta: Option<i64>,
+    pub total_importance: Option<String>,
+    pub total_balance_micro_xym: Option<String>,
+    pub harvest_metric_error: Option<String>,
+    pub latest_harvest_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +209,19 @@ pub struct StoredNode {
     pub rest_version: Option<String>,
     pub enabled: bool,
     pub favorite: bool,
+    pub show_harvest_metrics: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarvestEvent {
+    pub id: String,
+    pub node_id: String,
+    pub observer_node_id: String,
+    pub harvester_public_key: String,
+    pub height: Option<String>,
+    pub hash: Option<String>,
+    pub observed_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,6 +237,7 @@ pub struct NodeDetail {
     pub nis_status_code: Option<i64>,
     pub peers: Vec<PeerInfo>,
     pub websocket_connected: bool,
+    pub recent_harvests: Vec<HarvestEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +257,11 @@ pub struct NodeSample {
     pub db_status: Option<String>,
     pub nis_status_code: Option<i64>,
     pub last_error: Option<String>,
+    pub delegated_harvester_count: Option<i64>,
+    pub delegated_harvester_delta: Option<i64>,
+    pub total_importance: Option<String>,
+    pub total_balance_micro_xym: Option<String>,
+    pub harvest_metric_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,6 +274,10 @@ pub struct MetricPoint {
     pub peer_count: Option<i64>,
     pub latency_ms: Option<i64>,
     pub reachable: bool,
+    pub delegated_harvester_count: Option<i64>,
+    pub delegated_harvester_delta: Option<i64>,
+    pub total_importance: Option<String>,
+    pub total_balance_micro_xym: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -239,6 +288,7 @@ pub struct DashboardData {
     pub warning: usize,
     pub critical: usize,
     pub offline: usize,
+    pub rechecking: bool,
     pub nodes: Vec<NodeSummary>,
 }
 

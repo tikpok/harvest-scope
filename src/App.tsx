@@ -7,6 +7,7 @@ import {
   Bell,
   CheckCircle2,
   ChevronRight,
+  Cherry,
   CircleAlert,
   CircleDashed,
   CircleGauge,
@@ -15,6 +16,7 @@ import {
   Moon,
   Network,
   Pause,
+  Pickaxe,
   Play,
   Plus,
   RefreshCw,
@@ -36,7 +38,7 @@ import { StatusBadge } from "./components/StatusBadge";
 import { MetricChart } from "./components/MetricChart";
 import { TopologyPage } from "./components/TopologyPage";
 import packageJson from "../package.json";
-import type { AppSettings, DiagnosticRun, NodeStatus, ScanCandidate } from "./types";
+import type { AppSettings, DashboardData, DiagnosticRun, HarvestEvent, NodeDetail, NodeStatus, ScanCandidate, TopologySnapshot } from "./types";
 
 function formatTime(value: number | null) {
   return value ? new Intl.DateTimeFormat("ja-JP", { dateStyle: "short", timeStyle: "medium" }).format(value) : "—";
@@ -44,6 +46,36 @@ function formatTime(value: number | null) {
 
 function formatLatency(value: number | null) {
   return value == null ? "—" : `${value} ms`;
+}
+
+function formatNetwork(value: string | null) {
+  if (!value) return "—";
+  const normalized = value.trim().toLowerCase();
+  if (["-104", "104", "symbol--104", "symbol-104", "symbol mainnet", "symbol main net"].includes(normalized)) return "SYMBOL Mainnet";
+  if (["152", "symbol-152", "symbol testnet", "symbol test net"].includes(normalized)) return "SYMBOL Testnet";
+  return value;
+}
+
+function formatXym(value: string | null) {
+  if (!value) return "—";
+  try {
+    const whole = BigInt(value) / 1_000_000n;
+    return `${whole.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",")} XYM`;
+  } catch {
+    const micro = Number(value);
+    if (!Number.isFinite(micro)) return "—";
+    return `${new Intl.NumberFormat("ja-JP", { maximumFractionDigits: 0 }).format(Math.trunc(micro / 1_000_000))} XYM`;
+  }
+}
+
+function formatDelta(value: number | null) {
+  if (value == null) return "—";
+  if (value > 0) return `+${value}`;
+  return String(value);
+}
+
+function shortKey(value: string | null | undefined) {
+  return value ? `${value.slice(0, 6)}…${value.slice(-6)}` : "—";
 }
 
 function EmptyState({ title, children }: { title: string; children: React.ReactNode }) {
@@ -98,6 +130,16 @@ function DiagnosticPanel({
   </section>;
 }
 
+function HarvestEventList({ events }: { events: HarvestEvent[] }) {
+  if (events.length === 0) {
+    return <p className="harvest-empty">まだハーベスト検知はありません。</p>;
+  }
+  return <div className="harvest-event-list">{events.slice(0, 1).map((event) => <article className="harvest-event" key={event.id}>
+    <Pickaxe size={15} />
+    <div><strong>高さ {event.height ?? "—"}</strong><span className="mono">{shortKey(event.harvesterPublicKey)}</span><small>{formatTime(event.observedAt)}</small></div>
+  </article>)}</div>;
+}
+
 function Layout({ children }: { children: React.ReactNode }) {
   const { sidebarOpen, setSidebarOpen } = useUiStore();
   const queryClient = useQueryClient();
@@ -125,7 +167,7 @@ function Layout({ children }: { children: React.ReactNode }) {
       <aside className={`sidebar ${sidebarOpen ? "sidebar--open" : ""}`}>
         <div className="brand">
           <div className="brand__mark"><Activity size={22} /></div>
-          <div><strong>Node Watcher</strong><span>NEM / Symbol</span></div>
+          <div><strong>Harvest Scope</strong><span>NEM / Symbol</span></div>
           <button className="icon-button sidebar__close" onClick={() => setSidebarOpen(false)} aria-label="メニューを閉じる"><X /></button>
         </div>
         <nav>
@@ -144,7 +186,7 @@ function Layout({ children }: { children: React.ReactNode }) {
       <main className="main">
         <header className="topbar">
           <button className="icon-button mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="メニューを開く"><Menu /></button>
-          <div><h1>ノード監視</h1><p>ローカルネットワークの状態をひと目で確認</p></div>
+          <div><h1>Harvest Scope</h1><p>Symbol / NEM ノードの状態をひと目で確認</p></div>
           <div className="live-indicator"><span />監視エンジン稼働中</div>
           <button className="icon-button theme-toggle" aria-label={dark ? "ライトテーマに切り替え" : "ダークテーマに切り替え"} title={dark ? "ライトテーマ" : "ダークテーマ"} disabled={changeTheme.isPending} onClick={() => changeTheme.mutate(dark ? "light" : "dark")}>{dark ? <Sun size={17} /> : <Moon size={17} />}</button>
         </header>
@@ -163,7 +205,7 @@ const statMeta: { key: keyof Pick<ReturnType<typeof emptyDashboard>, "total" | "
 ];
 
 function emptyDashboard() {
-  return { total: 0, healthy: 0, warning: 0, critical: 0, offline: 0, nodes: [] };
+  return { total: 0, healthy: 0, warning: 0, critical: 0, offline: 0, rechecking: false, nodes: [] };
 }
 
 function DashboardPage() {
@@ -172,7 +214,12 @@ function DashboardPage() {
   const { nodeFilter, setNodeFilter } = useUiStore();
   const [statusFilter, setStatusFilter] = useState<NodeStatus | "all">("all");
   const { data = emptyDashboard(), isLoading, error } = useQuery({ queryKey: ["dashboard"], queryFn: api.dashboard, refetchInterval: 10_000 });
-  const refresh = useMutation({ mutationFn: api.refreshNode, onSuccess: () => queryClient.invalidateQueries({ queryKey: ["dashboard"] }) });
+  const refreshNode = useMutation({ mutationFn: api.refreshNode, onSuccess: () => queryClient.invalidateQueries({ queryKey: ["dashboard"] }) });
+  const refreshAll = useMutation({
+    mutationFn: api.refreshAllNodes,
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
+  });
+  const isRechecking = refreshAll.isPending || data.rechecking;
   const pause = useMutation({
     mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) => enabled ? api.pauseNode(id) : api.resumeNode(id),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
@@ -200,12 +247,13 @@ function DashboardPage() {
   return (
     <>
       <section className="stats-grid">
-        {statMeta.map((stat) => <article key={stat.key} className={`stat-card stat-card--${stat.tone}`}><span>{stat.label}</span><strong>{data[stat.key]}</strong></article>)}
+        {statMeta.map((stat) => <article key={stat.key} className={`stat-card stat-card--${stat.tone}`}><span>{stat.label}</span><strong>{isRechecking && stat.key !== "total" ? "—" : data[stat.key]}</strong></article>)}
       </section>
       <section className="panel">
         <div className="panel__header">
           <div><h2>ノード一覧</h2><p>高さ、同期遅延、接続状態を自動更新します</p></div>
           <div className="actions">
+            <button className="button" aria-label="全ノード再確認" disabled={isRechecking} onClick={() => refreshAll.mutate()}><RefreshCw size={17} />{isRechecking ? "再確認中…" : "全ノード再確認"}</button>
             <label className="search-field"><Search size={17} /><input value={nodeFilter} onChange={(event) => setNodeFilter(event.target.value)} placeholder="名前・URL・ネットワーク" /></label>
             <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as NodeStatus | "all")} aria-label="状態で絞り込み">
               <option value="all">すべての状態</option><option value="healthy">正常</option><option value="warning">警告</option><option value="critical">重大</option><option value="offline">オフライン</option><option value="unknown">未確認</option>
@@ -214,20 +262,21 @@ function DashboardPage() {
           </div>
         </div>
         {error && <div className="notice notice--error">監視サービスに接続できません: {String(error)}</div>}
-        {(reorder.error || remove.error) && <div className="notice notice--error">操作に失敗しました: {String(reorder.error ?? remove.error)}</div>}
+        {(reorder.error || remove.error || refreshAll.error) && <div className="notice notice--error">操作に失敗しました: {String(reorder.error ?? remove.error ?? refreshAll.error)}</div>}
+        {isRechecking && <div className="notice notice--info">全ノードの接続状態を再確認しています。完了すると自動的に表示を更新します。</div>}
         {isLoading ? <div className="loading">監視データを読み込み中…</div> : nodes.length === 0 ? (
           <EmptyState title="監視ノードがありません">「ノード追加」からURLを登録するか、LAN内をスキャンしてください。</EmptyState>
         ) : (
-          <div className="table-wrap"><table>
+          <div className="table-wrap"><table className="node-table">
             <thead><tr><th>ノード</th><th>種別</th><th>状態</th><th>チェーン高</th><th>ファイナライズ高</th><th>遅延</th><th>ピア</th><th>REST</th><th>最終確認</th><th aria-label="操作" /></tr></thead>
             <tbody>{nodes.map((node, index) => <tr key={node.id} className="clickable" onClick={() => navigate(`/nodes/${node.id}`)}>
-              <td><strong>{node.displayName}</strong><small>{node.baseUrl}</small></td>
+              <td className="node-table__node" title={`${node.displayName}\n${node.baseUrl}`}><strong>{node.displayName}</strong><small>{node.baseUrl}</small>{node.showHarvestMetrics && node.kind === "symbol" && <div className="harvest-chips"><span><Cherry size={12} />{node.delegatedHarvesterCount ?? "—"}</span><span className={node.delegatedHarvesterDelta && node.delegatedHarvesterDelta !== 0 ? (node.delegatedHarvesterDelta > 0 ? "text-good" : "text-warn") : undefined}>{formatDelta(node.delegatedHarvesterDelta)}</span><span>{formatXym(node.totalBalanceMicroXym)}</span></div>}</td>
               <td><span className={`kind kind--${node.kind}`}>{node.kind === "symbol" ? "Symbol" : "NIS1"}</span></td>
-              <td><StatusBadge status={node.status} /></td><td className="mono">{node.height ?? "—"}</td><td className="mono">{node.finalizedHeight ?? "—"}</td><td>{node.lag ?? "—"}</td><td>{node.peerCount ?? "—"}</td><td>{formatLatency(node.latencyMs)}</td><td>{formatTime(node.lastSeenAt)}</td>
+              <td><StatusBadge status={isRechecking ? "unknown" : node.status} label={isRechecking ? "再確認中" : undefined} /></td><td className="mono">{node.height ?? "—"}</td><td className="mono">{node.finalizedHeight ?? "—"}</td><td>{node.lag ?? "—"}</td><td>{node.peerCount ?? "—"}</td><td>{formatLatency(node.latencyMs)}</td><td>{formatTime(node.lastSeenAt)}</td>
               <td><div className="row-actions">
                 <button className="icon-button" aria-label={`${node.displayName}を上へ移動`} title={reorderTitle ?? "上へ移動"} disabled={filterActive || index === 0 || reorder.isPending} onClick={(event) => { event.stopPropagation(); reorder.mutate({ id: node.id, direction: "up" }); }}><ArrowUp size={16} /></button>
                 <button className="icon-button" aria-label={`${node.displayName}を下へ移動`} title={reorderTitle ?? "下へ移動"} disabled={filterActive || index === nodes.length - 1 || reorder.isPending} onClick={(event) => { event.stopPropagation(); reorder.mutate({ id: node.id, direction: "down" }); }}><ArrowDown size={16} /></button>
-                <button className="icon-button" title="今すぐ更新" onClick={(event) => { event.stopPropagation(); refresh.mutate(node.id); }}><RefreshCw size={16} /></button>
+                <button className="icon-button" title="今すぐ更新" onClick={(event) => { event.stopPropagation(); refreshNode.mutate(node.id); }}><RefreshCw size={16} /></button>
                 <button className="icon-button" title={node.enabled ? "監視を停止" : "監視を再開"} onClick={(event) => { event.stopPropagation(); pause.mutate({ id: node.id, enabled: node.enabled }); }}>{node.enabled ? <Pause size={16} /> : <Play size={16} />}</button>
                 <button className="icon-button icon-button--danger" aria-label={`${node.displayName}の登録を解除`} title="登録解除" disabled={remove.isPending} onClick={(event) => { event.stopPropagation(); unregisterNode(node.id, node.displayName); }}><Trash2 size={16} /></button>
                 <ChevronRight size={17} />
@@ -243,23 +292,56 @@ function DashboardPage() {
 function NodeDetailPage() {
   const { nodeId = "" } = useParams();
   const navigate = useNavigate();
-  const now = Date.now();
+  const queryClient = useQueryClient();
   const { data, isLoading, error } = useQuery({ queryKey: ["node", nodeId], queryFn: () => api.nodeDetail(nodeId), refetchInterval: 10_000 });
-  const { data: metrics = [] } = useQuery({ queryKey: ["metrics", nodeId], queryFn: () => api.metrics(nodeId, now - 24 * 60 * 60 * 1000, now), refetchInterval: 30_000 });
+  const { data: metrics = [] } = useQuery({ queryKey: ["metrics", nodeId], queryFn: () => api.metrics(nodeId, 0, Date.now()), refetchInterval: 30_000 });
   const { data: diagnostics = [], refetch: refetchDiagnostics } = useQuery({ queryKey: ["diagnostics", nodeId], queryFn: () => api.nodeDiagnostics(nodeId) });
   const diagnose = useMutation({ mutationFn: () => api.runNodeDiagnostic(nodeId), onSuccess: () => void refetchDiagnostics() });
   const remove = useMutation({ mutationFn: () => api.deleteNode(nodeId), onSuccess: () => navigate("/") });
+  const toggleHarvest = useMutation({
+    mutationFn: (visible: boolean) => api.setNodeHarvestMetricsVisible(nodeId, visible),
+    onMutate: async (visible) => {
+      await queryClient.cancelQueries({ queryKey: ["node", nodeId] });
+      const previousDetail = queryClient.getQueryData<NodeDetail>(["node", nodeId]);
+      const previousDashboard = queryClient.getQueryData<DashboardData>(["dashboard"]);
+      const previousTopology = queryClient.getQueryData<TopologySnapshot>(["topology"]);
+      queryClient.setQueryData<NodeDetail>(["node", nodeId], (current) => current ? {
+        ...current,
+        node: { ...current.node, showHarvestMetrics: visible },
+      } : current);
+      queryClient.setQueryData<DashboardData>(["dashboard"], (current) => current ? {
+        ...current,
+        nodes: current.nodes.map((node) => node.id === nodeId ? { ...node, showHarvestMetrics: visible } : node),
+      } : current);
+      queryClient.setQueryData<TopologySnapshot>(["topology"], (current) => current ? {
+        ...current,
+        nodes: current.nodes.map((node) => node.id === nodeId ? { ...node, showHarvestMetrics: visible } : node),
+      } : current);
+      return { previousDetail, previousDashboard, previousTopology };
+    },
+    onError: (_error, _visible, context) => {
+      if (context?.previousDetail) queryClient.setQueryData(["node", nodeId], context.previousDetail);
+      if (context?.previousDashboard) queryClient.setQueryData(["dashboard"], context.previousDashboard);
+      if (context?.previousTopology) queryClient.setQueryData(["topology"], context.previousTopology);
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: ["node", nodeId] });
+      void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+      void queryClient.invalidateQueries({ queryKey: ["topology"] });
+    },
+  });
   if (isLoading) return <div className="loading">ノード詳細を読み込み中…</div>;
   if (error || !data) return <div className="notice notice--error">ノード情報を取得できません。</div>;
   return <>
     <div className="page-heading"><div><button className="link-button" onClick={() => navigate("/")}>← ダッシュボード</button><h2>{data.node.displayName}</h2><p>{data.node.baseUrl}</p></div><div className="actions"><StatusBadge status={data.node.status} /><button className="button button--danger" onClick={() => remove.mutate()}><Trash2 size={16} />削除</button></div></div>
     <section className="detail-grid">
       <article className="panel detail-card"><h3>チェーン</h3><dl><div><dt>高さ</dt><dd>{data.node.height ?? "—"}</dd></div><div><dt>ファイナライズ高</dt><dd>{data.node.finalizedHeight ?? "対象外"}</dd></div><div><dt>同期遅延</dt><dd>{data.node.lag ?? "—"}</dd></div><div><dt>チェーンスコア</dt><dd className="mono text-truncate">{data.chainScore ?? "—"}</dd></div></dl></article>
-      <article className="panel detail-card"><h3>ノード</h3><dl><div><dt>種別</dt><dd>{data.node.kind === "symbol" ? "Symbol" : "NIS1"}</dd></div><div><dt>ネットワーク</dt><dd>{data.node.network ?? "—"}</dd></div><div><dt>バージョン</dt><dd>{data.node.version ?? "—"}</dd></div><div><dt>REST</dt><dd>{data.restVersion ?? "—"}</dd></div></dl></article>
+      <article className="panel detail-card"><h3>ノード</h3><dl><div><dt>種別</dt><dd>{data.node.kind === "symbol" ? "Symbol" : "NIS1"}</dd></div><div><dt>ネットワーク</dt><dd>{formatNetwork(data.node.network)}</dd></div><div><dt>バージョン</dt><dd>{data.node.version ?? "—"}</dd></div><div><dt>REST</dt><dd>{data.restVersion ?? "—"}</dd></div></dl></article>
       <article className="panel detail-card"><h3>接続</h3><dl><div><dt>REST応答</dt><dd>{formatLatency(data.node.latencyMs)}</dd></div><div><dt>ピア</dt><dd>{data.node.peerCount ?? "—"}</dd></div><div><dt>API / DB</dt><dd>{[data.apiStatus, data.dbStatus].filter(Boolean).join(" / ") || "—"}</dd></div><div><dt>WebSocket</dt><dd>{data.node.kind === "symbol" ? (data.websocketConnected ? "接続中" : "RESTへフォールバック") : "対象外"}</dd></div></dl></article>
+      <article className="panel detail-card harvest-card"><div className="detail-card__heading"><h3>委任ハーベスト</h3>{data.node.kind === "symbol" && <label className="mini-toggle"><input type="checkbox" checked={data.node.showHarvestMetrics} disabled={toggleHarvest.isPending} onChange={(event) => toggleHarvest.mutate(event.target.checked)} />表示</label>}</div>{data.node.kind !== "symbol" ? <p className="harvest-empty">Symbolノードのみ対象です。</p> : data.node.showHarvestMetrics ? <><dl><div><dt>委任者数</dt><dd>{data.node.delegatedHarvesterCount ?? "—"}</dd></div><div><dt>24時間増減</dt><dd>{formatDelta(data.node.delegatedHarvesterDelta)}</dd></div><div><dt>合計XYM</dt><dd>{formatXym(data.node.totalBalanceMicroXym)}</dd></div><div><dt>最新検知</dt><dd>{formatTime(data.node.latestHarvestAt)}</dd></div></dl>{data.node.harvestMetricError && <p className="harvest-error">取得エラー: {data.node.harvestMetricError}</p>}<HarvestEventList events={data.recentHarvests} /></> : <p className="harvest-empty">表示をONにすると委任ハーベスト情報を表示します。</p>}</article>
     </section>
     <DiagnosticPanel latest={diagnose.data ?? diagnostics[0]} history={diagnostics} isPending={diagnose.isPending} error={diagnose.error} onRun={() => diagnose.mutate()} />
-    <section className="panel"><div className="panel__header"><div><h2>24時間メトリクス</h2><p>REST応答、ピア数、同期遅延</p></div><button className="button" onClick={() => api.exportCsv("metrics", nodeId)}><Download size={16} />CSV</button></div>{metrics.length ? <MetricChart data={metrics} /> : <EmptyState title="履歴を収集中">最初の監視サンプルが保存されるとグラフが表示されます。</EmptyState>}</section>
+    <section className="panel"><div className="panel__header"><div><h2>監視期間メトリクス</h2><p>REST応答、ピア数、同期遅延、委任ハーベスト</p></div><button className="button" onClick={() => api.exportCsv("metrics", nodeId)}><Download size={16} />CSV</button></div>{metrics.length ? <MetricChart data={metrics} showHarvestMetrics={data.node.showHarvestMetrics} /> : <EmptyState title="履歴を収集中">最初の監視サンプルが保存されるとグラフが表示されます。</EmptyState>}</section>
     <section className="panel"><div className="panel__header"><div><h2>現在のピア</h2><p>{data.peers.length}件</p></div></div>{data.peers.length ? <div className="table-wrap"><table><thead><tr><th>名前</th><th>ホスト</th><th>ポート</th><th>状態</th><th>バージョン</th></tr></thead><tbody>{data.peers.map((peer) => <tr key={peer.key}><td>{peer.name ?? "—"}</td><td>{peer.host ?? "—"}</td><td>{peer.port ?? "—"}</td><td>{peer.status}</td><td>{peer.version ?? "—"}</td></tr>)}</tbody></table></div> : <EmptyState title="ピア情報がありません">次回のピアポーリング後に表示されます。</EmptyState>}</section>
   </>;
 }

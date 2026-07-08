@@ -8,7 +8,6 @@ const labels: Record<NodeStatus, string> = {
   offline: "オフライン",
 };
 
-export function StatusBadge({ status }: { status: NodeStatus }) {
-  return <span className={`status status--${status}`}>{labels[status]}</span>;
+export function StatusBadge({ status, label }: { status: NodeStatus; label?: string }) {
+  return <span className={`status status--${status}`}>{label ?? labels[status]}</span>;
 }
-
