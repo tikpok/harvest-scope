@@ -9,6 +9,7 @@ import type {
   NetworkEvent,
   NetworkInterfaceInfo,
   NodeDetail,
+  NodeConfigImportResult,
   NodeSummary,
   ScanCandidate,
   ScanRequest,
@@ -88,6 +89,8 @@ export const api = {
   takePendingNavigation: () => call<string | null>("take_pending_navigation", undefined, null),
   settings: () => call("get_settings", undefined, defaultSettings),
   updateSettings: (settings: AppSettings) => invoke<AppSettings>("update_settings", { settings }),
+  exportNodeConfig: () => invoke<string | null>("export_node_config"),
+  importNodeConfig: () => invoke<NodeConfigImportResult | null>("import_node_config"),
   exportCsv: (dataset: "nodes" | "metrics" | "alerts", nodeId?: string) =>
     invoke<string | null>("export_csv", { dataset, nodeId }),
 };

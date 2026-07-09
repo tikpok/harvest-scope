@@ -294,6 +294,13 @@ mod tests {
             total_balance_micro_xym: None,
             harvest_metric_error: None,
             latest_harvest_at: None,
+            node_certificate_not_after: None,
+            node_certificate_remaining_days: None,
+            voting_key_start_epoch: None,
+            voting_key_end_epoch: None,
+            finalization_epoch: None,
+            voting_key_remaining_epochs: None,
+            certificate_metric_error: None,
         }
     }
 

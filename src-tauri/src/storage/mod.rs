@@ -35,6 +35,17 @@ struct HarvestMetricSnapshot {
     harvest_metric_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct CertificateMetricSnapshot {
+    node_certificate_not_after: Option<i64>,
+    node_certificate_remaining_days: Option<i64>,
+    voting_key_start_epoch: Option<i64>,
+    voting_key_end_epoch: Option<i64>,
+    finalization_epoch: Option<i64>,
+    voting_key_remaining_epochs: Option<i64>,
+    certificate_metric_error: Option<String>,
+}
+
 fn parse_kind(value: &str) -> AppResult<NodeKind> {
     NodeKind::try_from(value).map_err(AppError::Configuration)
 }
@@ -170,6 +181,7 @@ impl Repository {
         } else {
             None
         };
+        let certificate = self.latest_certificate_metrics(&node.id).await?;
         let summary = if let Some(row) = sample {
             NodeSummary {
                 id: node.id.clone(),
@@ -215,6 +227,27 @@ impl Repository {
                     .try_get::<Option<String>, _>("harvest_metric_error")?
                     .or(harvest.harvest_metric_error),
                 latest_harvest_at,
+                node_certificate_not_after: row
+                    .try_get::<Option<i64>, _>("node_certificate_not_after")?
+                    .or(certificate.node_certificate_not_after),
+                node_certificate_remaining_days: row
+                    .try_get::<Option<i64>, _>("node_certificate_remaining_days")?
+                    .or(certificate.node_certificate_remaining_days),
+                voting_key_start_epoch: row
+                    .try_get::<Option<i64>, _>("voting_key_start_epoch")?
+                    .or(certificate.voting_key_start_epoch),
+                voting_key_end_epoch: row
+                    .try_get::<Option<i64>, _>("voting_key_end_epoch")?
+                    .or(certificate.voting_key_end_epoch),
+                finalization_epoch: row
+                    .try_get::<Option<i64>, _>("finalization_epoch")?
+                    .or(certificate.finalization_epoch),
+                voting_key_remaining_epochs: row
+                    .try_get::<Option<i64>, _>("voting_key_remaining_epochs")?
+                    .or(certificate.voting_key_remaining_epochs),
+                certificate_metric_error: row
+                    .try_get::<Option<String>, _>("certificate_metric_error")?
+                    .or(certificate.certificate_metric_error),
             }
         } else {
             NodeSummary {
@@ -241,6 +274,13 @@ impl Repository {
                 total_balance_micro_xym: harvest.total_balance_micro_xym,
                 harvest_metric_error: harvest.harvest_metric_error,
                 latest_harvest_at,
+                node_certificate_not_after: certificate.node_certificate_not_after,
+                node_certificate_remaining_days: certificate.node_certificate_remaining_days,
+                voting_key_start_epoch: certificate.voting_key_start_epoch,
+                voting_key_end_epoch: certificate.voting_key_end_epoch,
+                finalization_epoch: certificate.finalization_epoch,
+                voting_key_remaining_epochs: certificate.voting_key_remaining_epochs,
+                certificate_metric_error: certificate.certificate_metric_error,
             }
         };
         Ok(summary)
@@ -342,14 +382,17 @@ impl Repository {
 
     pub async fn save_sample(&self, node_id: &str, sample: &NodeSample) -> AppResult<()> {
         sqlx::query(
-            "INSERT INTO node_samples (node_id, observed_at, reachable, status, latency_ms, height, finalized_height, network_height, lag, peer_count, chain_score, api_status, db_status, nis_status_code, last_error, delegated_harvester_count, delegated_harvester_delta, total_importance, total_balance_micro_xym, harvest_metric_error)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO node_samples (node_id, observed_at, reachable, status, latency_ms, height, finalized_height, network_height, lag, peer_count, chain_score, api_status, db_status, nis_status_code, last_error, delegated_harvester_count, delegated_harvester_delta, total_importance, total_balance_micro_xym, harvest_metric_error, node_certificate_not_after, node_certificate_remaining_days, voting_key_start_epoch, voting_key_end_epoch, finalization_epoch, voting_key_remaining_epochs, certificate_metric_error)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         ).bind(node_id).bind(sample.observed_at).bind(sample.reachable as i64).bind(sample.status.as_str())
             .bind(sample.latency_ms).bind(to_i64(sample.height)).bind(to_i64(sample.finalized_height))
             .bind(to_i64(sample.network_height)).bind(to_i64(sample.lag)).bind(sample.peer_count)
             .bind(&sample.chain_score).bind(&sample.api_status).bind(&sample.db_status).bind(sample.nis_status_code)
             .bind(&sample.last_error).bind(sample.delegated_harvester_count).bind(sample.delegated_harvester_delta)
             .bind(&sample.total_importance).bind(&sample.total_balance_micro_xym).bind(&sample.harvest_metric_error)
+            .bind(sample.node_certificate_not_after).bind(sample.node_certificate_remaining_days)
+            .bind(sample.voting_key_start_epoch).bind(sample.voting_key_end_epoch).bind(sample.finalization_epoch)
+            .bind(sample.voting_key_remaining_epochs).bind(&sample.certificate_metric_error)
             .execute(&self.pool).await?;
         Ok(())
     }
@@ -422,6 +465,64 @@ impl Repository {
             total_importance: row.try_get("total_importance")?,
             total_balance_micro_xym: row.try_get("total_balance_micro_xym")?,
             harvest_metric_error: row.try_get("harvest_metric_error")?,
+        })
+    }
+
+    async fn latest_certificate_metrics(&self, node_id: &str) -> AppResult<CertificateMetricSnapshot> {
+        let row = sqlx::query(
+            "SELECT node_certificate_not_after, node_certificate_remaining_days, voting_key_start_epoch, voting_key_end_epoch, finalization_epoch, voting_key_remaining_epochs, certificate_metric_error
+             FROM node_samples
+             WHERE node_id = ?
+               AND (node_certificate_not_after IS NOT NULL OR node_certificate_remaining_days IS NOT NULL OR voting_key_start_epoch IS NOT NULL OR voting_key_end_epoch IS NOT NULL OR finalization_epoch IS NOT NULL OR voting_key_remaining_epochs IS NOT NULL OR certificate_metric_error IS NOT NULL)
+             ORDER BY observed_at DESC
+             LIMIT 1",
+        )
+        .bind(node_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(CertificateMetricSnapshot::default());
+        };
+        Ok(CertificateMetricSnapshot {
+            node_certificate_not_after: row.try_get("node_certificate_not_after")?,
+            node_certificate_remaining_days: row.try_get("node_certificate_remaining_days")?,
+            voting_key_start_epoch: row.try_get("voting_key_start_epoch")?,
+            voting_key_end_epoch: row.try_get("voting_key_end_epoch")?,
+            finalization_epoch: row.try_get("finalization_epoch")?,
+            voting_key_remaining_epochs: row.try_get("voting_key_remaining_epochs")?,
+            certificate_metric_error: row.try_get("certificate_metric_error")?,
+        })
+    }
+
+    async fn latest_certificate_metrics_at_or_before(
+        &self,
+        node_id: &str,
+        observed_at: i64,
+    ) -> AppResult<CertificateMetricSnapshot> {
+        let row = sqlx::query(
+            "SELECT node_certificate_not_after, node_certificate_remaining_days, voting_key_start_epoch, voting_key_end_epoch, finalization_epoch, voting_key_remaining_epochs, certificate_metric_error
+             FROM node_samples
+             WHERE node_id = ?
+               AND observed_at <= ?
+               AND (node_certificate_not_after IS NOT NULL OR node_certificate_remaining_days IS NOT NULL OR voting_key_start_epoch IS NOT NULL OR voting_key_end_epoch IS NOT NULL OR finalization_epoch IS NOT NULL OR voting_key_remaining_epochs IS NOT NULL OR certificate_metric_error IS NOT NULL)
+             ORDER BY observed_at DESC
+             LIMIT 1",
+        )
+        .bind(node_id)
+        .bind(observed_at)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(CertificateMetricSnapshot::default());
+        };
+        Ok(CertificateMetricSnapshot {
+            node_certificate_not_after: row.try_get("node_certificate_not_after")?,
+            node_certificate_remaining_days: row.try_get("node_certificate_remaining_days")?,
+            voting_key_start_epoch: row.try_get("voting_key_start_epoch")?,
+            voting_key_end_epoch: row.try_get("voting_key_end_epoch")?,
+            finalization_epoch: row.try_get("finalization_epoch")?,
+            voting_key_remaining_epochs: row.try_get("voting_key_remaining_epochs")?,
+            certificate_metric_error: row.try_get("certificate_metric_error")?,
         })
     }
 
@@ -695,6 +796,9 @@ impl Repository {
         let mut harvest = self
             .latest_harvest_metrics_at_or_before(node_id, from)
             .await?;
+        let mut certificate = self
+            .latest_certificate_metrics_at_or_before(node_id, from)
+            .await?;
         rows.into_iter()
             .map(|row| {
                 harvest.delegated_harvester_count = row
@@ -709,6 +813,12 @@ impl Repository {
                 harvest.total_balance_micro_xym = row
                     .try_get::<Option<String>, _>("total_balance_micro_xym")?
                     .or_else(|| harvest.total_balance_micro_xym.clone());
+                certificate.node_certificate_remaining_days = row
+                    .try_get::<Option<i64>, _>("node_certificate_remaining_days")?
+                    .or(certificate.node_certificate_remaining_days);
+                certificate.voting_key_remaining_epochs = row
+                    .try_get::<Option<i64>, _>("voting_key_remaining_epochs")?
+                    .or(certificate.voting_key_remaining_epochs);
                 Ok(MetricPoint {
                     observed_at: row.try_get("observed_at")?,
                     height: row
@@ -727,6 +837,8 @@ impl Repository {
                     delegated_harvester_delta: harvest.delegated_harvester_delta,
                     total_importance: harvest.total_importance.clone(),
                     total_balance_micro_xym: harvest.total_balance_micro_xym.clone(),
+                    node_certificate_remaining_days: certificate.node_certificate_remaining_days,
+                    voting_key_remaining_epochs: certificate.voting_key_remaining_epochs,
                 })
             })
             .collect()
@@ -945,6 +1057,13 @@ mod tests {
             total_importance: None,
             total_balance_micro_xym: None,
             harvest_metric_error: None,
+            node_certificate_not_after: None,
+            node_certificate_remaining_days: None,
+            voting_key_start_epoch: None,
+            voting_key_end_epoch: None,
+            finalization_epoch: None,
+            voting_key_remaining_epochs: None,
+            certificate_metric_error: None,
         }
     }
 
@@ -1094,6 +1213,12 @@ mod tests {
         harvest_sample.delegated_harvester_delta = Some(1);
         harvest_sample.total_importance = Some("123".into());
         harvest_sample.total_balance_micro_xym = Some("9876543210".into());
+        harvest_sample.node_certificate_not_after = Some(1_800_000_000_000);
+        harvest_sample.node_certificate_remaining_days = Some(12);
+        harvest_sample.voting_key_start_epoch = Some(100);
+        harvest_sample.voting_key_end_epoch = Some(150);
+        harvest_sample.finalization_epoch = Some(142);
+        harvest_sample.voting_key_remaining_epochs = Some(8);
         repository
             .save_sample("node-a", &harvest_sample)
             .await
@@ -1118,6 +1243,10 @@ mod tests {
             summary.total_balance_micro_xym.as_deref(),
             Some("9876543210")
         );
+        assert_eq!(summary.node_certificate_not_after, Some(1_800_000_000_000));
+        assert_eq!(summary.node_certificate_remaining_days, Some(12));
+        assert_eq!(summary.voting_key_end_epoch, Some(150));
+        assert_eq!(summary.voting_key_remaining_epochs, Some(8));
         let metrics = repository
             .query_metrics("node-a", 1, 2)
             .await
@@ -1129,6 +1258,8 @@ mod tests {
             metrics[1].total_balance_micro_xym.as_deref(),
             Some("9876543210")
         );
+        assert_eq!(metrics[1].node_certificate_remaining_days, Some(12));
+        assert_eq!(metrics[1].voting_key_remaining_epochs, Some(8));
     }
 
     #[tokio::test]

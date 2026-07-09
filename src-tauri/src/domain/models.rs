@@ -91,6 +91,18 @@ pub struct HarvestSnapshot {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CertificateSnapshot {
+    pub node_certificate_not_after: Option<i64>,
+    pub node_certificate_remaining_days: Option<i64>,
+    pub voting_key_start_epoch: Option<i64>,
+    pub voting_key_end_epoch: Option<i64>,
+    pub finalization_epoch: Option<i64>,
+    pub voting_key_remaining_epochs: Option<i64>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PeerInfo {
@@ -194,6 +206,13 @@ pub struct NodeSummary {
     pub total_balance_micro_xym: Option<String>,
     pub harvest_metric_error: Option<String>,
     pub latest_harvest_at: Option<i64>,
+    pub node_certificate_not_after: Option<i64>,
+    pub node_certificate_remaining_days: Option<i64>,
+    pub voting_key_start_epoch: Option<i64>,
+    pub voting_key_end_epoch: Option<i64>,
+    pub finalization_epoch: Option<i64>,
+    pub voting_key_remaining_epochs: Option<i64>,
+    pub certificate_metric_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -262,6 +281,13 @@ pub struct NodeSample {
     pub total_importance: Option<String>,
     pub total_balance_micro_xym: Option<String>,
     pub harvest_metric_error: Option<String>,
+    pub node_certificate_not_after: Option<i64>,
+    pub node_certificate_remaining_days: Option<i64>,
+    pub voting_key_start_epoch: Option<i64>,
+    pub voting_key_end_epoch: Option<i64>,
+    pub finalization_epoch: Option<i64>,
+    pub voting_key_remaining_epochs: Option<i64>,
+    pub certificate_metric_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,6 +304,8 @@ pub struct MetricPoint {
     pub delegated_harvester_delta: Option<i64>,
     pub total_importance: Option<String>,
     pub total_balance_micro_xym: Option<String>,
+    pub node_certificate_remaining_days: Option<i64>,
+    pub voting_key_remaining_epochs: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -301,6 +329,43 @@ pub struct UpsertNodeInput {
     pub kind: Option<NodeKind>,
     pub enabled: Option<bool>,
     pub favorite: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeConfigFile {
+    pub format_version: u32,
+    pub exported_at: String,
+    pub app_version: String,
+    pub nodes: Vec<NodeConfigEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeConfigEntry {
+    pub display_name: Option<String>,
+    pub kind: Option<NodeKind>,
+    pub base_url: String,
+    pub enabled: Option<bool>,
+    pub favorite: Option<bool>,
+    pub show_harvest_metrics: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeConfigImportFailure {
+    pub base_url: Option<String>,
+    pub display_name: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeConfigImportResult {
+    pub added: usize,
+    pub updated: usize,
+    pub failed: usize,
+    pub failures: Vec<NodeConfigImportFailure>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
