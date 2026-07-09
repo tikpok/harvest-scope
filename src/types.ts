@@ -29,6 +29,13 @@ export interface NodeSummary {
   totalBalanceMicroXym: string | null;
   harvestMetricError: string | null;
   latestHarvestAt: number | null;
+  nodeCertificateNotAfter: number | null;
+  nodeCertificateRemainingDays: number | null;
+  votingKeyStartEpoch: number | null;
+  votingKeyEndEpoch: number | null;
+  finalizationEpoch: number | null;
+  votingKeyRemainingEpochs: number | null;
+  certificateMetricError: string | null;
 }
 
 export interface DashboardData {
@@ -140,6 +147,8 @@ export interface MetricPoint {
   delegatedHarvesterDelta: number | null;
   totalImportance: string | null;
   totalBalanceMicroXym: string | null;
+  nodeCertificateRemainingDays: number | null;
+  votingKeyRemainingEpochs: number | null;
 }
 
 export interface AlertRecord {
@@ -220,4 +229,17 @@ export interface UpsertNodeInput {
   kind?: NodeKind;
   enabled?: boolean;
   favorite?: boolean;
+}
+
+export interface NodeConfigImportFailure {
+  baseUrl: string | null;
+  displayName: string | null;
+  reason: string;
+}
+
+export interface NodeConfigImportResult {
+  added: number;
+  updated: number;
+  failed: number;
+  failures: NodeConfigImportFailure[];
 }

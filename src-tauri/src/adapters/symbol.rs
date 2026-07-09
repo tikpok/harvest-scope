@@ -1,13 +1,21 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
+use chrono::{NaiveDate, TimeZone, Utc};
 use reqwest::Client;
+use rustls::{
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    DigitallySignedStruct, SignatureScheme,
+};
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::Value;
+use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 
 use crate::{
     domain::{
-        ChainSnapshot, HarvestSnapshot, HealthSnapshot, NodeAdapter, NodeIdentity, NodeKind,
-        PeerInfo, WebSocketSpec,
+        CertificateSnapshot, ChainSnapshot, HarvestSnapshot, HealthSnapshot, NodeAdapter,
+        NodeIdentity, NodeKind, PeerInfo, WebSocketSpec,
     },
     error::{AppError, AppResult},
 };
@@ -17,6 +25,120 @@ use super::{string_value, u64_value};
 pub struct SymbolAdapter {
     base_url: String,
     client: Client,
+}
+
+#[derive(Debug)]
+struct CertificateOnlyVerifier;
+
+impl ServerCertVerifier for CertificateOnlyVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ED25519,
+        ]
+    }
+}
+
+struct DerReader<'a> {
+    data: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> DerReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, offset: 0 }
+    }
+
+    fn peek_tag(&self) -> Option<u8> {
+        self.data.get(self.offset).copied()
+    }
+
+    fn read_tlv(&mut self) -> AppResult<(u8, &'a [u8])> {
+        let tag = *self
+            .data
+            .get(self.offset)
+            .ok_or_else(|| AppError::InvalidPayload("証明書DERが途中で終わっています".into()))?;
+        self.offset += 1;
+        let first = *self
+            .data
+            .get(self.offset)
+            .ok_or_else(|| AppError::InvalidPayload("証明書DERの長さがありません".into()))?;
+        self.offset += 1;
+        let length = if first & 0x80 == 0 {
+            first as usize
+        } else {
+            let bytes = (first & 0x7f) as usize;
+            if bytes == 0 || bytes > 8 {
+                return Err(AppError::InvalidPayload(
+                    "証明書DERの長さ形式が不正です".into(),
+                ));
+            }
+            let mut length = 0usize;
+            for _ in 0..bytes {
+                length = (length << 8)
+                    | *self.data.get(self.offset).ok_or_else(|| {
+                        AppError::InvalidPayload("証明書DERの長さが途中で終わっています".into())
+                    })? as usize;
+                self.offset += 1;
+            }
+            length
+        };
+        let end = self.offset.checked_add(length).ok_or_else(|| {
+            AppError::InvalidPayload("証明書DERの長さが大きすぎます".into())
+        })?;
+        let value = self
+            .data
+            .get(self.offset..end)
+            .ok_or_else(|| AppError::InvalidPayload("証明書DER値が途中で終わっています".into()))?;
+        self.offset = end;
+        Ok((tag, value))
+    }
+
+    fn expect(&mut self, expected: u8) -> AppResult<&'a [u8]> {
+        let (tag, value) = self.read_tlv()?;
+        if tag != expected {
+            return Err(AppError::InvalidPayload(format!(
+                "証明書DERで想定外のタグを検出しました: {tag:#x}"
+            )));
+        }
+        Ok(value)
+    }
 }
 
 impl SymbolAdapter {
@@ -164,6 +286,16 @@ impl SymbolAdapter {
         })
     }
 
+    fn i64_value(value: Option<&Value>) -> Option<i64> {
+        value.and_then(|value| match value {
+            Value::String(value) => value.parse().ok(),
+            Value::Number(value) => value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok())),
+            _ => None,
+        })
+    }
+
     fn account_items(root: &Value) -> Vec<&Value> {
         root.get("data")
             .and_then(Value::as_array)
@@ -182,6 +314,200 @@ impl SymbolAdapter {
             .and_then(string_value)
             .map(|value| value.to_ascii_uppercase())
             .filter(|value| !value.is_empty())
+    }
+
+    fn voting_key_ranges(account: &Value) -> Vec<(i64, i64)> {
+        fn visit(value: &Value, ranges: &mut Vec<(i64, i64)>) {
+            match value {
+                Value::Array(items) => {
+                    for item in items {
+                        visit(item, ranges);
+                    }
+                }
+                Value::Object(object) => {
+                    if let (Some(start), Some(end)) = (
+                        SymbolAdapter::i64_value(object.get("startEpoch")),
+                        SymbolAdapter::i64_value(object.get("endEpoch")),
+                    ) {
+                        ranges.push((start, end));
+                    }
+                    for key in ["supplementalPublicKeys", "voting", "publicKeys", "data"] {
+                        if let Some(value) = object.get(key) {
+                            visit(value, ranges);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut ranges = Vec::new();
+        visit(account, &mut ranges);
+        ranges.sort_unstable();
+        ranges.dedup();
+        ranges
+    }
+
+    fn parse_asn1_time(tag: u8, value: &[u8]) -> AppResult<i64> {
+        let raw = std::str::from_utf8(value)
+            .map_err(|_| AppError::InvalidPayload("証明書時刻がUTF-8ではありません".into()))?;
+        let raw = raw.trim_end_matches('Z');
+        let (year, rest) = match tag {
+            0x17 => {
+                if raw.len() < 10 {
+                    return Err(AppError::InvalidPayload("UTCTimeが短すぎます".into()));
+                }
+                let year = raw[0..2].parse::<i32>().map_err(|_| {
+                    AppError::InvalidPayload("UTCTimeの年を解析できません".into())
+                })?;
+                (if year >= 50 { 1900 + year } else { 2000 + year }, &raw[2..])
+            }
+            0x18 => {
+                if raw.len() < 12 {
+                    return Err(AppError::InvalidPayload(
+                        "GeneralizedTimeが短すぎます".into(),
+                    ));
+                }
+                let year = raw[0..4].parse::<i32>().map_err(|_| {
+                    AppError::InvalidPayload("GeneralizedTimeの年を解析できません".into())
+                })?;
+                (year, &raw[4..])
+            }
+            _ => {
+                return Err(AppError::InvalidPayload(
+                    "証明書時刻タグが不正です".into(),
+                ))
+            }
+        };
+        let month = rest[0..2]
+            .parse::<u32>()
+            .map_err(|_| AppError::InvalidPayload("証明書時刻の月を解析できません".into()))?;
+        let day = rest[2..4]
+            .parse::<u32>()
+            .map_err(|_| AppError::InvalidPayload("証明書時刻の日を解析できません".into()))?;
+        let hour = rest[4..6]
+            .parse::<u32>()
+            .map_err(|_| AppError::InvalidPayload("証明書時刻の時を解析できません".into()))?;
+        let minute = rest[6..8]
+            .parse::<u32>()
+            .map_err(|_| AppError::InvalidPayload("証明書時刻の分を解析できません".into()))?;
+        let second = rest
+            .get(8..10)
+            .unwrap_or("00")
+            .parse::<u32>()
+            .map_err(|_| AppError::InvalidPayload("証明書時刻の秒を解析できません".into()))?;
+        let date = NaiveDate::from_ymd_opt(year, month, day)
+            .and_then(|date| date.and_hms_opt(hour, minute, second))
+            .ok_or_else(|| AppError::InvalidPayload("証明書時刻が不正です".into()))?;
+        Ok(Utc.from_utc_datetime(&date).timestamp_millis())
+    }
+
+    fn parse_certificate_not_after_ms(der: &[u8]) -> AppResult<i64> {
+        let mut certificate = DerReader::new(der);
+        let certificate = certificate.expect(0x30)?;
+        let mut certificate = DerReader::new(certificate);
+        let tbs = certificate.expect(0x30)?;
+        let mut tbs = DerReader::new(tbs);
+        if tbs.peek_tag() == Some(0xa0) {
+            let _ = tbs.read_tlv()?;
+        }
+        let _serial = tbs.read_tlv()?;
+        let _signature = tbs.read_tlv()?;
+        let _issuer = tbs.read_tlv()?;
+        let validity = tbs.expect(0x30)?;
+        let mut validity = DerReader::new(validity);
+        let _not_before = validity.read_tlv()?;
+        let (tag, not_after) = validity.read_tlv()?;
+        Self::parse_asn1_time(tag, not_after)
+    }
+
+    async fn fetch_tls_certificate_not_after(&self) -> Result<Option<i64>, String> {
+        let url = url::Url::parse(&self.base_url).map_err(|error| error.to_string())?;
+        if url.scheme() != "https" {
+            return Ok(None);
+        }
+        let host = url
+            .host_str()
+            .ok_or_else(|| "HTTPS URLにホストがありません".to_string())?
+            .to_owned();
+        let port = url.port_or_known_default().unwrap_or(443);
+        let stream = TcpStream::connect((host.as_str(), port))
+            .await
+            .map_err(|error| error.to_string())?;
+        let server_name = ServerName::try_from(host)
+            .map_err(|_| "TLS ServerNameを作成できません".to_string())?;
+        let config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(CertificateOnlyVerifier))
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(config));
+        let tls = connector
+            .connect(server_name, stream)
+            .await
+            .map_err(|error| error.to_string())?;
+        let (_, session) = tls.get_ref();
+        let certificate = session
+            .peer_certificates()
+            .and_then(|certificates| certificates.first())
+            .ok_or_else(|| "TLS証明書が提示されませんでした".to_string())?;
+        Self::parse_certificate_not_after_ms(certificate.as_ref())
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn fetch_voting_key_snapshot(&self) -> Result<CertificateSnapshot, String> {
+        let info = self.get_json("/node/info").await.map_err(|error| error.to_string())?;
+        let roles = u64_value(info.get("roles")).unwrap_or_default();
+        if roles & 4 == 0 {
+            return Ok(CertificateSnapshot::default());
+        }
+        let public_key = info
+            .get("publicKey")
+            .and_then(string_value)
+            .ok_or_else(|| "node/infoにpublicKeyがありません".to_string())?;
+        let chain = self
+            .get_json("/chain/info")
+            .await
+            .map_err(|error| error.to_string())?;
+        let finalization_epoch = chain
+            .get("latestFinalizedBlock")
+            .and_then(|block| Self::i64_value(block.get("finalizationEpoch")));
+        let accounts = self
+            .fetch_accounts_by_public_keys(&[public_key.to_ascii_uppercase()], &mut Vec::new())
+            .await;
+        let account = accounts
+            .first()
+            .ok_or_else(|| "投票キー確認用アカウント情報を取得できません".to_string())?;
+        let ranges = Self::voting_key_ranges(account);
+        let selected = finalization_epoch
+            .and_then(|epoch| {
+                ranges
+                    .iter()
+                    .copied()
+                    .filter(|(start, end)| *start <= epoch && epoch <= *end)
+                    .max_by_key(|(_, end)| *end)
+            })
+            .or_else(|| ranges.iter().copied().max_by_key(|(_, end)| *end));
+        let Some((start, end)) = selected else {
+            return Err("voting keyの有効epochを取得できません".into());
+        };
+        Ok(CertificateSnapshot {
+            voting_key_start_epoch: Some(start),
+            voting_key_end_epoch: Some(end),
+            finalization_epoch,
+            voting_key_remaining_epochs: finalization_epoch.map(|epoch| end.saturating_sub(epoch)),
+            ..CertificateSnapshot::default()
+        })
+    }
+
+    fn remaining_days(not_after: i64, now: i64) -> i64 {
+        let remaining = not_after.saturating_sub(now);
+        let day = 86_400_000;
+        if remaining >= 0 {
+            (remaining + day - 1) / day
+        } else {
+            remaining.div_euclid(day)
+        }
     }
 
     fn linked_public_key(account: &Value) -> Option<String> {
@@ -436,6 +762,34 @@ impl NodeAdapter for SymbolAdapter {
         })
     }
 
+    async fn fetch_certificate_metrics(&self) -> AppResult<CertificateSnapshot> {
+        let mut snapshot = CertificateSnapshot::default();
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut errors = Vec::new();
+
+        match self.fetch_tls_certificate_not_after().await {
+            Ok(Some(not_after)) => {
+                snapshot.node_certificate_not_after = Some(not_after);
+                snapshot.node_certificate_remaining_days = Some(Self::remaining_days(not_after, now));
+            }
+            Ok(None) => {}
+            Err(error) => errors.push(format!("node certificate: {error}")),
+        }
+
+        match self.fetch_voting_key_snapshot().await {
+            Ok(voting) => {
+                snapshot.voting_key_start_epoch = voting.voting_key_start_epoch;
+                snapshot.voting_key_end_epoch = voting.voting_key_end_epoch;
+                snapshot.finalization_epoch = voting.finalization_epoch;
+                snapshot.voting_key_remaining_epochs = voting.voting_key_remaining_epochs;
+            }
+            Err(error) => errors.push(format!("voting key: {error}")),
+        }
+
+        snapshot.error = (!errors.is_empty()).then(|| errors.join("; "));
+        Ok(snapshot)
+    }
+
     async fn fetch_state_hash(&self, height: u64) -> AppResult<Option<String>> {
         let block = self.get_json(&format!("/blocks/{height}")).await?;
         Ok(block
@@ -538,5 +892,42 @@ mod tests {
             SymbolAdapter::linked_public_key(&account).as_deref(),
             Some("MAIN")
         );
+    }
+
+    #[test]
+    fn extracts_voting_key_epoch_ranges() {
+        let account = serde_json::json!({
+            "supplementalPublicKeys": {
+                "voting": {
+                    "publicKeys": [
+                        { "publicKey": "A", "startEpoch": 10, "endEpoch": 20 },
+                        { "publicKey": "B", "startEpoch": "21", "endEpoch": "40" }
+                    ]
+                }
+            }
+        });
+
+        assert_eq!(
+            SymbolAdapter::voting_key_ranges(&account),
+            vec![(10, 20), (21, 40)]
+        );
+    }
+
+    #[test]
+    fn parses_certificate_asn1_times() {
+        assert_eq!(
+            SymbolAdapter::parse_asn1_time(0x17, b"260710010203Z").unwrap(),
+            1_783_645_323_000
+        );
+        assert_eq!(
+            SymbolAdapter::parse_asn1_time(0x18, b"20560710010203Z").unwrap(),
+            2_730_416_523_000
+        );
+    }
+
+    #[test]
+    fn remaining_certificate_days_rounds_expired_values_down() {
+        assert_eq!(SymbolAdapter::remaining_days(1_001, 1_000), 1);
+        assert_eq!(SymbolAdapter::remaining_days(999, 1_000), -1);
     }
 }

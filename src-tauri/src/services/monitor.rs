@@ -27,6 +27,34 @@ fn latency_sample_is_slow(health_succeeded: bool, latency_ms: i64, warning_ms: u
     health_succeeded && latency_ms as u64 >= warning_ms
 }
 
+fn certificate_expiry_severity(remaining: Option<i64>) -> Option<&'static str> {
+    remaining.and_then(|value| {
+        if value <= 7 {
+            Some("critical")
+        } else if value <= 30 {
+            Some("warning")
+        } else {
+            None
+        }
+    })
+}
+
+fn node_certificate_message(days: i64) -> String {
+    if days < 0 {
+        "ノード証明書の期限が切れています。".into()
+    } else {
+        format!("ノード証明書の期限まで残り{days}日です。")
+    }
+}
+
+fn voting_key_message(epochs: i64) -> String {
+    if epochs == 0 {
+        "投票キーの有効epochが終了しています。".into()
+    } else {
+        format!("投票キーの有効期限まで残り{epochs} epochです。")
+    }
+}
+
 async fn enter_resume_grace(state: &AppState, now: i64, reason: &str) {
     if !state.begin_resume_grace(now, RESUME_GRACE_MS) {
         return;
@@ -235,6 +263,27 @@ async fn monitor_node_inner(
         }
     }
     let static_due = force || now - runtime.last_static_poll >= 15 * 60 * 1_000;
+    let mut node_certificate_not_after = None;
+    let mut node_certificate_remaining_days = None;
+    let mut voting_key_start_epoch = None;
+    let mut voting_key_end_epoch = None;
+    let mut finalization_epoch = None;
+    let mut voting_key_remaining_epochs = None;
+    let mut certificate_metric_error = None;
+    if node.kind == NodeKind::Symbol && health.is_some() && static_due {
+        match adapter.fetch_certificate_metrics().await {
+            Ok(certificate) => {
+                node_certificate_not_after = certificate.node_certificate_not_after;
+                node_certificate_remaining_days = certificate.node_certificate_remaining_days;
+                voting_key_start_epoch = certificate.voting_key_start_epoch;
+                voting_key_end_epoch = certificate.voting_key_end_epoch;
+                finalization_epoch = certificate.finalization_epoch;
+                voting_key_remaining_epochs = certificate.voting_key_remaining_epochs;
+                certificate_metric_error = certificate.error;
+            }
+            Err(err) => certificate_metric_error = Some(err.to_string()),
+        }
+    }
     if health.is_some() && static_due {
         if let Ok(identity) = adapter.fetch_static_info().await {
             match state
@@ -379,6 +428,13 @@ async fn monitor_node_inner(
         total_importance,
         total_balance_micro_xym,
         harvest_metric_error,
+        node_certificate_not_after,
+        node_certificate_remaining_days,
+        voting_key_start_epoch,
+        voting_key_end_epoch,
+        finalization_epoch,
+        voting_key_remaining_epochs,
+        certificate_metric_error,
     };
     state.repository.save_sample(&node.id, &sample).await?;
     // Power events can arrive while a request or database write is in flight.
@@ -480,6 +536,35 @@ async fn monitor_node_inner(
         )
         .await?;
     }
+    let node_certificate_severity =
+        certificate_expiry_severity(node_certificate_remaining_days);
+    let node_certificate_message = node_certificate_remaining_days
+        .map(node_certificate_message)
+        .unwrap_or_else(|| "ノード証明書期限を確認できません。".into());
+    update_alert(
+        &app,
+        &state,
+        &node,
+        node_certificate_severity.is_some(),
+        "node_certificate_expiring",
+        node_certificate_severity.unwrap_or("warning"),
+        &node_certificate_message,
+    )
+    .await?;
+    let voting_key_severity = certificate_expiry_severity(voting_key_remaining_epochs);
+    let voting_key_message = voting_key_remaining_epochs
+        .map(voting_key_message)
+        .unwrap_or_else(|| "投票キー期限を確認できません。".into());
+    update_alert(
+        &app,
+        &state,
+        &node,
+        voting_key_severity.is_some(),
+        "voting_key_expiring",
+        voting_key_severity.unwrap_or("warning"),
+        &voting_key_message,
+    )
+    .await?;
     let _ = app.emit("node-updated", &node.id);
     desktop::refresh_tray(&app, &state).await;
     Ok(())
@@ -685,5 +770,14 @@ mod tests {
     fn connection_failures_are_not_latency_samples() {
         assert!(!latency_sample_is_slow(false, 5_000, 2_000));
         assert!(latency_sample_is_slow(true, 5_000, 2_000));
+    }
+
+    #[test]
+    fn certificate_expiry_thresholds_are_warning_then_critical() {
+        assert_eq!(certificate_expiry_severity(Some(31)), None);
+        assert_eq!(certificate_expiry_severity(Some(30)), Some("warning"));
+        assert_eq!(certificate_expiry_severity(Some(7)), Some("critical"));
+        assert_eq!(certificate_expiry_severity(Some(-1)), Some("critical"));
+        assert_eq!(certificate_expiry_severity(None), None);
     }
 }

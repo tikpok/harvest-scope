@@ -1,10 +1,10 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import App from "./App";
 import packageJson from "../package.json";
 import { api, defaultSettings } from "./services/ipc";
-import type { AlertRecord, DashboardData, DiagnosticRun, NodeSummary } from "./types";
+import type { AlertRecord, DashboardData, DiagnosticRun, NodeSummary, TopologySnapshot } from "./types";
 
 const emptyDashboard: DashboardData = { total: 0, healthy: 0, warning: 0, critical: 0, offline: 0, rechecking: false, nodes: [] };
 
@@ -15,6 +15,9 @@ vi.mock("./services/ipc", async () => {
     api: {
       ...mod.api,
       dashboard: vi.fn().mockResolvedValue({ total: 0, healthy: 0, warning: 0, critical: 0, offline: 0, rechecking: false, nodes: [] }),
+      topology: vi.fn().mockResolvedValue({ nodes: [], edges: [], observedAt: 0 }),
+      recentNetworkEvents: vi.fn().mockResolvedValue([]),
+      recentHarvestEvents: vi.fn().mockResolvedValue([]),
       refreshAllNodes: vi.fn().mockResolvedValue(undefined),
       moveNode: vi.fn().mockResolvedValue(undefined),
       deleteNode: vi.fn().mockResolvedValue(undefined),
@@ -26,6 +29,8 @@ vi.mock("./services/ipc", async () => {
       takePendingNavigation: vi.fn().mockResolvedValue(null),
       settings: vi.fn().mockResolvedValue({ ...mod.defaultSettings, onboardingCompleted: true }),
       updateSettings: vi.fn(),
+      exportNodeConfig: vi.fn(),
+      importNodeConfig: vi.fn(),
       interfaces: vi.fn().mockResolvedValue([]),
     },
   };
@@ -66,12 +71,79 @@ function node(id: string, displayName: string): NodeSummary {
     totalBalanceMicroXym: null,
     harvestMetricError: null,
     latestHarvestAt: null,
+    nodeCertificateNotAfter: null,
+    nodeCertificateRemainingDays: null,
+    votingKeyStartEpoch: null,
+    votingKeyEndEpoch: null,
+    finalizationEpoch: null,
+    votingKeyRemainingEpochs: null,
+    certificateMetricError: null,
+  };
+}
+
+function topologyFixture(): TopologySnapshot {
+  return {
+    observedAt: 1_700_000_000_000,
+    nodes: [
+      {
+        id: "node-a",
+        label: "Node A",
+        kind: "symbol",
+        network: "Symbol-104",
+        status: "healthy",
+        registered: true,
+        enabled: true,
+        host: "10.0.0.1",
+        port: 3000,
+        version: "1.0.3.7",
+        roles: ["Peer", "API"],
+        peerStatus: null,
+        websocketConnected: true,
+        apiStatus: "up",
+        dbStatus: "up",
+        nisStatusCode: null,
+        height: "123",
+        finalizedHeight: "120",
+        lag: "0",
+        showHarvestMetrics: true,
+        delegatedHarvesterCount: 2,
+        latestHarvestAt: 1_800,
+      },
+      {
+        id: "external:symbol:peer-b",
+        label: "Peer B",
+        kind: "symbol",
+        network: "Symbol-104",
+        status: "unknown",
+        registered: false,
+        enabled: true,
+        host: "10.0.0.2",
+        port: 7900,
+        version: "1.0.3.7",
+        roles: [],
+        peerStatus: "active",
+        websocketConnected: false,
+        apiStatus: null,
+        dbStatus: null,
+        nisStatusCode: null,
+        height: null,
+        finalizedHeight: null,
+        lag: null,
+        showHarvestMetrics: false,
+        delegatedHarvesterCount: null,
+        latestHarvestAt: null,
+      },
+    ],
+    edges: [{ id: "node-a|peer-b", source: "node-a", target: "external:symbol:peer-b", status: "active" }],
   };
 }
 
 beforeEach(() => {
   document.documentElement.removeAttribute("data-theme");
   vi.mocked(api.dashboard).mockResolvedValue(emptyDashboard);
+  vi.mocked(api.topology).mockResolvedValue({ nodes: [], edges: [], observedAt: 0 });
+  vi.mocked(api.recentNetworkEvents).mockResolvedValue([]);
+  vi.mocked(api.recentHarvestEvents).mockResolvedValue([]);
   vi.mocked(api.moveNode).mockResolvedValue(undefined);
   vi.mocked(api.deleteNode).mockResolvedValue(undefined);
   vi.mocked(api.refreshAllNodes).mockResolvedValue(undefined);
@@ -81,12 +153,47 @@ beforeEach(() => {
   vi.mocked(api.takePendingNavigation).mockResolvedValue(null);
   vi.mocked(api.updateSettings).mockReset();
   vi.mocked(api.updateSettings).mockImplementation(async (settings) => settings);
+  vi.mocked(api.exportNodeConfig).mockReset();
+  vi.mocked(api.exportNodeConfig).mockResolvedValue(null);
+  vi.mocked(api.importNodeConfig).mockReset();
+  vi.mocked(api.importNodeConfig).mockResolvedValue(null);
 });
 
 test("日本語ダッシュボードを表示する", async () => {
   renderApp();
   expect(await screen.findByRole("heading", { name: "Harvest Scope" })).toBeInTheDocument();
   expect(screen.getByLabelText("アプリバージョン")).toHaveTextContent(`v${packageJson.version}`);
+});
+
+test("トポロジー画面から宇宙探索ビューを開閉できる", async () => {
+  vi.mocked(api.topology).mockResolvedValue(topologyFixture());
+  vi.mocked(api.recentNetworkEvents).mockResolvedValue([
+    { id: "event-1", nodeId: "node-a", kind: "block", height: "123", hash: "ABC", signerPublicKey: null, harvesterPublicKey: null, harvestedNodeId: null, observerNodeId: null, observedAt: Date.now(), source: "websocket" },
+  ]);
+  renderApp("/topology");
+
+  const openButton = await screen.findByRole("button", { name: "宇宙探索" });
+  expect(openButton).toBeEnabled();
+  fireEvent.click(openButton);
+
+  expect(await screen.findByRole("dialog", { name: "トポロジー宇宙探索ビュー" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "航路" })).toHaveAttribute("aria-pressed", "false");
+  expect(screen.getByRole("button", { name: "自動回転" })).toHaveAttribute("aria-pressed", "false");
+  fireEvent.click(screen.getByRole("button", { name: "航路" }));
+  fireEvent.click(screen.getByRole("button", { name: "自動回転" }));
+  expect(screen.getByRole("button", { name: "航路" })).toHaveAttribute("aria-pressed", "true");
+  expect(screen.getByRole("button", { name: "自動回転" })).toHaveAttribute("aria-pressed", "true");
+  const eventLog = screen.getByRole("region", { name: "観測イベントログ" });
+  expect(eventLog).toBeInTheDocument();
+  expect(await within(eventLog).findByText("ブロック高更新")).toBeInTheDocument();
+  expect(screen.getByText(/3Dビューを初期化できません/)).toBeInTheDocument();
+  fireEvent.keyDown(window, { key: "Escape" });
+  await waitFor(() => expect(screen.queryByRole("dialog", { name: "トポロジー宇宙探索ビュー" })).not.toBeInTheDocument());
+
+  fireEvent.click(screen.getByRole("button", { name: "宇宙探索" }));
+  expect(await screen.findByRole("dialog", { name: "トポロジー宇宙探索ビュー" })).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "宇宙探索を閉じる" }));
+  await waitFor(() => expect(screen.queryByRole("dialog", { name: "トポロジー宇宙探索ビュー" })).not.toBeInTheDocument());
 });
 
 test("一覧からノードを上下に移動できる", async () => {
@@ -239,4 +346,30 @@ test("上部バーからライトテーマへ切り替える", async () => {
   const toggle = await screen.findByRole("button", { name: "ライトテーマに切り替え" });
   fireEvent.click(toggle);
   await waitFor(() => expect(api.updateSettings).toHaveBeenCalledWith(expect.objectContaining({ theme: "light" })));
+});
+
+test("設定画面からノード設定をエクスポートする", async () => {
+  vi.mocked(api.exportNodeConfig).mockResolvedValue("C:\\tmp\\node-watcher-config.json");
+  renderApp("/settings");
+
+  fireEvent.click(await screen.findByRole("button", { name: "エクスポート" }));
+
+  await waitFor(() => expect(api.exportNodeConfig).toHaveBeenCalledOnce());
+  expect(await screen.findByText(/ノード設定を書き出しました/)).toBeInTheDocument();
+});
+
+test("設定画面からノード設定をインポートして結果を表示する", async () => {
+  vi.mocked(api.importNodeConfig).mockResolvedValue({
+    added: 1,
+    updated: 2,
+    failed: 1,
+    failures: [{ baseUrl: "http://bad.test:3000", displayName: null, reason: "接続できません" }],
+  });
+  renderApp("/settings");
+
+  fireEvent.click(await screen.findByRole("button", { name: "インポート" }));
+
+  await waitFor(() => expect(api.importNodeConfig).toHaveBeenCalledOnce());
+  expect(await screen.findByText("ノード設定を読み込みました: 追加 1件 / 更新 2件 / 失敗 1件")).toBeInTheDocument();
+  expect(screen.getByText("接続できません")).toBeInTheDocument();
 });

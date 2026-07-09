@@ -12,13 +12,18 @@ use crate::{
     adapters::{adapter_for, normalize_base_url, probe_endpoint},
     domain::{
         AlertRecord, AppSettings, DashboardData, DiagnosticRun, HarvestEvent, MetricPoint,
-        NetworkEvent, NetworkInterfaceInfo, NodeDetail, NodeSample, NodeStatus, NodeSummary,
-        ScanCandidate, ScanRequest, TopologyEdge, TopologyNode, TopologySnapshot, UpsertNodeInput,
+        NetworkEvent, NetworkInterfaceInfo, NodeConfigEntry, NodeConfigFile,
+        NodeConfigImportFailure, NodeConfigImportResult, NodeDetail, NodeSample, NodeStatus,
+        NodeSummary, ScanCandidate, ScanRequest, TopologyEdge, TopologyNode, TopologySnapshot,
+        UpsertNodeInput,
     },
     error::{AppError, AppResult},
     services::{desktop, diagnostic as diagnostic_service, discovery, monitor},
     state::AppState,
 };
+
+const NODE_CONFIG_FORMAT_VERSION: u32 = 1;
+const MAX_NODE_COUNT: usize = 50;
 
 #[tauri::command]
 pub async fn list_nodes(state: State<'_, AppState>) -> AppResult<Vec<NodeSummary>> {
@@ -246,9 +251,18 @@ pub async fn upsert_node(
     state: State<'_, AppState>,
     input: UpsertNodeInput,
 ) -> AppResult<NodeSummary> {
+    upsert_node_from_input(app, state.inner().clone(), input, true).await
+}
+
+async fn upsert_node_from_input(
+    app: AppHandle,
+    state: AppState,
+    input: UpsertNodeInput,
+    enforce_limit: bool,
+) -> AppResult<NodeSummary> {
     let base_url = normalize_base_url(&input.base_url)?;
     let existing = state.repository.list_stored_nodes(false).await?;
-    if input.id.is_none() && existing.len() >= 50 {
+    if enforce_limit && input.id.is_none() && existing.len() >= MAX_NODE_COUNT {
         return Err(AppError::Configuration(
             "監視できるノードは最大50台です".into(),
         ));
@@ -304,6 +318,13 @@ pub async fn upsert_node(
             total_importance: None,
             total_balance_micro_xym: None,
             harvest_metric_error: None,
+            node_certificate_not_after: None,
+            node_certificate_remaining_days: None,
+            voting_key_start_epoch: None,
+            voting_key_end_epoch: None,
+            finalization_epoch: None,
+            voting_key_remaining_epochs: None,
+            certificate_metric_error: None,
         },
         Err(error) => NodeSample {
             observed_at,
@@ -325,6 +346,13 @@ pub async fn upsert_node(
             total_importance: None,
             total_balance_micro_xym: None,
             harvest_metric_error: None,
+            node_certificate_not_after: None,
+            node_certificate_remaining_days: None,
+            voting_key_start_epoch: None,
+            voting_key_end_epoch: None,
+            finalization_epoch: None,
+            voting_key_remaining_epochs: None,
+            certificate_metric_error: None,
         },
     };
     state
@@ -341,7 +369,7 @@ pub async fn upsert_node(
     state.repository.save_sample(&id, &initial_sample).await?;
     let node = state.repository.get_stored_node(&id).await?;
     let app_for_monitor = app.clone();
-    let state_for_monitor = state.inner().clone();
+    let state_for_monitor = state.clone();
     tauri::async_runtime::spawn(async move {
         if let Err(error) =
             monitor::monitor_node(app_for_monitor, state_for_monitor, node, true).await
@@ -358,6 +386,182 @@ pub async fn upsert_node(
         .ok_or_else(|| AppError::NotFound(id))?;
     let _ = app.emit("topology-updated", &summary.id);
     Ok(summary)
+}
+
+fn config_entry_from_node(node: crate::domain::StoredNode) -> NodeConfigEntry {
+    NodeConfigEntry {
+        display_name: Some(node.display_name),
+        kind: Some(node.kind),
+        base_url: node.base_url,
+        enabled: Some(node.enabled),
+        favorite: Some(node.favorite),
+        show_harvest_metrics: Some(node.show_harvest_metrics),
+    }
+}
+
+fn node_config_file_from_nodes(nodes: Vec<crate::domain::StoredNode>) -> NodeConfigFile {
+    NodeConfigFile {
+        format_version: NODE_CONFIG_FORMAT_VERSION,
+        exported_at: chrono::Utc::now().to_rfc3339(),
+        app_version: env!("CARGO_PKG_VERSION").into(),
+        nodes: nodes.into_iter().map(config_entry_from_node).collect(),
+    }
+}
+
+#[tauri::command]
+pub async fn export_node_config(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<Option<String>> {
+    let file = node_config_file_from_nodes(state.repository.list_stored_nodes(false).await?);
+    let bytes = serde_json::to_vec_pretty(&file)?;
+    let file_name = format!(
+        "harvest-scope-config-{}.json",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    );
+    let path = app
+        .dialog()
+        .file()
+        .add_filter("JSON", &["json"])
+        .set_file_name(file_name)
+        .blocking_save_file();
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let path = path
+        .into_path()
+        .map_err(|error| AppError::Io(std::io::Error::other(error)))?;
+    std::fs::write(&path, bytes)?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+pub async fn import_node_config(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<Option<NodeConfigImportResult>> {
+    let path = app
+        .dialog()
+        .file()
+        .add_filter("JSON", &["json"])
+        .blocking_pick_file();
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let path = path
+        .into_path()
+        .map_err(|error| AppError::Io(std::io::Error::other(error)))?;
+    let bytes = std::fs::read(&path)?;
+    let config: NodeConfigFile = serde_json::from_slice(&bytes)?;
+    if config.format_version != NODE_CONFIG_FORMAT_VERSION {
+        return Err(AppError::Configuration(format!(
+            "未対応のノード設定形式です: {}",
+            config.format_version
+        )));
+    }
+    import_node_config_entries(app, state.inner().clone(), config.nodes).await
+}
+
+async fn import_node_config_entries(
+    app: AppHandle,
+    state: AppState,
+    entries: Vec<NodeConfigEntry>,
+) -> AppResult<Option<NodeConfigImportResult>> {
+    let mut result = NodeConfigImportResult::default();
+    let mut existing = state.repository.list_stored_nodes(false).await?;
+    let mut existing_by_url = existing
+        .iter()
+        .filter_map(|node| {
+            normalize_base_url(&node.base_url)
+                .ok()
+                .map(|url| (url, node.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut total_nodes = existing.len();
+
+    for entry in entries {
+        let normalized = match normalize_base_url(&entry.base_url) {
+            Ok(value) => value,
+            Err(error) => {
+                result.failed += 1;
+                result.failures.push(NodeConfigImportFailure {
+                    base_url: Some(entry.base_url),
+                    display_name: entry.display_name,
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+        };
+        let existing_node = existing_by_url.get(&normalized).cloned();
+        if existing_node.is_none() && total_nodes >= MAX_NODE_COUNT {
+            result.failed += 1;
+            result.failures.push(NodeConfigImportFailure {
+                base_url: Some(normalized),
+                display_name: entry.display_name,
+                reason: "監視できるノードは最大50台です".into(),
+            });
+            continue;
+        }
+        let existing_id = existing_node.as_ref().map(|node| node.id.clone());
+        let show_harvest_metrics = entry.show_harvest_metrics.unwrap_or_else(|| {
+            existing_node
+                .as_ref()
+                .is_some_and(|node| node.show_harvest_metrics)
+        });
+        let input = UpsertNodeInput {
+            id: existing_id.clone(),
+            display_name: entry.display_name.clone(),
+            base_url: normalized.clone(),
+            kind: entry.kind,
+            enabled: entry
+                .enabled
+                .or_else(|| existing_node.as_ref().map(|node| node.enabled)),
+            favorite: entry
+                .favorite
+                .or_else(|| existing_node.as_ref().map(|node| node.favorite)),
+        };
+        match upsert_node_from_input(app.clone(), state.clone(), input, false).await {
+            Ok(node) => {
+                if let Err(error) = state
+                    .repository
+                    .set_harvest_metrics_visible(&node.id, show_harvest_metrics)
+                    .await
+                {
+                    result.failed += 1;
+                    result.failures.push(NodeConfigImportFailure {
+                        base_url: Some(normalized),
+                        display_name: Some(node.display_name),
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+                if existing_id.is_some() {
+                    result.updated += 1;
+                } else {
+                    result.added += 1;
+                }
+            }
+            Err(error) => {
+                result.failed += 1;
+                result.failures.push(NodeConfigImportFailure {
+                    base_url: Some(normalized),
+                    display_name: entry.display_name,
+                    reason: error.to_string(),
+                });
+            }
+        }
+        existing = state.repository.list_stored_nodes(false).await?;
+        existing_by_url = existing
+            .iter()
+            .filter_map(|node| {
+                normalize_base_url(&node.base_url)
+                    .ok()
+                    .map(|url| (url, node.clone()))
+            })
+            .collect();
+        total_nodes = existing.len();
+    }
+    Ok(Some(result))
 }
 
 #[tauri::command]
@@ -619,6 +823,11 @@ pub async fn export_csv(
                 "委任者数".into(),
                 "24時間増減".into(),
                 "合計XYM(micro)".into(),
+                "ノード証明書期限UTCms".into(),
+                "ノード証明書残日数".into(),
+                "投票キー終了epoch".into(),
+                "投票キー残epoch".into(),
+                "証明書取得エラー".into(),
             ]];
             rows.extend(
                 state
@@ -645,6 +854,19 @@ pub async fn export_csv(
                                 .map(|value| value.to_string())
                                 .unwrap_or_default(),
                             node.total_balance_micro_xym.unwrap_or_default(),
+                            node.node_certificate_not_after
+                                .map(|value| value.to_string())
+                                .unwrap_or_default(),
+                            node.node_certificate_remaining_days
+                                .map(|value| value.to_string())
+                                .unwrap_or_default(),
+                            node.voting_key_end_epoch
+                                .map(|value| value.to_string())
+                                .unwrap_or_default(),
+                            node.voting_key_remaining_epochs
+                                .map(|value| value.to_string())
+                                .unwrap_or_default(),
+                            node.certificate_metric_error.unwrap_or_default(),
                         ]
                     }),
             );
@@ -696,6 +918,8 @@ pub async fn export_csv(
                 "24時間増減".into(),
                 "合計XYM(micro)".into(),
                 "合計importance".into(),
+                "ノード証明書残日数".into(),
+                "投票キー残epoch".into(),
             ]];
             let metrics = state
                 .repository
@@ -726,6 +950,14 @@ pub async fn export_csv(
                         .unwrap_or_default(),
                     point.total_balance_micro_xym.unwrap_or_default(),
                     point.total_importance.unwrap_or_default(),
+                    point
+                        .node_certificate_remaining_days
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                    point
+                        .voting_key_remaining_epochs
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
                 ]
             }));
             rows
@@ -767,5 +999,38 @@ mod tests {
             ..AppSettings::default()
         };
         assert!(validate_settings(&settings).is_err());
+    }
+
+    #[test]
+    fn exported_node_config_contains_only_portable_node_settings() {
+        let file = node_config_file_from_nodes(vec![crate::domain::StoredNode {
+            id: "node-a".into(),
+            display_name: "Node A".into(),
+            kind: crate::domain::NodeKind::Symbol,
+            base_url: "http://node-a:3000".into(),
+            network: Some("Symbol Mainnet".into()),
+            version: Some("1.0.0".into()),
+            public_key: Some("SECRET-LIKE-PUBLIC-KEY".into()),
+            roles: vec!["Peer".into(), "API".into()],
+            rest_version: Some("2.4.0".into()),
+            enabled: true,
+            favorite: true,
+            show_harvest_metrics: true,
+        }]);
+        let value = serde_json::to_value(file).expect("config should serialize");
+        let node = &value["nodes"][0];
+
+        assert_eq!(node["displayName"], "Node A");
+        assert_eq!(node["kind"], "symbol");
+        assert_eq!(node["baseUrl"], "http://node-a:3000");
+        assert_eq!(node["enabled"], true);
+        assert_eq!(node["favorite"], true);
+        assert_eq!(node["showHarvestMetrics"], true);
+        assert!(node.get("id").is_none());
+        assert!(node.get("publicKey").is_none());
+        assert!(node.get("network").is_none());
+        assert!(node.get("version").is_none());
+        assert!(node.get("roles").is_none());
+        assert!(node.get("restVersion").is_none());
     }
 }

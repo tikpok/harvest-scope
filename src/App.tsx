@@ -12,6 +12,8 @@ import {
   CircleDashed,
   CircleGauge,
   Download,
+  FileInput,
+  FileOutput,
   Menu,
   Moon,
   Network,
@@ -72,6 +74,18 @@ function formatDelta(value: number | null) {
   if (value == null) return "—";
   if (value > 0) return `+${value}`;
   return String(value);
+}
+
+function formatDays(value: number | null) {
+  if (value == null) return "—";
+  if (value < 0) return "期限切れ";
+  return `${value} 日`;
+}
+
+function formatEpochs(value: number | null) {
+  if (value == null) return "—";
+  if (value === 0) return "終了";
+  return `${value} epoch`;
 }
 
 function shortKey(value: string | null | undefined) {
@@ -338,6 +352,7 @@ function NodeDetailPage() {
       <article className="panel detail-card"><h3>チェーン</h3><dl><div><dt>高さ</dt><dd>{data.node.height ?? "—"}</dd></div><div><dt>ファイナライズ高</dt><dd>{data.node.finalizedHeight ?? "対象外"}</dd></div><div><dt>同期遅延</dt><dd>{data.node.lag ?? "—"}</dd></div><div><dt>チェーンスコア</dt><dd className="mono text-truncate">{data.chainScore ?? "—"}</dd></div></dl></article>
       <article className="panel detail-card"><h3>ノード</h3><dl><div><dt>種別</dt><dd>{data.node.kind === "symbol" ? "Symbol" : "NIS1"}</dd></div><div><dt>ネットワーク</dt><dd>{formatNetwork(data.node.network)}</dd></div><div><dt>バージョン</dt><dd>{data.node.version ?? "—"}</dd></div><div><dt>REST</dt><dd>{data.restVersion ?? "—"}</dd></div></dl></article>
       <article className="panel detail-card"><h3>接続</h3><dl><div><dt>REST応答</dt><dd>{formatLatency(data.node.latencyMs)}</dd></div><div><dt>ピア</dt><dd>{data.node.peerCount ?? "—"}</dd></div><div><dt>API / DB</dt><dd>{[data.apiStatus, data.dbStatus].filter(Boolean).join(" / ") || "—"}</dd></div><div><dt>WebSocket</dt><dd>{data.node.kind === "symbol" ? (data.websocketConnected ? "接続中" : "RESTへフォールバック") : "対象外"}</dd></div></dl></article>
+      <article className="panel detail-card certificate-card"><h3>証明書</h3>{data.node.kind !== "symbol" ? <p className="harvest-empty">Symbolノードのみ対象です。</p> : <><dl><div><dt>ノード証明書</dt><dd>{formatTime(data.node.nodeCertificateNotAfter)}</dd></div><div><dt>残り日数</dt><dd className={data.node.nodeCertificateRemainingDays != null && data.node.nodeCertificateRemainingDays <= 7 ? "text-warn" : undefined}>{formatDays(data.node.nodeCertificateRemainingDays)}</dd></div><div><dt>投票キー範囲</dt><dd>{data.node.votingKeyStartEpoch != null || data.node.votingKeyEndEpoch != null ? `${data.node.votingKeyStartEpoch ?? "—"} - ${data.node.votingKeyEndEpoch ?? "—"}` : "—"}</dd></div><div><dt>残りepoch</dt><dd className={data.node.votingKeyRemainingEpochs != null && data.node.votingKeyRemainingEpochs <= 7 ? "text-warn" : undefined}>{formatEpochs(data.node.votingKeyRemainingEpochs)}</dd></div><div><dt>現在epoch</dt><dd>{data.node.finalizationEpoch ?? "—"}</dd></div></dl>{data.node.certificateMetricError && <p className="harvest-error">取得エラー: {data.node.certificateMetricError}</p>}</>}</article>
       <article className="panel detail-card harvest-card"><div className="detail-card__heading"><h3>委任ハーベスト</h3>{data.node.kind === "symbol" && <label className="mini-toggle"><input type="checkbox" checked={data.node.showHarvestMetrics} disabled={toggleHarvest.isPending} onChange={(event) => toggleHarvest.mutate(event.target.checked)} />表示</label>}</div>{data.node.kind !== "symbol" ? <p className="harvest-empty">Symbolノードのみ対象です。</p> : data.node.showHarvestMetrics ? <><dl><div><dt>委任者数</dt><dd>{data.node.delegatedHarvesterCount ?? "—"}</dd></div><div><dt>24時間増減</dt><dd>{formatDelta(data.node.delegatedHarvesterDelta)}</dd></div><div><dt>合計XYM</dt><dd>{formatXym(data.node.totalBalanceMicroXym)}</dd></div><div><dt>最新検知</dt><dd>{formatTime(data.node.latestHarvestAt)}</dd></div></dl>{data.node.harvestMetricError && <p className="harvest-error">取得エラー: {data.node.harvestMetricError}</p>}<HarvestEventList events={data.recentHarvests} /></> : <p className="harvest-empty">表示をONにすると委任ハーベスト情報を表示します。</p>}</article>
     </section>
     <DiagnosticPanel latest={diagnose.data ?? diagnostics[0]} history={diagnostics} isPending={diagnose.isPending} error={diagnose.error} onRun={() => diagnose.mutate()} />
@@ -411,8 +426,25 @@ function SettingsPage() {
   const queryClient = useQueryClient();
   const { data = defaultSettings, isLoading } = useQuery({ queryKey: ["settings"], queryFn: api.settings });
   const [draft, setDraft] = useState<AppSettings | null>(null);
+  const [nodeConfigMessage, setNodeConfigMessage] = useState<string | null>(null);
   const value = draft ?? data;
   const save = useMutation({ mutationFn: api.updateSettings, onSuccess: (settings) => { setDraft(settings); void queryClient.invalidateQueries({ queryKey: ["settings"] }); } });
+  const exportNodes = useMutation({
+    mutationFn: api.exportNodeConfig,
+    onSuccess: (path) => setNodeConfigMessage(path ? `ノード設定を書き出しました: ${path}` : null),
+  });
+  const importNodes = useMutation({
+    mutationFn: api.importNodeConfig,
+    onSuccess: async (result) => {
+      if (!result) {
+        setNodeConfigMessage(null);
+        return;
+      }
+      setNodeConfigMessage(`ノード設定を読み込みました: 追加 ${result.added}件 / 更新 ${result.updated}件 / 失敗 ${result.failed}件`);
+      await queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+      await queryClient.invalidateQueries({ queryKey: ["topology"] });
+    },
+  });
   const update = <K extends keyof AppSettings>(key: K, next: AppSettings[K]) => setDraft({ ...value, [key]: next });
   if (isLoading) return <div className="loading">設定を読み込み中…</div>;
   return <section className="panel settings-panel"><div className="panel__header"><div><h2>設定</h2><p>監視間隔、通知、履歴保持を調整</p></div><button className="button button--primary" onClick={() => save.mutate(value)} disabled={save.isPending}>保存</button></div>
@@ -420,6 +452,7 @@ function SettingsPage() {
     <div className="settings-section"><h3>同期アラート</h3><div className="settings-grid"><label>警告ブロック差<input type="number" min="1" value={value.lagWarningBlocks} onChange={(event) => update("lagWarningBlocks", Number(event.target.value))} /></label><label>重大ブロック差<input type="number" min="2" value={value.lagCriticalBlocks} onChange={(event) => update("lagCriticalBlocks", Number(event.target.value))} /></label></div></div>
     <div className="settings-section"><h3>データ保持</h3><div className="settings-grid"><label>生データ（日）<input type="number" min="1" max="90" value={value.rawRetentionDays} onChange={(event) => update("rawRetentionDays", Number(event.target.value))} /></label><label>集約データ（日）<input type="number" min="30" max="1825" value={value.aggregateRetentionDays} onChange={(event) => update("aggregateRetentionDays", Number(event.target.value))} /></label></div></div>
     <div className="settings-section"><h3>表示</h3><div className="settings-grid"><label>テーマ<select value={value.theme} onChange={(event) => update("theme", event.target.value as AppSettings["theme"])}><option value="system">Windowsの設定に合わせる</option><option value="light">ライト</option><option value="dark">ダーク</option></select></label></div></div>
+    <div className="settings-section"><h3>ノード設定</h3><div className="settings-actions"><button className="button" disabled={exportNodes.isPending || importNodes.isPending} onClick={() => exportNodes.mutate()}><FileOutput size={16} />エクスポート</button><button className="button" disabled={exportNodes.isPending || importNodes.isPending} onClick={() => importNodes.mutate()}><FileInput size={16} />インポート</button></div><p className="form-hint">監視対象ノードのURL、表示名、有効状態、お気に入り、ハーベスト表示設定だけをJSONで移行します。</p>{nodeConfigMessage && <div className="notice notice--success">{nodeConfigMessage}</div>}{(exportNodes.error || importNodes.error) && <div className="notice notice--error">ノード設定の操作に失敗しました: {String(exportNodes.error ?? importNodes.error)}</div>}{importNodes.data?.failures.length ? <ul className="import-failure-list">{importNodes.data.failures.slice(0, 5).map((failure, index) => <li key={`${failure.baseUrl ?? failure.displayName ?? "failure"}-${index}`}><strong>{failure.displayName || failure.baseUrl || "不明なノード"}</strong><span>{failure.reason}</span></li>)}</ul> : null}</div>
     <div className="settings-section"><h3>Windows</h3><div className="toggle-list"><label><span><strong>Windows通知</strong><small>障害発生・重大化・復旧を通知します</small></span><input type="checkbox" checked={value.notificationEnabled} onChange={(event) => update("notificationEnabled", event.target.checked)} /></label><label><span><strong>バックグラウンド監視</strong><small>ウィンドウを閉じてもトレイで監視を続けます</small></span><input type="checkbox" checked={value.backgroundMonitoring} onChange={(event) => update("backgroundMonitoring", event.target.checked)} /></label><label><span><strong>Windowsログオン時に起動</strong><small>既定では無効です</small></span><input type="checkbox" checked={value.autostartEnabled} onChange={(event) => update("autostartEnabled", event.target.checked)} /></label></div></div>
     {save.isSuccess && <div className="notice notice--success">設定を保存しました。</div>}
   </section>;

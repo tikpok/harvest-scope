@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { listen } from "@tauri-apps/api/event";
-import { ChevronRight, Pause, Play, Radio, RefreshCw } from "lucide-react";
+import { ChevronRight, Pause, Play, Radio, RefreshCw, Rocket } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { useNetworkEvents } from "../hooks/useNetworkEvents";
 import { api } from "../services/ipc";
 import type { NetworkEventKind, NodeKind, TopologyNode } from "../types";
 import { TopologyGraph } from "./TopologyGraph";
+import { TopologySpaceExplorer } from "./TopologySpaceExplorer";
 
 const labels: Record<NetworkEventKind, string> = {
   block: "ブロック高更新",
@@ -52,6 +53,7 @@ export function TopologyPage() {
   const [showExternal, setShowExternal] = useState(false);
   const [kind, setKind] = useState<NodeKind | "all">("symbol");
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [spaceExplorerOpen, setSpaceExplorerOpen] = useState(false);
   const [now, setNow] = useState(Date.now());
   const events = useNetworkEvents(paused);
   const { data = { nodes: [], edges: [], observedAt: 0 }, isLoading, error, refetch } = useQuery({
@@ -123,6 +125,7 @@ export function TopologyPage() {
           <option value="symbol">Symbol</option><option value="nis1">NEM</option><option value="all">Symbol / NEM</option>
         </select>
         <label className="topology-toggle"><input type="checkbox" checked={showExternal} onChange={(event) => setShowExternal(event.target.checked)} />外部ピア</label>
+        <button className="button topology-space-button" disabled={graph.nodes.length === 0 || isLoading} onClick={() => setSpaceExplorerOpen(true)}><Rocket size={16} />宇宙探索</button>
         <button className="button" onClick={() => setPaused((value) => !value)}>{paused ? <Play size={16} /> : <Pause size={16} />}{paused ? "再開" : "一時停止"}</button>
         <button className="icon-button" title="再取得" aria-label="トポロジーを再取得" onClick={() => void refetch()}><RefreshCw size={16} /></button>
       </div>
@@ -168,5 +171,15 @@ export function TopologyPage() {
         </>}
       </aside>
     </div>
+    {spaceExplorerOpen && graph.nodes.length > 0 && <TopologySpaceExplorer
+      nodes={graph.nodes}
+      edges={graph.edges}
+      events={paused ? [] : visibleEvents}
+      now={now}
+      wideView={showExternal}
+      selectedNodeId={selectedNodeId}
+      onInspectNode={setSelectedNodeId}
+      onClose={() => setSpaceExplorerOpen(false)}
+    />}
   </>;
 }

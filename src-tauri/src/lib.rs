@@ -114,6 +114,8 @@ fn run_app() -> tauri::Result<()> {
             commands::take_pending_navigation,
             commands::get_settings,
             commands::update_settings,
+            commands::export_node_config,
+            commands::import_node_config,
             commands::export_csv,
         ])
         .run(tauri::generate_context!())
