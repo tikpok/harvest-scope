@@ -98,11 +98,19 @@ export function TopologyPage() {
   }, []);
 
   useEffect(() => {
+    let timer: number | null = null;
     const unlistener = listen("topology-updated", () => {
-      void queryClient.invalidateQueries({ queryKey: ["topology"] });
+      if (timer != null) window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        timer = null;
+        void queryClient.invalidateQueries({ queryKey: ["topology"] });
+      }, spaceExplorerOpen ? 600 : 250);
     }).catch(() => () => undefined);
-    return () => { void unlistener.then((unlisten) => unlisten()); };
-  }, [queryClient]);
+    return () => {
+      if (timer != null) window.clearTimeout(timer);
+      void unlistener.then((unlisten) => unlisten());
+    };
+  }, [queryClient, spaceExplorerOpen]);
 
   const graph = useMemo(() => {
     const registered = data.nodes.filter((node) => node.registered && (kind === "all" || node.kind === kind));

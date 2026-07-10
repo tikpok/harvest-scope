@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::atomic::Ordering,
-    time::{Duration, Instant},
 };
 
 use tauri::{AppHandle, Emitter, State};
@@ -9,16 +8,13 @@ use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_dialog::DialogExt;
 
 use crate::{
-    adapters::{
-        adapter_for, normalize_base_url, normalize_peer_endpoint, probe_endpoint,
-        probe_tcp_endpoint,
-    },
+    adapters::{adapter_for, normalize_base_url, normalize_peer_endpoint, probe_endpoint},
     domain::{
         AlertRecord, AppSettings, DashboardData, DiagnosticRun, HarvestEvent, MetricPoint,
         MonitorMode, NetworkEvent, NetworkInterfaceInfo, NodeConfigEntry, NodeConfigFile,
         NodeConfigImportFailure, NodeConfigImportResult, NodeDetail, NodeIdentity, NodeKind,
-        NodeSample, NodeStatus, NodeSummary, ScanCandidate, ScanRequest, TopologyEdge,
-        TopologyNode, TopologySnapshot, UpsertNodeInput,
+        NodeStatus, NodeSummary, ScanCandidate, ScanRequest, TopologyEdge, TopologyNode,
+        TopologySnapshot, UpsertNodeInput,
     },
     error::{AppError, AppResult},
     services::{desktop, diagnostic as diagnostic_service, discovery, monitor},
@@ -261,50 +257,6 @@ pub async fn upsert_node(
     upsert_node_from_input(app, state.inner().clone(), input, true).await
 }
 
-fn blank_registration_sample(
-    observed_at: i64,
-    reachable: bool,
-    status: NodeStatus,
-    latency_ms: Option<i64>,
-    last_error: Option<String>,
-) -> NodeSample {
-    NodeSample {
-        observed_at,
-        reachable,
-        status,
-        latency_ms,
-        height: None,
-        finalized_height: None,
-        network_height: None,
-        lag: None,
-        peer_count: None,
-        chain_score: None,
-        api_status: None,
-        db_status: None,
-        nis_status_code: None,
-        last_error,
-        delegated_harvester_count: None,
-        delegated_harvester_delta: None,
-        total_importance: None,
-        total_balance_micro_xym: None,
-        harvest_metric_error: None,
-        node_certificate_not_after: None,
-        node_certificate_remaining_days: None,
-        voting_key_start_epoch: None,
-        voting_key_end_epoch: None,
-        finalization_epoch: None,
-        voting_key_remaining_epochs: None,
-        certificate_metric_error: None,
-        supernode_id: None,
-        supernode_status: None,
-        supernode_last_round: None,
-        supernode_checks_passed: None,
-        supernode_last_round_at: None,
-        supernode_failed_checks: Vec::new(),
-        supernode_metric_error: None,
-    }
-}
-
 fn normalized_roles(input: Option<Vec<String>>, monitor_mode: MonitorMode) -> Vec<String> {
     let mut roles = input
         .unwrap_or_else(|| {
@@ -318,12 +270,98 @@ fn normalized_roles(input: Option<Vec<String>>, monitor_mode: MonitorMode) -> Ve
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
-    if monitor_mode == MonitorMode::Peer && !roles.iter().any(|role| role.eq_ignore_ascii_case("Peer")) {
+    if monitor_mode == MonitorMode::Peer
+        && !roles.iter().any(|role| role.eq_ignore_ascii_case("Peer"))
+    {
         roles.insert(0, "Peer".into());
     }
     roles.sort_by_key(|value| value.to_ascii_lowercase());
     roles.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
     roles
+}
+
+fn provisional_identity(input: &UpsertNodeInput, monitor_mode: MonitorMode) -> NodeIdentity {
+    let roles = normalized_roles(input.roles.clone(), monitor_mode);
+    NodeIdentity {
+        kind: input.kind.unwrap_or(NodeKind::Symbol),
+        name: input
+            .display_name
+            .clone()
+            .filter(|value| !value.trim().is_empty()),
+        network: input
+            .network
+            .clone()
+            .filter(|value| !value.trim().is_empty()),
+        version: input
+            .version
+            .clone()
+            .filter(|value| !value.trim().is_empty()),
+        public_key: input
+            .public_key
+            .clone()
+            .map(|value| value.trim().to_ascii_uppercase())
+            .filter(|value| !value.is_empty()),
+        roles,
+        rest_version: None,
+    }
+}
+
+async fn complete_node_registration(
+    app: AppHandle,
+    state: AppState,
+    node_id: String,
+    kind_hint: Option<NodeKind>,
+) {
+    let mut node = match state.repository.get_stored_node(&node_id).await {
+        Ok(node) => node,
+        Err(error) => {
+            tracing::warn!(%error, node_id, "registered node disappeared before initial monitor");
+            return;
+        }
+    };
+    if node.monitor_mode == MonitorMode::Api {
+        let identity_result = match kind_hint {
+            Some(kind) => {
+                adapter_for(kind, node.base_url.clone(), state.client.clone())
+                    .probe()
+                    .await
+            }
+            None => probe_endpoint(&node.base_url, state.client.clone()).await,
+        };
+        if let Ok(identity) = identity_result {
+            let display_name = if node.display_name == node.base_url {
+                identity
+                    .name
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| node.display_name.clone())
+            } else {
+                node.display_name.clone()
+            };
+            if let Err(error) = state
+                .repository
+                .upsert_node_with_mode(
+                    &node.id,
+                    &node.base_url,
+                    &display_name,
+                    &identity,
+                    node.monitor_mode,
+                    node.enabled,
+                    node.favorite,
+                )
+                .await
+            {
+                tracing::warn!(%error, node_id = %node.id, "registered node identity update failed");
+            } else if let Ok(updated) = state.repository.get_stored_node(&node.id).await {
+                node = updated;
+                let _ = app.emit("node-updated", &node.id);
+                let _ = app.emit("topology-updated", &node.id);
+            }
+        }
+    }
+    if let Err(error) = monitor::monitor_node(app, state, node, true).await {
+        tracing::warn!(%error, node_id, "initial node monitor failed");
+    }
 }
 
 async fn upsert_node_from_input(
@@ -343,31 +381,21 @@ async fn upsert_node_from_input(
             "監視できるノードは最大50台です".into(),
         ));
     }
-    let identity = if monitor_mode == MonitorMode::Peer {
-        let roles = normalized_roles(input.roles.clone(), monitor_mode);
-        NodeIdentity {
-            kind: input.kind.unwrap_or(NodeKind::Symbol),
-            name: input.display_name.clone().filter(|value| !value.trim().is_empty()),
-            network: input.network.clone().filter(|value| !value.trim().is_empty()),
-            version: input.version.clone().filter(|value| !value.trim().is_empty()),
-            public_key: input
-                .public_key
-                .clone()
-                .map(|value| value.trim().to_ascii_uppercase())
-                .filter(|value| !value.is_empty()),
-            roles,
-            rest_version: None,
-        }
-    } else {
-        match input.kind {
-            Some(kind) => {
-                adapter_for(kind, base_url.clone(), state.client.clone())
-                    .probe()
-                    .await?
-            }
-            None => probe_endpoint(&base_url, state.client.clone()).await?,
-        }
-    };
+    if monitor_mode == MonitorMode::Peer
+        && input
+            .roles
+            .as_ref()
+            .is_some_and(|roles| roles.iter().any(|role| role.eq_ignore_ascii_case("Voting")))
+        && input
+            .public_key
+            .as_ref()
+            .map_or(true, |value| value.trim().is_empty())
+    {
+        return Err(AppError::Configuration(
+            "Votingノードの登録には公開鍵が必要です".into(),
+        ));
+    }
+    let identity = provisional_identity(&input, monitor_mode);
     let id = input.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let display_name = input
         .display_name
@@ -375,47 +403,6 @@ async fn upsert_node_from_input(
         .or(identity.name.clone())
         .unwrap_or_else(|| base_url.clone());
 
-    let started = Instant::now();
-    let health_result = if monitor_mode == MonitorMode::Peer {
-        probe_tcp_endpoint(&base_url, Duration::from_secs(10))
-            .await
-            .map(|_| crate::domain::HealthSnapshot {
-                reachable: true,
-                api_status: None,
-                db_status: None,
-                nis_status_code: None,
-                healthy: true,
-            })
-    } else {
-        adapter_for(identity.kind, base_url.clone(), state.client.clone())
-            .fetch_health()
-            .await
-    };
-    let health_latency_ms = started.elapsed().as_millis() as i64;
-    let latency_warning_ms = state.settings.read().await.latency_warning_ms;
-    let observed_at = chrono::Utc::now().timestamp_millis();
-    let initial_sample = match health_result {
-        Ok(health) => {
-            let status = if !health.healthy || health_latency_ms as u64 >= latency_warning_ms {
-                NodeStatus::Warning
-            } else {
-                NodeStatus::Healthy
-            };
-            let mut sample =
-                blank_registration_sample(observed_at, health.reachable, status, Some(health_latency_ms), None);
-            sample.api_status = health.api_status;
-            sample.db_status = health.db_status;
-            sample.nis_status_code = health.nis_status_code;
-            sample
-        }
-        Err(error) => blank_registration_sample(
-            observed_at,
-            false,
-            NodeStatus::Warning,
-            Some(health_latency_ms),
-            Some(error.to_string()),
-        ),
-    };
     state
         .repository
         .upsert_node_with_mode(
@@ -428,24 +415,21 @@ async fn upsert_node_from_input(
             input.favorite.unwrap_or(false),
         )
         .await?;
-    state.repository.save_sample(&id, &initial_sample).await?;
-    let node = state.repository.get_stored_node(&id).await?;
     let app_for_monitor = app.clone();
     let state_for_monitor = state.clone();
+    let id_for_monitor = id.clone();
+    let kind_hint = input.kind;
     tauri::async_runtime::spawn(async move {
-        if let Err(error) =
-            monitor::monitor_node(app_for_monitor, state_for_monitor, node, true).await
-        {
-            tracing::warn!(%error, "initial node monitor failed");
-        }
+        complete_node_registration(
+            app_for_monitor,
+            state_for_monitor,
+            id_for_monitor,
+            kind_hint,
+        )
+        .await;
     });
-    let summary = state
-        .repository
-        .list_nodes()
-        .await?
-        .into_iter()
-        .find(|node| node.id == id)
-        .ok_or_else(|| AppError::NotFound(id))?;
+    let summary = state.repository.get_node_summary(&id).await?;
+    let _ = app.emit("node-updated", &summary.id);
     let _ = app.emit("topology-updated", &summary.id);
     Ok(summary)
 }
@@ -543,8 +527,8 @@ async fn import_node_config_entries(
                 MonitorMode::Api => normalize_base_url(&node.base_url),
                 MonitorMode::Peer => normalize_peer_endpoint(&node.base_url),
             }
-                .ok()
-                .map(|url| (url, node.clone()))
+            .ok()
+            .map(|url| (url, node.clone()))
         })
         .collect::<HashMap<_, _>>();
     let mut total_nodes = existing.len();
@@ -637,8 +621,8 @@ async fn import_node_config_entries(
                     MonitorMode::Api => normalize_base_url(&node.base_url),
                     MonitorMode::Peer => normalize_peer_endpoint(&node.base_url),
                 }
-                    .ok()
-                    .map(|url| (url, node.clone()))
+                .ok()
+                .map(|url| (url, node.clone()))
             })
             .collect();
         total_nodes = existing.len();
@@ -654,8 +638,13 @@ pub async fn delete_node(
 ) -> AppResult<()> {
     state.repository.delete_node(&node_id).await?;
     state.runtime.lock().await.remove(&node_id);
+    let _ = app.emit("node-updated", &node_id);
     let _ = app.emit("topology-updated", &node_id);
-    desktop::refresh_tray(&app, &state).await;
+    let app_for_tray = app.clone();
+    let state_for_tray = state.inner().clone();
+    tauri::async_runtime::spawn(async move {
+        desktop::refresh_tray(&app_for_tray, &state_for_tray).await;
+    });
     Ok(())
 }
 
@@ -684,7 +673,13 @@ pub async fn pause_node(
     node_id: String,
 ) -> AppResult<()> {
     state.repository.set_enabled(&node_id, false).await?;
-    desktop::refresh_tray(&app, &state).await;
+    let _ = app.emit("node-updated", &node_id);
+    let _ = app.emit("topology-updated", &node_id);
+    let app_for_tray = app.clone();
+    let state_for_tray = state.inner().clone();
+    tauri::async_runtime::spawn(async move {
+        desktop::refresh_tray(&app_for_tray, &state_for_tray).await;
+    });
     Ok(())
 }
 
@@ -696,7 +691,14 @@ pub async fn resume_node(
 ) -> AppResult<()> {
     state.repository.set_enabled(&node_id, true).await?;
     let node = state.repository.get_stored_node(&node_id).await?;
+    let _ = app.emit("node-updated", &node_id);
+    let _ = app.emit("topology-updated", &node_id);
     let state = state.inner().clone();
+    let app_for_tray = app.clone();
+    let state_for_tray = state.clone();
+    tauri::async_runtime::spawn(async move {
+        desktop::refresh_tray(&app_for_tray, &state_for_tray).await;
+    });
     tauri::async_runtime::spawn(async move {
         let _ = monitor::monitor_node(app, state, node, true).await;
     });

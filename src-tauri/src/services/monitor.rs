@@ -3,6 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures_util::StreamExt;
 use rand::Rng;
 use tauri::{AppHandle, Emitter};
 
@@ -23,6 +24,7 @@ const RESUME_GRACE_MS: i64 = 90_000;
 const SUSPENDED_REQUEST_THRESHOLD: Duration = Duration::from_secs(10);
 const SUPERNODE_INTERVAL_MS: i64 = 15 * 60 * 1_000;
 const SUPERNODE_CACHE_MS: i64 = 10 * 60 * 1_000;
+const MONITOR_NODE_CONCURRENCY: usize = 2;
 
 fn wake_was_late(expected_at: i64, actual_at: i64) -> bool {
     actual_at.saturating_sub(expected_at) >= RESUME_LATE_THRESHOLD_MS
@@ -977,11 +979,13 @@ pub async fn refresh_all_nodes(app: AppHandle, state: AppState) -> AppResult<()>
 
     let result = async {
         let nodes = state.repository.list_stored_nodes(true).await?;
-        let results = futures_util::future::join_all(nodes.into_iter().map(|node| {
+        let results = futures_util::stream::iter(nodes.into_iter().map(|node| {
             let app = app.clone();
             let state = state.clone();
             async move { monitor_node(app, state, node, true).await }
         }))
+        .buffer_unordered(MONITOR_NODE_CONCURRENCY)
+        .collect::<Vec<_>>()
         .await;
         results
             .into_iter()
@@ -1055,9 +1059,15 @@ async fn compare_state_hashes(app: AppHandle, state: AppState) -> AppResult<()> 
 
 pub fn start(app: AppHandle, state: AppState) {
     tauri::async_runtime::spawn(async move {
-        let initial_settings = state.settings.read().await.clone();
-        let _ = state.repository.compact(&initial_settings).await;
-        let mut last_state_hash_check = 0i64;
+        let state_for_compact = state.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(90)).await;
+            let settings = state_for_compact.settings.read().await.clone();
+            if let Err(error) = state_for_compact.repository.compact(&settings).await {
+                tracing::warn!(%error, "delayed repository compaction failed");
+            }
+        });
+        let mut last_state_hash_check = chrono::Utc::now().timestamp_millis();
         let mut expected_wake_at = None;
         loop {
             let cycle_started_at = chrono::Utc::now().timestamp_millis();
@@ -1079,15 +1089,22 @@ pub fn start(app: AppHandle, state: AppState) {
                 .list_stored_nodes(true)
                 .await
                 .unwrap_or_default();
-            for node in nodes {
-                let app = app.clone();
-                let state = state.clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Err(error) = monitor_node(app, state, node, false).await {
-                        tracing::warn!(%error, "node monitor failed");
+            let app_for_cycle = app.clone();
+            let state_for_cycle = state.clone();
+            tauri::async_runtime::spawn(async move {
+                futures_util::stream::iter(nodes.into_iter().map(|node| {
+                    let app = app_for_cycle.clone();
+                    let state = state_for_cycle.clone();
+                    async move {
+                        if let Err(error) = monitor_node(app, state, node, false).await {
+                            tracing::warn!(%error, "node monitor failed");
+                        }
                     }
-                });
-            }
+                }))
+                .buffer_unordered(MONITOR_NODE_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
+            });
             let now = chrono::Utc::now().timestamp_millis();
             if !state.in_resume_grace(now) && now - last_state_hash_check >= 120_000 {
                 last_state_hash_check = now;

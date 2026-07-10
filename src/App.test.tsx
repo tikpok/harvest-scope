@@ -1,10 +1,23 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import App from "./App";
 import packageJson from "../package.json";
 import { api, defaultSettings } from "./services/ipc";
 import type { AlertRecord, DashboardData, DiagnosticRun, NodeSummary, TopologySnapshot } from "./types";
+
+const tauriEventListeners = vi.hoisted(() => new Map<string, Set<(event: { payload: unknown }) => void>>());
+
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn((event: string, handler: (event: { payload: unknown }) => void) => {
+    const listeners = tauriEventListeners.get(event) ?? new Set<(event: { payload: unknown }) => void>();
+    listeners.add(handler);
+    tauriEventListeners.set(event, listeners);
+    return Promise.resolve(() => {
+      listeners.delete(handler);
+    });
+  }),
+}));
 
 const emptyDashboard: DashboardData = { total: 0, healthy: 0, warning: 0, critical: 0, offline: 0, rechecking: false, nodes: [] };
 
@@ -22,6 +35,8 @@ vi.mock("./services/ipc", async () => {
       refreshNode: vi.fn().mockResolvedValue(undefined),
       moveNode: vi.fn().mockResolvedValue(undefined),
       deleteNode: vi.fn().mockResolvedValue(undefined),
+      pauseNode: vi.fn().mockResolvedValue(undefined),
+      resumeNode: vi.fn().mockResolvedValue(undefined),
       upsertNode: vi.fn(),
       nodeDetail: vi.fn(),
       metrics: vi.fn().mockResolvedValue([]),
@@ -39,6 +54,12 @@ vi.mock("./services/ipc", async () => {
     },
   };
 });
+
+function emitTauriEvent(event: string, payload: unknown) {
+  for (const listener of tauriEventListeners.get(event) ?? []) {
+    listener({ payload });
+  }
+}
 
 function renderApp(path = "/") {
   return render(
@@ -156,6 +177,8 @@ function topologyFixture(): TopologySnapshot {
 }
 
 beforeEach(() => {
+  vi.useRealTimers();
+  tauriEventListeners.clear();
   document.documentElement.removeAttribute("data-theme");
   vi.mocked(api.dashboard).mockResolvedValue(emptyDashboard);
   vi.mocked(api.topology).mockResolvedValue({ nodes: [], edges: [], observedAt: 0 });
@@ -163,6 +186,8 @@ beforeEach(() => {
   vi.mocked(api.recentHarvestEvents).mockResolvedValue([]);
   vi.mocked(api.moveNode).mockResolvedValue(undefined);
   vi.mocked(api.deleteNode).mockResolvedValue(undefined);
+  vi.mocked(api.pauseNode).mockResolvedValue(undefined);
+  vi.mocked(api.resumeNode).mockResolvedValue(undefined);
   vi.mocked(api.refreshNode).mockResolvedValue(undefined);
   vi.mocked(api.refreshAllNodes).mockResolvedValue(undefined);
   vi.mocked(api.upsertNode).mockReset();
@@ -308,8 +333,33 @@ test("確認後に一覧からノードの登録を解除できる", async () =>
   fireEvent.click(await screen.findByRole("button", { name: "Node Aの登録を解除" }));
 
   expect(confirm).toHaveBeenCalledWith("「Node A」の登録を解除しますか？\n保存済みの監視履歴とアラートも削除されます。");
+  await waitFor(() => expect(screen.queryByText("Node A")).not.toBeInTheDocument());
   await waitFor(() => expect(api.deleteNode).toHaveBeenCalledWith("1"));
   confirm.mockRestore();
+});
+
+test("連続したノード更新イベントのダッシュボード再取得をまとめる", async () => {
+  vi.mocked(api.dashboard).mockResolvedValue({
+    total: 1,
+    healthy: 1,
+    warning: 0,
+    critical: 0,
+    offline: 0,
+    rechecking: false,
+    nodes: [node("1", "Node A")],
+  });
+  renderApp();
+
+  expect(await screen.findByText("Node A")).toBeInTheDocument();
+  const initialCalls = vi.mocked(api.dashboard).mock.calls.length;
+  await act(async () => {
+    emitTauriEvent("node-updated", "1");
+    emitTauriEvent("node-updated", "1");
+    emitTauriEvent("node-updated", "1");
+  });
+  expect(api.dashboard).toHaveBeenCalledTimes(initialCalls);
+  await new Promise((resolve) => window.setTimeout(resolve, 300));
+  await waitFor(() => expect(api.dashboard).toHaveBeenCalledTimes(initialCalls + 1));
 });
 
 test("URLだけで登録し成功結果を表示する", async () => {
@@ -323,7 +373,7 @@ test("URLだけで登録し成功結果を表示する", async () => {
   expect(screen.queryByLabelText("表示名")).not.toBeInTheDocument();
   const url = await screen.findByLabelText("REST URL");
   fireEvent.change(url, { target: { value: registered.baseUrl } });
-  fireEvent.click(screen.getByRole("button", { name: "接続確認して登録" }));
+  fireEvent.click(screen.getByRole("button", { name: "登録して確認開始" }));
 
   await waitFor(() => expect(api.upsertNode).toHaveBeenCalled());
   expect(vi.mocked(api.upsertNode).mock.calls[0][0]).toEqual({ baseUrl: registered.baseUrl });
