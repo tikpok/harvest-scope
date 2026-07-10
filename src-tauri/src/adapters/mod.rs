@@ -2,6 +2,8 @@ mod nis1;
 mod symbol;
 
 use reqwest::Client;
+use std::time::Duration;
+use tokio::net::{lookup_host, TcpStream};
 use url::Url;
 
 use crate::{
@@ -35,6 +37,70 @@ pub fn normalize_base_url(input: &str) -> AppResult<String> {
     url.set_path("");
     let normalized = url.as_str().trim_end_matches('/').to_string();
     Ok(normalized)
+}
+
+pub fn normalize_peer_endpoint(input: &str) -> AppResult<String> {
+    let raw = input.trim();
+    let raw = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("tcp://{raw}")
+    };
+    let mut url = Url::parse(&raw)?;
+    if !matches!(url.scheme(), "tcp" | "symbol-peer") {
+        return Err(AppError::InvalidUrl(
+            "Peerノードはtcpまたはsymbol-peerだけを使用できます".into(),
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(AppError::InvalidUrl(
+            "URLに資格情報を含めることはできません".into(),
+        ));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(AppError::InvalidUrl(
+            "queryとfragmentは使用できません".into(),
+        ));
+    }
+    if url.host_str().is_none() {
+        return Err(AppError::InvalidUrl("ホスト名がありません".into()));
+    }
+    url.set_scheme("tcp")
+        .map_err(|_| AppError::InvalidUrl("Peer URLを正規化できません".into()))?;
+    url.set_path("");
+    if url.port().is_none() {
+        url.set_port(Some(7900))
+            .map_err(|_| AppError::InvalidUrl("Peerポートを設定できません".into()))?;
+    }
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+pub fn endpoint_host_port(endpoint: &str) -> AppResult<(String, u16)> {
+    let url = Url::parse(endpoint)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| AppError::InvalidUrl("ホスト名がありません".into()))?
+        .to_owned();
+    let port = url
+        .port()
+        .or_else(|| matches!(url.scheme(), "tcp" | "symbol-peer").then_some(7900))
+        .or_else(|| url.port_or_known_default())
+        .ok_or_else(|| AppError::InvalidUrl("ポートがありません".into()))?;
+    Ok((host, port))
+}
+
+pub async fn probe_tcp_endpoint(endpoint: &str, timeout: Duration) -> AppResult<()> {
+    let (host, port) = endpoint_host_port(endpoint)?;
+    let mut addresses = tokio::time::timeout(timeout, lookup_host((host.as_str(), port)))
+        .await
+        .map_err(|_| AppError::Network("名前解決がタイムアウトしました".into()))??;
+    let address = addresses
+        .next()
+        .ok_or_else(|| AppError::Network("接続先アドレスがありません".into()))?;
+    tokio::time::timeout(timeout, TcpStream::connect(address))
+        .await
+        .map_err(|_| AppError::Network("TCP接続がタイムアウトしました".into()))??;
+    Ok(())
 }
 
 pub fn adapter_for(kind: NodeKind, base_url: String, client: Client) -> Box<dyn NodeAdapter> {

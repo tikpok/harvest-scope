@@ -29,6 +29,33 @@ impl TryFrom<&str> for NodeKind {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+pub enum MonitorMode {
+    Api,
+    Peer,
+}
+
+impl MonitorMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::Peer => "peer",
+        }
+    }
+}
+
+impl TryFrom<&str> for MonitorMode {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "api" => Ok(Self::Api),
+            "peer" => Ok(Self::Peer),
+            other => Err(format!("unknown monitor mode: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum NodeStatus {
     Unknown,
     Healthy,
@@ -139,6 +166,7 @@ pub struct PeerInfo {
     pub port: Option<u16>,
     pub status: String,
     pub version: Option<String>,
+    pub roles: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -153,12 +181,14 @@ pub struct TopologyNode {
     pub id: String,
     pub label: String,
     pub kind: NodeKind,
+    pub monitor_mode: MonitorMode,
     pub network: Option<String>,
     pub status: NodeStatus,
     pub registered: bool,
     pub enabled: bool,
     pub host: Option<String>,
     pub port: Option<u16>,
+    pub public_key: Option<String>,
     pub version: Option<String>,
     pub roles: Vec<String>,
     pub peer_status: Option<String>,
@@ -213,9 +243,11 @@ pub struct NodeSummary {
     pub id: String,
     pub display_name: String,
     pub kind: NodeKind,
+    pub monitor_mode: MonitorMode,
     pub base_url: String,
     pub network: Option<String>,
     pub version: Option<String>,
+    pub roles: Vec<String>,
     pub enabled: bool,
     pub favorite: bool,
     pub status: NodeStatus,
@@ -254,6 +286,7 @@ pub struct StoredNode {
     pub id: String,
     pub display_name: String,
     pub kind: NodeKind,
+    pub monitor_mode: MonitorMode,
     pub base_url: String,
     pub network: Option<String>,
     pub version: Option<String>,
@@ -370,6 +403,11 @@ pub struct UpsertNodeInput {
     pub display_name: Option<String>,
     pub base_url: String,
     pub kind: Option<NodeKind>,
+    pub monitor_mode: Option<MonitorMode>,
+    pub network: Option<String>,
+    pub version: Option<String>,
+    pub public_key: Option<String>,
+    pub roles: Option<Vec<String>>,
     pub enabled: Option<bool>,
     pub favorite: Option<bool>,
 }
@@ -388,7 +426,12 @@ pub struct NodeConfigFile {
 pub struct NodeConfigEntry {
     pub display_name: Option<String>,
     pub kind: Option<NodeKind>,
+    pub monitor_mode: Option<MonitorMode>,
     pub base_url: String,
+    pub network: Option<String>,
+    pub version: Option<String>,
+    pub public_key: Option<String>,
+    pub roles: Option<Vec<String>>,
     pub enabled: Option<bool>,
     pub favorite: Option<bool>,
     pub show_harvest_metrics: Option<bool>,

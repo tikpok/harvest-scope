@@ -8,8 +8,8 @@ use sqlx::{
 use crate::{
     domain::{
         AlertMutation, AlertRecord, AppSettings, DiagnosticRun, DiagnosticStatus, HarvestEvent,
-        MetricPoint, NodeDetail, NodeIdentity, NodeKind, NodeSample, NodeStatus, NodeSummary,
-        PeerInfo, StoredNode,
+        MetricPoint, MonitorMode, NodeDetail, NodeIdentity, NodeKind, NodeSample, NodeStatus,
+        NodeSummary, PeerInfo, StoredNode,
     },
     error::{AppError, AppResult},
 };
@@ -69,6 +69,10 @@ fn parse_status(value: &str) -> NodeStatus {
         "offline" => NodeStatus::Offline,
         _ => NodeStatus::Unknown,
     }
+}
+
+fn parse_monitor_mode(value: &str) -> AppResult<MonitorMode> {
+    MonitorMode::try_from(value).map_err(AppError::Configuration)
 }
 
 fn to_i64(value: Option<u64>) -> Option<i64> {
@@ -153,6 +157,9 @@ impl Repository {
                     id: row.try_get("id")?,
                     display_name: row.try_get("display_name")?,
                     kind: parse_kind(row.try_get::<String, _>("kind")?.as_str())?,
+                    monitor_mode: parse_monitor_mode(
+                        row.try_get::<String, _>("monitor_mode")?.as_str(),
+                    )?,
                     base_url: row.try_get("base_url")?,
                     network: row.try_get("network")?,
                     version: row.try_get("version")?,
@@ -209,9 +216,11 @@ impl Repository {
                 id: node.id.clone(),
                 display_name: node.display_name.clone(),
                 kind: node.kind,
+                monitor_mode: node.monitor_mode,
                 base_url: node.base_url.clone(),
                 network: node.network.clone(),
                 version: node.version.clone(),
+                roles: node.roles.clone(),
                 enabled: node.enabled,
                 favorite: node.favorite,
                 status: if node.enabled {
@@ -303,9 +312,11 @@ impl Repository {
                 id: node.id.clone(),
                 display_name: node.display_name.clone(),
                 kind: node.kind,
+                monitor_mode: node.monitor_mode,
                 base_url: node.base_url.clone(),
                 network: node.network.clone(),
                 version: node.version.clone(),
+                roles: node.roles.clone(),
                 enabled: node.enabled,
                 favorite: node.favorite,
                 status: NodeStatus::Unknown,
@@ -342,6 +353,7 @@ impl Repository {
         Ok(summary)
     }
 
+    #[allow(dead_code)]
     pub async fn upsert_node(
         &self,
         id: &str,
@@ -354,12 +366,36 @@ impl Repository {
         let now = chrono::Utc::now().timestamp_millis();
         let roles = serde_json::to_string(&identity.roles)?;
         sqlx::query(
-            "INSERT INTO nodes (id, display_name, kind, base_url, network, version, public_key, roles_json, rest_version, enabled, favorite, sort_order, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort_order) + 1, 0) FROM nodes), ?, ?)
-             ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name, kind=excluded.kind, base_url=excluded.base_url,
+            "INSERT INTO nodes (id, display_name, kind, monitor_mode, base_url, network, version, public_key, roles_json, rest_version, enabled, favorite, sort_order, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort_order) + 1, 0) FROM nodes), ?, ?)
+             ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name, kind=excluded.kind, monitor_mode=excluded.monitor_mode, base_url=excluded.base_url,
              network=excluded.network, version=excluded.version, public_key=excluded.public_key, roles_json=excluded.roles_json,
              rest_version=excluded.rest_version, enabled=excluded.enabled, favorite=excluded.favorite, updated_at=excluded.updated_at"
-        ).bind(id).bind(display_name).bind(identity.kind.as_str()).bind(base_url).bind(&identity.network).bind(&identity.version)
+        ).bind(id).bind(display_name).bind(identity.kind.as_str()).bind(MonitorMode::Api.as_str()).bind(base_url).bind(&identity.network).bind(&identity.version)
+            .bind(&identity.public_key).bind(roles).bind(&identity.rest_version).bind(enabled as i64).bind(favorite as i64)
+            .bind(now).bind(now).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn upsert_node_with_mode(
+        &self,
+        id: &str,
+        base_url: &str,
+        display_name: &str,
+        identity: &NodeIdentity,
+        monitor_mode: MonitorMode,
+        enabled: bool,
+        favorite: bool,
+    ) -> AppResult<()> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let roles = serde_json::to_string(&identity.roles)?;
+        sqlx::query(
+            "INSERT INTO nodes (id, display_name, kind, monitor_mode, base_url, network, version, public_key, roles_json, rest_version, enabled, favorite, sort_order, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort_order) + 1, 0) FROM nodes), ?, ?)
+             ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name, kind=excluded.kind, monitor_mode=excluded.monitor_mode, base_url=excluded.base_url,
+             network=excluded.network, version=excluded.version, public_key=excluded.public_key, roles_json=excluded.roles_json,
+             rest_version=excluded.rest_version, enabled=excluded.enabled, favorite=excluded.favorite, updated_at=excluded.updated_at"
+        ).bind(id).bind(display_name).bind(identity.kind.as_str()).bind(monitor_mode.as_str()).bind(base_url).bind(&identity.network).bind(&identity.version)
             .bind(&identity.public_key).bind(roles).bind(&identity.rest_version).bind(enabled as i64).bind(favorite as i64)
             .bind(now).bind(now).execute(&self.pool).await?;
         Ok(())
@@ -790,9 +826,10 @@ impl Repository {
             // Public node APIs can return the same peer more than once. Keep
             // the first occurrence (NIS1 orders active peers first) instead of
             // aborting the entire monitor cycle on the composite primary key.
-            sqlx::query("INSERT OR IGNORE INTO peers_current (node_id, peer_key, name, host, port, status, version, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+            let roles = serde_json::to_string(&peer.roles)?;
+            sqlx::query("INSERT OR IGNORE INTO peers_current (node_id, peer_key, name, host, port, status, version, roles_json, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
                 .bind(node_id).bind(&peer.key).bind(&peer.name).bind(&peer.host).bind(peer.port.map(i64::from))
-                .bind(&peer.status).bind(&peer.version).bind(observed_at).execute(&mut *tx).await?;
+                .bind(&peer.status).bind(&peer.version).bind(roles).bind(observed_at).execute(&mut *tx).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -800,7 +837,7 @@ impl Repository {
 
     pub async fn list_peer_connections(&self) -> AppResult<Vec<(String, PeerInfo)>> {
         let rows = sqlx::query(
-            "SELECT node_id, peer_key, name, host, port, status, version FROM peers_current ORDER BY node_id, status, name",
+            "SELECT node_id, peer_key, name, host, port, status, version, roles_json FROM peers_current ORDER BY node_id, status, name",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -817,6 +854,7 @@ impl Repository {
                             .and_then(|value| u16::try_from(value).ok()),
                         status: row.try_get("status")?,
                         version: row.try_get("version")?,
+                        roles: parse_string_list(row.try_get("roles_json")?),
                     },
                 ))
             })
@@ -875,6 +913,7 @@ impl Repository {
                         .and_then(|value| u16::try_from(value).ok()),
                     status: row.try_get("status")?,
                     version: row.try_get("version")?,
+                    roles: parse_string_list(row.try_get("roles_json")?),
                 })
             })
             .collect::<AppResult<Vec<_>>>()?;
@@ -1304,6 +1343,7 @@ mod tests {
                 port: Some(7900),
                 status: "active".into(),
                 version: None,
+                roles: Vec::new(),
             },
             PeerInfo {
                 key: "duplicate-key".into(),
@@ -1312,6 +1352,7 @@ mod tests {
                 port: Some(7900),
                 status: "inactive".into(),
                 version: None,
+                roles: Vec::new(),
             },
         ];
 

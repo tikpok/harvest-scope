@@ -7,8 +7,11 @@ use rand::Rng;
 use tauri::{AppHandle, Emitter};
 
 use crate::{
-    adapters::{adapter_for, Nis1Adapter},
-    domain::{NetworkEvent, NodeKind, NodeSample, NodeStatus, StoredNode, SupernodeProgramNode},
+    adapters::{adapter_for, probe_tcp_endpoint, Nis1Adapter, SymbolAdapter},
+    domain::{
+        CertificateSnapshot, MonitorMode, NetworkEvent, NodeKind, NodeSample, NodeStatus,
+        StoredNode, SupernodeProgramNode,
+    },
     error::{AppError, AppResult},
     state::AppState,
 };
@@ -69,6 +72,269 @@ fn supernode_failure_message(round: Option<i64>, failed_checks: &[String]) -> St
             failed_checks.join(", ")
         )
     }
+}
+
+fn empty_sample(
+    observed_at: i64,
+    reachable: bool,
+    status: NodeStatus,
+    latency_ms: Option<i64>,
+    last_error: Option<String>,
+) -> NodeSample {
+    NodeSample {
+        observed_at,
+        reachable,
+        status,
+        latency_ms,
+        height: None,
+        finalized_height: None,
+        network_height: None,
+        lag: None,
+        peer_count: None,
+        chain_score: None,
+        api_status: None,
+        db_status: None,
+        nis_status_code: None,
+        last_error,
+        delegated_harvester_count: None,
+        delegated_harvester_delta: None,
+        total_importance: None,
+        total_balance_micro_xym: None,
+        harvest_metric_error: None,
+        node_certificate_not_after: None,
+        node_certificate_remaining_days: None,
+        voting_key_start_epoch: None,
+        voting_key_end_epoch: None,
+        finalization_epoch: None,
+        voting_key_remaining_epochs: None,
+        certificate_metric_error: None,
+        supernode_id: None,
+        supernode_status: None,
+        supernode_last_round: None,
+        supernode_last_round_at: None,
+        supernode_checks_passed: None,
+        supernode_failed_checks: Vec::new(),
+        supernode_metric_error: None,
+    }
+}
+
+fn has_role(node: &StoredNode, role: &str) -> bool {
+    node.roles
+        .iter()
+        .any(|value| value.eq_ignore_ascii_case(role))
+}
+
+fn symbol_network_match_key(value: &str) -> String {
+    let normalized = value
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '_'], "")
+        .replace("--", "-");
+    match normalized.as_str() {
+        "104" | "-104" | "symbol104" | "symbol-104" | "symbolmainnet" | "symbolmain" => {
+            "symbol-mainnet".into()
+        }
+        "152" | "symbol152" | "symbol-152" | "symboltestnet" | "symboltest" => {
+            "symbol-testnet".into()
+        }
+        other => other.to_owned(),
+    }
+}
+
+async fn fetch_peer_voting_metrics(
+    state: &AppState,
+    node: &StoredNode,
+) -> Result<CertificateSnapshot, String> {
+    if !has_role(node, "Voting") {
+        return Ok(CertificateSnapshot::default());
+    }
+    let public_key = node
+        .public_key
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Voting期限監視には公開鍵が必要です".to_string())?;
+    let network = node
+        .network
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Voting期限監視にはネットワークが必要です".to_string())?;
+    let network_key = symbol_network_match_key(network);
+    let reference = state
+        .repository
+        .list_stored_nodes(true)
+        .await
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|candidate| {
+            candidate.id != node.id
+                && candidate.kind == NodeKind::Symbol
+                && candidate.monitor_mode == MonitorMode::Api
+                && candidate
+                    .network
+                    .as_deref()
+                    .map(symbol_network_match_key)
+                    .as_deref()
+                    == Some(network_key.as_str())
+        })
+        .ok_or_else(|| "同一ネットワークの参照用Symbol APIノードがありません".to_string())?;
+    SymbolAdapter::new(reference.base_url, state.client.clone())
+        .fetch_voting_key_snapshot_for_public_key(public_key)
+        .await
+}
+
+async fn monitor_peer_node_inner(
+    app: AppHandle,
+    state: AppState,
+    node: StoredNode,
+    _force: bool,
+) -> AppResult<()> {
+    let settings = state.settings.read().await.clone();
+    let now = chrono::Utc::now().timestamp_millis();
+    let started = Instant::now();
+    let probe_result = probe_tcp_endpoint(&node.base_url, Duration::from_secs(10)).await;
+    let latency_ms = started.elapsed().as_millis() as i64;
+    let evaluation_now = chrono::Utc::now().timestamp_millis();
+    let resume_grace = state.is_system_suspended() || state.in_resume_grace(evaluation_now);
+    let mut runtime_map = state.runtime.lock().await;
+    let runtime = runtime_map.entry(node.id.clone()).or_default();
+    let mut last_error = None;
+    match probe_result {
+        Ok(()) => {
+            if resume_grace {
+                runtime.consecutive_successes = 0;
+                runtime.consecutive_failures = 0;
+            } else {
+                runtime.consecutive_successes += 1;
+                runtime.consecutive_failures = 0;
+            }
+        }
+        Err(error) => {
+            if resume_grace {
+                runtime.consecutive_successes = 0;
+                runtime.consecutive_failures = 0;
+            } else {
+                runtime.consecutive_failures += 1;
+                runtime.consecutive_successes = 0;
+            }
+            last_error = Some(error.to_string());
+        }
+    }
+    if resume_grace || last_error.is_some() {
+        runtime.latency_failures = 0;
+        runtime.latency_successes = 0;
+    } else if latency_sample_is_slow(true, latency_ms, settings.latency_warning_ms) {
+        runtime.latency_failures += 1;
+        runtime.latency_successes = 0;
+    } else if latency_ms < 1_500 {
+        runtime.latency_successes += 1;
+        runtime.latency_failures = 0;
+    } else {
+        runtime.latency_failures = 0;
+        runtime.latency_successes = 0;
+    }
+    let offline = runtime.consecutive_failures >= 3;
+    let recovered = runtime.consecutive_successes >= 2;
+    let latency_alert = runtime.latency_failures >= 3;
+    let latency_recovered = runtime.latency_successes >= 3;
+    let status = if resume_grace && last_error.is_some() {
+        NodeStatus::Unknown
+    } else if offline {
+        NodeStatus::Offline
+    } else if last_error.is_some() || latency_alert {
+        NodeStatus::Warning
+    } else {
+        NodeStatus::Healthy
+    };
+    drop(runtime_map);
+
+    let mut sample = empty_sample(
+        now,
+        last_error.is_none(),
+        status,
+        Some(latency_ms),
+        last_error,
+    );
+    match fetch_peer_voting_metrics(&state, &node).await {
+        Ok(certificate) => {
+            sample.voting_key_start_epoch = certificate.voting_key_start_epoch;
+            sample.voting_key_end_epoch = certificate.voting_key_end_epoch;
+            sample.finalization_epoch = certificate.finalization_epoch;
+            sample.voting_key_remaining_epochs = certificate.voting_key_remaining_epochs;
+            sample.certificate_metric_error = certificate.error;
+        }
+        Err(error) => sample.certificate_metric_error = Some(error),
+    }
+    state.repository.save_sample(&node.id, &sample).await?;
+
+    let evaluation_paused = resume_grace
+        || state.is_system_suspended()
+        || state.in_resume_grace(chrono::Utc::now().timestamp_millis());
+    if !evaluation_paused && offline {
+        update_alert(
+            &app,
+            &state,
+            &node,
+            true,
+            "offline",
+            "critical",
+            "3回連続でPeerノードへ接続できません。",
+        )
+        .await?;
+    } else if !evaluation_paused && recovered {
+        update_alert(
+            &app,
+            &state,
+            &node,
+            false,
+            "offline",
+            "critical",
+            "Peerノードへの接続が復旧しました。",
+        )
+        .await?;
+    }
+    if !evaluation_paused && latency_alert {
+        update_alert(
+            &app,
+            &state,
+            &node,
+            true,
+            "latency",
+            "warning",
+            "P2Pポートの応答遅延が継続しています。",
+        )
+        .await?;
+    } else if !evaluation_paused && latency_recovered {
+        update_alert(
+            &app,
+            &state,
+            &node,
+            false,
+            "latency",
+            "warning",
+            "P2Pポートの応答時間が正常に戻りました。",
+        )
+        .await?;
+    }
+    if !evaluation_paused {
+        let voting_key_severity = certificate_expiry_severity(sample.voting_key_remaining_epochs);
+        let voting_key_message = sample
+            .voting_key_remaining_epochs
+            .map(voting_key_message)
+            .unwrap_or_else(|| "投票キー期限を確認できません。".into());
+        update_alert(
+            &app,
+            &state,
+            &node,
+            voting_key_severity.is_some(),
+            "voting_key_expiring",
+            voting_key_severity.unwrap_or("warning"),
+            &voting_key_message,
+        )
+        .await?;
+    }
+    let _ = app.emit("node-updated", &node.id);
+    desktop::refresh_tray(&app, &state).await;
+    Ok(())
 }
 
 async fn supernode_nodes(state: &AppState, now: i64) -> AppResult<Vec<SupernodeProgramNode>> {
@@ -152,6 +418,9 @@ async fn monitor_node_inner(
     node: StoredNode,
     force: bool,
 ) -> AppResult<()> {
+    if node.monitor_mode == MonitorMode::Peer {
+        return monitor_peer_node_inner(app, state, node, force).await;
+    }
     let settings = state.settings.read().await.clone();
     let network_nodes = state
         .repository
@@ -348,11 +617,12 @@ async fn monitor_node_inner(
         if let Ok(identity) = adapter.fetch_static_info().await {
             match state
                 .repository
-                .upsert_node(
+                .upsert_node_with_mode(
                     &node.id,
                     &node.base_url,
                     &node.display_name,
                     &identity,
+                    node.monitor_mode,
                     node.enabled,
                     node.favorite,
                 )
@@ -735,6 +1005,7 @@ async fn compare_state_hashes(app: AppHandle, state: AppState) -> AppResult<()> 
     for node in nodes
         .into_iter()
         .filter(|node| node.kind == crate::domain::NodeKind::Symbol)
+        .filter(|node| node.monitor_mode == MonitorMode::Api)
     {
         if let (Some(network), Some(height)) = (
             node.network.clone(),
@@ -861,5 +1132,21 @@ mod tests {
         assert_eq!(certificate_expiry_severity(Some(7)), Some("critical"));
         assert_eq!(certificate_expiry_severity(Some(-1)), Some("critical"));
         assert_eq!(certificate_expiry_severity(None), None);
+    }
+
+    #[test]
+    fn normalizes_symbol_network_names_for_reference_lookup() {
+        assert_eq!(
+            symbol_network_match_key("Symbol Mainnet"),
+            symbol_network_match_key("Symbol-104")
+        );
+        assert_eq!(
+            symbol_network_match_key("SYMBOL Mainnet"),
+            symbol_network_match_key("-104")
+        );
+        assert_eq!(
+            symbol_network_match_key("Symbol Testnet"),
+            symbol_network_match_key("152")
+        );
     }
 }

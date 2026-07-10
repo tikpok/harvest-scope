@@ -455,16 +455,10 @@ impl SymbolAdapter {
             .map_err(|error| error.to_string())
     }
 
-    async fn fetch_voting_key_snapshot(&self) -> Result<CertificateSnapshot, String> {
-        let info = self.get_json("/node/info").await.map_err(|error| error.to_string())?;
-        let roles = u64_value(info.get("roles")).unwrap_or_default();
-        if roles & 4 == 0 {
-            return Ok(CertificateSnapshot::default());
-        }
-        let public_key = info
-            .get("publicKey")
-            .and_then(string_value)
-            .ok_or_else(|| "node/infoにpublicKeyがありません".to_string())?;
+    pub async fn fetch_voting_key_snapshot_for_public_key(
+        &self,
+        public_key: &str,
+    ) -> Result<CertificateSnapshot, String> {
         let chain = self
             .get_json("/chain/info")
             .await
@@ -498,6 +492,20 @@ impl SymbolAdapter {
             voting_key_remaining_epochs: finalization_epoch.map(|epoch| end.saturating_sub(epoch)),
             ..CertificateSnapshot::default()
         })
+    }
+
+    async fn fetch_voting_key_snapshot(&self) -> Result<CertificateSnapshot, String> {
+        let info = self.get_json("/node/info").await.map_err(|error| error.to_string())?;
+        let roles = u64_value(info.get("roles")).unwrap_or_default();
+        if roles & 4 == 0 {
+            return Ok(CertificateSnapshot::default());
+        }
+        let public_key = info
+            .get("publicKey")
+            .and_then(string_value)
+            .ok_or_else(|| "node/infoにpublicKeyがありません".to_string())?;
+        self.fetch_voting_key_snapshot_for_public_key(&public_key)
+            .await
     }
 
     fn remaining_days(not_after: i64, now: i64) -> i64 {
@@ -675,6 +683,7 @@ impl NodeAdapter for SymbolAdapter {
                     port: u64_value(peer.get("port")).and_then(|value| u16::try_from(value).ok()),
                     status: "active".into(),
                     version: Self::version(u64_value(peer.get("version"))),
+                    roles: Self::roles(u64_value(peer.get("roles")).unwrap_or_default()),
                 }
             })
             .collect())

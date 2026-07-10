@@ -21,10 +21,12 @@ export function MetricChart({
   data,
   showHarvestMetrics = true,
   showSupernodeMetrics = false,
+  latencyLabel = "REST応答",
 }: {
   data: MetricPoint[];
   showHarvestMetrics?: boolean;
   showSupernodeMetrics?: boolean;
+  latencyLabel?: string;
 }) {
   const ref = useRef<HTMLDivElement>(null);
 
@@ -74,7 +76,7 @@ export function MetricChart({
       color: ["#55d6be", "#73a9ff", "#ffca5c", "#d58cff", "#ff8fb3", "#8de5a1"],
       animationDuration: 350,
       tooltip: { trigger: "axis" },
-      legend: { textStyle: { color: "#91a3b8" }, data: ["REST応答", "ピア数", "同期遅延", ...harvestLegend, ...supernodeLegend] },
+      legend: { textStyle: { color: "#91a3b8" }, data: [latencyLabel, "ピア数", "同期遅延", ...harvestLegend, ...supernodeLegend] },
       grid: { left: 52, right: showHarvestMetrics || showSupernodeMetrics ? 82 : 32, top: 46, bottom: 42 },
       xAxis: {
         type: "time",
@@ -120,7 +122,7 @@ export function MetricChart({
       dataZoom: [{ type: "inside" }, { type: "slider", height: 18, bottom: 5 }],
       series: [
         {
-          name: "REST応答",
+          name: latencyLabel,
           type: "line",
           showSymbol: false,
           smooth: true,
@@ -153,7 +155,7 @@ export function MetricChart({
       resize.disconnect();
       chart.dispose();
     };
-  }, [data, showHarvestMetrics, showSupernodeMetrics]);
+  }, [data, showHarvestMetrics, showSupernodeMetrics, latencyLabel]);
 
   return <div ref={ref} className="chart" role="img" aria-label="ノードメトリクスの時系列グラフ" />;
 }

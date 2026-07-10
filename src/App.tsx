@@ -50,6 +50,20 @@ function formatLatency(value: number | null) {
   return value == null ? "—" : `${value} ms`;
 }
 
+function isPeerMonitor(node: { monitorMode: string }) {
+  return node.monitorMode === "peer";
+}
+
+function hasRole(node: { roles?: string[] }, role: string) {
+  return node.roles?.some((value) => value.toLowerCase() === role.toLowerCase()) ?? false;
+}
+
+function nodeKindLabel(node: { kind: string; monitorMode: string; roles?: string[] }) {
+  if (node.kind === "nis1") return "NIS1";
+  if (node.monitorMode === "peer") return hasRole(node, "Voting") ? "Symbol Voting" : "Symbol Peer";
+  return "Symbol API";
+}
+
 function formatNetwork(value: string | null) {
   if (!value) return "—";
   const normalized = value.trim().toLowerCase();
@@ -314,7 +328,7 @@ function DashboardPage() {
             <thead><tr><th>ノード</th><th>種別</th><th>状態</th><th>チェーン高</th><th>ファイナライズ高</th><th>遅延</th><th>ピア</th><th>REST</th><th>最終確認</th><th aria-label="操作" /></tr></thead>
             <tbody>{nodes.map((node, index) => <tr key={node.id} className="clickable" onClick={() => navigate(`/nodes/${node.id}`)}>
               <td className="node-table__node" title={`${node.displayName}\n${node.baseUrl}`}><strong>{node.displayName}</strong><small>{node.baseUrl}</small>{node.showHarvestMetrics && node.kind === "symbol" && <div className="harvest-chips"><span><Cherry size={12} />{node.delegatedHarvesterCount ?? "—"}</span><span className={node.delegatedHarvesterDelta && node.delegatedHarvesterDelta !== 0 ? (node.delegatedHarvesterDelta > 0 ? "text-good" : "text-warn") : undefined}>{formatDelta(node.delegatedHarvesterDelta)}</span><span>{formatXym(node.totalBalanceMicroXym)}</span></div>}{node.kind === "nis1" && <div className="supernode-chips"><span className={`supernode-chip ${supernodeClass(node.supernodeChecksPassed, node.supernodeStatus)}`}>{supernodeLabel(node.supernodeChecksPassed, node.supernodeStatus)}</span>{node.supernodeLastRound != null && <span>#{node.supernodeLastRound}</span>}</div>}</td>
-              <td><span className={`kind kind--${node.kind}`}>{node.kind === "symbol" ? "Symbol" : "NIS1"}</span></td>
+              <td><span className={`kind kind--${node.kind}`}>{nodeKindLabel(node)}</span></td>
               <td><StatusBadge status={isRechecking ? "unknown" : node.status} label={isRechecking ? "再確認中" : undefined} /></td><td className="mono">{node.height ?? "—"}</td><td className="mono">{node.finalizedHeight ?? "—"}</td><td>{node.lag ?? "—"}</td><td>{node.peerCount ?? "—"}</td><td>{formatLatency(node.latencyMs)}</td><td>{formatTime(node.lastSeenAt)}</td>
               <td><div className="row-actions">
                 <button className="icon-button" aria-label={`${node.displayName}を上へ移動`} title={reorderTitle ?? "上へ移動"} disabled={filterActive || index === 0 || reorder.isPending} onClick={(event) => { event.stopPropagation(); reorder.mutate({ id: node.id, direction: "up" }); }}><ArrowUp size={16} /></button>
@@ -378,16 +392,16 @@ function NodeDetailPage() {
   return <>
     <div className="page-heading"><div><button className="link-button" onClick={() => navigate("/")}>← ダッシュボード</button><h2>{data.node.displayName}</h2><p>{data.node.baseUrl}</p></div><div className="actions"><StatusBadge status={data.node.status} /><button className="button button--danger" onClick={() => remove.mutate()}><Trash2 size={16} />削除</button></div></div>
     <section className="detail-grid">
-      <article className="panel detail-card"><h3>チェーン</h3><dl><div><dt>高さ</dt><dd>{data.node.height ?? "—"}</dd></div><div><dt>ファイナライズ高</dt><dd>{data.node.finalizedHeight ?? "対象外"}</dd></div><div><dt>同期遅延</dt><dd>{data.node.lag ?? "—"}</dd></div><div><dt>チェーンスコア</dt><dd className="mono text-truncate">{data.chainScore ?? "—"}</dd></div></dl></article>
-      <article className="panel detail-card"><h3>ノード</h3><dl><div><dt>種別</dt><dd>{data.node.kind === "symbol" ? "Symbol" : "NIS1"}</dd></div><div><dt>ネットワーク</dt><dd>{formatNetwork(data.node.network)}</dd></div><div><dt>バージョン</dt><dd>{data.node.version ?? "—"}</dd></div><div><dt>REST</dt><dd>{data.restVersion ?? "—"}</dd></div></dl></article>
-      <article className="panel detail-card"><h3>接続</h3><dl><div><dt>REST応答</dt><dd>{formatLatency(data.node.latencyMs)}</dd></div><div><dt>ピア</dt><dd>{data.node.peerCount ?? "—"}</dd></div><div><dt>API / DB</dt><dd>{[data.apiStatus, data.dbStatus].filter(Boolean).join(" / ") || "—"}</dd></div><div><dt>WebSocket</dt><dd>{data.node.kind === "symbol" ? (data.websocketConnected ? "接続中" : "RESTへフォールバック") : "対象外"}</dd></div></dl></article>
-      <article className="panel detail-card certificate-card"><h3>証明書</h3>{data.node.kind !== "symbol" ? <p className="harvest-empty">Symbolノードのみ対象です。</p> : <><dl><div><dt>ノード証明書</dt><dd>{formatTime(data.node.nodeCertificateNotAfter)}</dd></div><div><dt>残り日数</dt><dd className={data.node.nodeCertificateRemainingDays != null && data.node.nodeCertificateRemainingDays <= 7 ? "text-warn" : undefined}>{formatDays(data.node.nodeCertificateRemainingDays)}</dd></div><div><dt>投票キー範囲</dt><dd>{data.node.votingKeyStartEpoch != null || data.node.votingKeyEndEpoch != null ? `${data.node.votingKeyStartEpoch ?? "—"} - ${data.node.votingKeyEndEpoch ?? "—"}` : "—"}</dd></div><div><dt>残りepoch</dt><dd className={data.node.votingKeyRemainingEpochs != null && data.node.votingKeyRemainingEpochs <= 7 ? "text-warn" : undefined}>{formatEpochs(data.node.votingKeyRemainingEpochs)}</dd></div><div><dt>現在epoch</dt><dd>{data.node.finalizationEpoch ?? "—"}</dd></div></dl>{data.node.certificateMetricError && <p className="harvest-error">取得エラー: {data.node.certificateMetricError}</p>}</>}</article>
+      <article className="panel detail-card"><h3>チェーン</h3><dl><div><dt>高さ</dt><dd>{isPeerMonitor(data.node) ? "対象外" : data.node.height ?? "—"}</dd></div><div><dt>ファイナライズ高</dt><dd>{isPeerMonitor(data.node) ? "対象外" : data.node.finalizedHeight ?? "対象外"}</dd></div><div><dt>同期遅延</dt><dd>{isPeerMonitor(data.node) ? "対象外" : data.node.lag ?? "—"}</dd></div><div><dt>チェーンスコア</dt><dd className="mono text-truncate">{isPeerMonitor(data.node) ? "対象外" : data.chainScore ?? "—"}</dd></div></dl></article>
+      <article className="panel detail-card"><h3>ノード</h3><dl><div><dt>種別</dt><dd>{nodeKindLabel({ ...data.node, roles: data.roles })}</dd></div><div><dt>ネットワーク</dt><dd>{formatNetwork(data.node.network)}</dd></div><div><dt>バージョン</dt><dd>{data.node.version ?? "—"}</dd></div><div><dt>REST</dt><dd>{isPeerMonitor(data.node) ? "対象外" : data.restVersion ?? "—"}</dd></div></dl></article>
+      <article className="panel detail-card"><h3>接続</h3><dl><div><dt>{isPeerMonitor(data.node) ? "P2P応答" : "REST応答"}</dt><dd>{formatLatency(data.node.latencyMs)}</dd></div><div><dt>ピア</dt><dd>{isPeerMonitor(data.node) ? "対象外" : data.node.peerCount ?? "—"}</dd></div><div><dt>API / DB</dt><dd>{isPeerMonitor(data.node) ? "対象外" : [data.apiStatus, data.dbStatus].filter(Boolean).join(" / ") || "—"}</dd></div><div><dt>WebSocket</dt><dd>{isPeerMonitor(data.node) ? "対象外" : data.node.kind === "symbol" ? (data.websocketConnected ? "接続中" : "RESTへフォールバック") : "対象外"}</dd></div></dl></article>
+      <article className="panel detail-card certificate-card"><h3>証明書</h3>{data.node.kind !== "symbol" ? <p className="harvest-empty">Symbolノードのみ対象です。</p> : <><dl><div><dt>ノード証明書</dt><dd>{isPeerMonitor(data.node) ? "対象外" : formatTime(data.node.nodeCertificateNotAfter)}</dd></div><div><dt>残り日数</dt><dd className={data.node.nodeCertificateRemainingDays != null && data.node.nodeCertificateRemainingDays <= 7 ? "text-warn" : undefined}>{isPeerMonitor(data.node) ? "対象外" : formatDays(data.node.nodeCertificateRemainingDays)}</dd></div><div><dt>投票キー範囲</dt><dd>{hasRole(data, "Voting") || !isPeerMonitor(data.node) ? (data.node.votingKeyStartEpoch != null || data.node.votingKeyEndEpoch != null ? `${data.node.votingKeyStartEpoch ?? "—"} - ${data.node.votingKeyEndEpoch ?? "—"}` : "—") : "対象外"}</dd></div><div><dt>残りepoch</dt><dd className={data.node.votingKeyRemainingEpochs != null && data.node.votingKeyRemainingEpochs <= 7 ? "text-warn" : undefined}>{hasRole(data, "Voting") || !isPeerMonitor(data.node) ? formatEpochs(data.node.votingKeyRemainingEpochs) : "対象外"}</dd></div><div><dt>現在epoch</dt><dd>{hasRole(data, "Voting") || !isPeerMonitor(data.node) ? data.node.finalizationEpoch ?? "—" : "対象外"}</dd></div></dl>{data.node.certificateMetricError && <p className="harvest-error">取得エラー: {data.node.certificateMetricError}</p>}</>}</article>
       <article className="panel detail-card harvest-card"><div className="detail-card__heading"><h3>委任ハーベスト</h3>{data.node.kind === "symbol" && <label className="mini-toggle"><input type="checkbox" checked={data.node.showHarvestMetrics} disabled={toggleHarvest.isPending} onChange={(event) => toggleHarvest.mutate(event.target.checked)} />表示</label>}</div>{data.node.kind !== "symbol" ? <p className="harvest-empty">Symbolノードのみ対象です。</p> : data.node.showHarvestMetrics ? <><dl><div><dt>委任者数</dt><dd>{data.node.delegatedHarvesterCount ?? "—"}</dd></div><div><dt>24時間増減</dt><dd>{formatDelta(data.node.delegatedHarvesterDelta)}</dd></div><div><dt>合計XYM</dt><dd>{formatXym(data.node.totalBalanceMicroXym)}</dd></div><div><dt>最新検知</dt><dd>{formatTime(data.node.latestHarvestAt)}</dd></div></dl>{data.node.harvestMetricError && <p className="harvest-error">取得エラー: {data.node.harvestMetricError}</p>}<HarvestEventList events={data.recentHarvests} /></> : <p className="harvest-empty">表示をONにすると委任ハーベスト情報を表示します。</p>}</article>
       <article className="panel detail-card supernode-card"><h3>Supernodeプログラム</h3>{data.node.kind !== "nis1" ? <p className="harvest-empty">NIS1ノードのみ対象です。</p> : data.node.supernodeStatus === "not_found" ? <p className="harvest-empty">Supernode対象リストに見つかりません。</p> : <><dl><div><dt>対象ID</dt><dd>{data.node.supernodeId ?? "—"}</dd></div><div><dt>状態</dt><dd>{data.node.supernodeStatus ?? "—"}</dd></div><div><dt>最新ラウンド</dt><dd>{data.node.supernodeLastRound ?? "—"}</dd></div><div><dt>最終チェック</dt><dd>{formatTime(data.node.supernodeLastRoundAt)}</dd></div><div><dt>総合合否</dt><dd className={data.node.supernodeChecksPassed === false ? "text-warn" : data.node.supernodeChecksPassed === true ? "text-good" : undefined}>{data.node.supernodeChecksPassed == null ? "—" : data.node.supernodeChecksPassed ? "合格" : "失敗"}</dd></div><div><dt>失敗項目</dt><dd>{formatFailedChecks(data.node.supernodeFailedChecks)}</dd></div></dl>{data.node.supernodeMetricError && <p className="harvest-error">取得エラー: {data.node.supernodeMetricError}</p>}</>}</article>
     </section>
     <DiagnosticPanel latest={diagnose.data ?? diagnostics[0]} history={diagnostics} isPending={diagnose.isPending} error={diagnose.error} onRun={() => diagnose.mutate()} />
-    <section className="panel"><div className="panel__header"><div><h2>監視期間メトリクス</h2><p>REST応答、ピア数、同期遅延、委任ハーベスト、Supernode合否</p></div><button className="button" onClick={() => api.exportCsv("metrics", nodeId)}><Download size={16} />CSV</button></div>{metrics.length ? <MetricChart data={metrics} showHarvestMetrics={data.node.showHarvestMetrics} showSupernodeMetrics={data.node.kind === "nis1"} /> : <EmptyState title="履歴を収集中">最初の監視サンプルが保存されるとグラフが表示されます。</EmptyState>}</section>
-    <section className="panel"><div className="panel__header"><div><h2>現在のピア</h2><p>{data.peers.length}件</p></div></div>{data.peers.length ? <div className="table-wrap"><table><thead><tr><th>名前</th><th>ホスト</th><th>ポート</th><th>状態</th><th>バージョン</th></tr></thead><tbody>{data.peers.map((peer) => <tr key={peer.key}><td>{peer.name ?? "—"}</td><td>{peer.host ?? "—"}</td><td>{peer.port ?? "—"}</td><td>{peer.status}</td><td>{peer.version ?? "—"}</td></tr>)}</tbody></table></div> : <EmptyState title="ピア情報がありません">次回のピアポーリング後に表示されます。</EmptyState>}</section>
+    <section className="panel"><div className="panel__header"><div><h2>監視期間メトリクス</h2><p>{isPeerMonitor(data.node) ? "P2P応答" : "REST応答、ピア数、同期遅延、委任ハーベスト、Supernode合否"}</p></div><button className="button" onClick={() => api.exportCsv("metrics", nodeId)}><Download size={16} />CSV</button></div>{metrics.length ? <MetricChart data={metrics} showHarvestMetrics={!isPeerMonitor(data.node) && data.node.showHarvestMetrics} showSupernodeMetrics={data.node.kind === "nis1"} latencyLabel={isPeerMonitor(data.node) ? "P2P応答" : "REST応答"} /> : <EmptyState title="履歴を収集中">最初の監視サンプルが保存されるとグラフが表示されます。</EmptyState>}</section>
+    <section className="panel"><div className="panel__header"><div><h2>現在のピア</h2><p>{isPeerMonitor(data.node) ? "対象外" : `${data.peers.length}件`}</p></div></div>{isPeerMonitor(data.node) ? <EmptyState title="ピア一覧は対象外です">APIなしPeerノード自身からpeer一覧は取得できません。トポロジーでは他の監視APIノードが報告した接続として表示されます。</EmptyState> : data.peers.length ? <div className="table-wrap"><table><thead><tr><th>名前</th><th>ホスト</th><th>ポート</th><th>状態</th><th>バージョン</th></tr></thead><tbody>{data.peers.map((peer) => <tr key={peer.key}><td>{peer.name ?? "—"}</td><td>{peer.host ?? "—"}</td><td>{peer.port ?? "—"}</td><td>{peer.status}</td><td>{peer.version ?? "—"}</td></tr>)}</tbody></table></div> : <EmptyState title="ピア情報がありません">次回のピアポーリング後に表示されます。</EmptyState>}</section>
   </>;
 }
 
@@ -396,20 +410,45 @@ function DiscoveryPage() {
   const { data: interfaces = [] } = useQuery({ queryKey: ["interfaces"], queryFn: api.interfaces });
   const [cidr, setCidr] = useState("");
   const [ports, setPorts] = useState("3000,3001,7890");
+  const [manualMode, setManualMode] = useState<"api" | "peer" | "peer-voting">("api");
   const [manualUrl, setManualUrl] = useState("");
+  const [peerPublicKey, setPeerPublicKey] = useState("");
+  const [peerNetwork, setPeerNetwork] = useState("Symbol Mainnet");
   const scan = useMutation({ mutationFn: api.scan });
   const add = useMutation({ mutationFn: api.upsertNode, onSuccess: () => queryClient.invalidateQueries({ queryKey: ["dashboard"] }) });
   useEffect(() => {
     if (!cidr && interfaces.length > 0) setCidr(interfaces[0].cidr);
   }, [cidr, interfaces]);
   function submitScan(event: FormEvent) { event.preventDefault(); scan.mutate({ cidr, ports: ports.split(",").map(Number).filter((port) => Number.isInteger(port)) }); }
-  function addManual(event: FormEvent) { event.preventDefault(); add.mutate({ baseUrl: manualUrl }, { onSuccess: () => setManualUrl("") }); }
+  function addManual(event: FormEvent) {
+    event.preventDefault();
+    const input = manualMode === "peer"
+      ? {
+          baseUrl: manualUrl,
+          kind: "symbol" as const,
+          monitorMode: "peer" as const,
+          network: peerNetwork.trim() || undefined,
+          publicKey: undefined,
+          roles: ["Peer"],
+        }
+      : manualMode === "peer-voting"
+      ? {
+          baseUrl: manualUrl,
+          kind: "symbol" as const,
+          monitorMode: "peer" as const,
+          network: peerNetwork.trim() || undefined,
+          publicKey: peerPublicKey.trim() || undefined,
+          roles: ["Peer", "Voting"],
+        }
+      : { baseUrl: manualUrl };
+    add.mutate(input, { onSuccess: () => { setManualUrl(""); setPeerPublicKey(""); } });
+  }
   function addCandidate(candidate: ScanCandidate) { add.mutate({ baseUrl: candidate.baseUrl, displayName: candidate.name ?? undefined, kind: candidate.kind }); }
   return <>
     <div className="page-heading"><div><h2>ノード検出</h2><p>選択したCIDRだけを明示的にスキャンします。候補は確認後に登録されます。</p></div></div>
     <section className="split-grid">
       <form className="panel form-card" onSubmit={submitScan}><h3>LANをスキャン</h3><label>ネットワーク候補<select value={cidr} onChange={(event) => setCidr(event.target.value)}>{!cidr && <option value="">ネットワークを選択</option>}{cidr && !interfaces.some((item) => item.cidr === cidr) && <option value={cidr}>{cidr}</option>}{interfaces.map((item) => <option key={`${item.name}-${item.cidr}`} value={item.cidr}>{item.name} — {item.cidr}</option>)}</select></label><label>CIDR<input value={cidr} onChange={(event) => setCidr(event.target.value)} required /></label><label>ポート（カンマ区切り）<input value={ports} onChange={(event) => setPorts(event.target.value)} required /></label><div className="actions"><button className="button button--primary" disabled={scan.isPending}><Search size={16} />{scan.isPending ? "スキャン中…" : "スキャン開始"}</button>{scan.isPending && <button type="button" className="button" onClick={() => api.cancelScan()}>キャンセル</button>}</div><p className="form-hint">最大1,024アドレス、既定ポート3000 / 3001 / 7890</p></form>
-      <form className="panel form-card" onSubmit={addManual}><h3>URLを手動登録</h3><label>REST URL<input type="url" value={manualUrl} onChange={(event) => { setManualUrl(event.target.value); if (add.isSuccess || add.isError) add.reset(); }} placeholder="http://192.0.2.10:3000" required /></label><button className="button button--primary" disabled={add.isPending}><Plus size={16} />{add.isPending ? "接続確認中…" : "接続確認して登録"}</button><p className="form-hint">表示名はノード情報から自動取得します。HTTP/HTTPSのみ指定できます。</p></form>
+      <form className="panel form-card" onSubmit={addManual}><h3>ノードを手動登録</h3><label>監視モード<select value={manualMode} onChange={(event) => { setManualMode(event.target.value as "api" | "peer" | "peer-voting"); if (add.isSuccess || add.isError) add.reset(); }}><option value="api">REST APIノード</option><option value="peer">Peerノード</option><option value="peer-voting">Peer + Votingノード</option></select></label><label>{manualMode === "api" ? "REST URL" : "Peerエンドポイント"}<input type={manualMode === "api" ? "url" : "text"} value={manualUrl} onChange={(event) => { setManualUrl(event.target.value); if (add.isSuccess || add.isError) add.reset(); }} placeholder={manualMode === "api" ? "http://192.0.2.10:3000" : "192.0.2.10:7900"} required /></label>{manualMode !== "api" && <label>ネットワーク<input value={peerNetwork} onChange={(event) => setPeerNetwork(event.target.value)} placeholder="Symbol Mainnet" required={manualMode === "peer-voting"} /></label>}{manualMode === "peer-voting" && <label>公開鍵<input value={peerPublicKey} onChange={(event) => setPeerPublicKey(event.target.value)} placeholder="必須" required /></label>}<button className="button button--primary" disabled={add.isPending}><Plus size={16} />{add.isPending ? "接続確認中…" : "接続確認して登録"}</button><p className="form-hint">{manualMode === "api" ? "表示名はノード情報から自動取得します。HTTP/HTTPSのみ指定できます。" : manualMode === "peer-voting" ? "P2P疎通に加えて、同一ネットワークの監視APIノード経由でVoting期限を確認します。" : "P2Pポートの疎通を監視します。"}</p></form>
     </section>
     {(scan.error || add.error) && <div className="notice notice--error">{String(scan.error ?? add.error)}</div>}
     {add.isSuccess && <div className="notice notice--success">「{add.data.displayName}」を登録しました。<small>{add.data.baseUrl}</small></div>}

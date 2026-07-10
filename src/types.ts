@@ -1,4 +1,5 @@
 export type NodeKind = "symbol" | "nis1";
+export type MonitorMode = "api" | "peer";
 export type NodeStatus = "unknown" | "healthy" | "warning" | "critical" | "offline";
 export type AlertSeverity = "warning" | "critical";
 export type AlertState = "open" | "acknowledged" | "resolved";
@@ -9,9 +10,11 @@ export interface NodeSummary {
   id: string;
   displayName: string;
   kind: NodeKind;
+  monitorMode: MonitorMode;
   baseUrl: string;
   network: string | null;
   version: string | null;
+  roles: string[];
   enabled: boolean;
   favorite: boolean;
   status: NodeStatus;
@@ -62,18 +65,21 @@ export interface PeerInfo {
   port: number | null;
   status: string;
   version: string | null;
+  roles: string[];
 }
 
 export interface TopologyNode {
   id: string;
   label: string;
   kind: NodeKind;
+  monitorMode: MonitorMode;
   network: string | null;
   status: NodeStatus;
   registered: boolean;
   enabled: boolean;
   host: string | null;
   port: number | null;
+  publicKey: string | null;
   version: string | null;
   roles: string[];
   peerStatus: string | null;
@@ -236,6 +242,11 @@ export interface UpsertNodeInput {
   displayName?: string;
   baseUrl: string;
   kind?: NodeKind;
+  monitorMode?: MonitorMode;
+  network?: string;
+  version?: string;
+  publicKey?: string;
+  roles?: string[];
   enabled?: boolean;
   favorite?: boolean;
 }

@@ -267,16 +267,18 @@ pub async fn notify_alert(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::NodeKind;
+    use crate::domain::{MonitorMode, NodeKind};
 
     fn node(status: NodeStatus, enabled: bool) -> NodeSummary {
         NodeSummary {
             id: "node".into(),
             display_name: "Node".into(),
             kind: NodeKind::Symbol,
+            monitor_mode: MonitorMode::Api,
             base_url: "http://127.0.0.1:3000".into(),
             network: None,
             version: None,
+            roles: Vec::new(),
             enabled,
             favorite: false,
             status,

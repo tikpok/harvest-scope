@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { listen } from "@tauri-apps/api/event";
-import { ChevronRight, Pause, Play, Radio, RefreshCw, Rocket } from "lucide-react";
+import { ChevronRight, Pause, Play, Plus, Radio, RefreshCw, Rocket } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { useNetworkEvents } from "../hooks/useNetworkEvents";
 import { api } from "../services/ipc";
@@ -23,8 +23,21 @@ const peerStatusLabels: Record<string, string> = {
   failure: "接続失敗",
 };
 
-function NodeInspector({ node, connections, onOpen }: { node: TopologyNode; connections: number; onOpen: () => void }) {
+function NodeInspector({
+  node,
+  connections,
+  onOpen,
+  onRegister,
+  registering,
+}: {
+  node: TopologyNode;
+  connections: number;
+  onOpen: () => void;
+  onRegister: () => void;
+  registering: boolean;
+}) {
   const endpoint = node.host ? `${node.host}${node.port ? `:${node.port}` : ""}` : "—";
+  const peerMonitor = node.monitorMode === "peer";
   return <section className="topology-inspector" aria-label="選択したノードの情報">
     <div className="topology-inspector__heading">
       <div><span className={`kind kind--${node.kind}`}>{node.kind === "symbol" ? "Symbol" : "NIS1"}</span><h3>{node.label}</h3></div>
@@ -34,15 +47,16 @@ function NodeInspector({ node, connections, onOpen }: { node: TopologyNode; conn
       <div><dt>エンドポイント</dt><dd className="mono">{endpoint}</dd></div>
       <div><dt>接続</dt><dd>{connections} 本{!node.registered && connections > 1 ? " · 共有ピア" : ""}</dd></div>
       <div><dt>バージョン</dt><dd>{node.version ?? "—"}</dd></div>
-      {node.registered && <div><dt>ブロック高</dt><dd>{node.height ?? "—"}{node.kind === "symbol" && node.finalizedHeight ? ` / F ${node.finalizedHeight}` : ""}</dd></div>}
-      {node.kind === "symbol" && node.registered && <div><dt>ライブ接続</dt><dd className={node.websocketConnected ? "text-good" : "muted"}>{node.websocketConnected ? "WebSocket接続中" : "RESTフォールバック"}</dd></div>}
-      {node.kind === "symbol" && node.registered && <div><dt>API / DB</dt><dd>{[node.apiStatus, node.dbStatus].filter(Boolean).join(" / ") || "—"}</dd></div>}
-      {node.kind === "symbol" && node.registered && <div><dt>委任者</dt><dd>{node.showHarvestMetrics ? node.delegatedHarvesterCount ?? "—" : "非表示"}</dd></div>}
-      {node.kind === "symbol" && node.registered && <div><dt>最新ハーベスト</dt><dd>{node.latestHarvestAt ? new Date(node.latestHarvestAt).toLocaleTimeString("ja-JP") : "—"}</dd></div>}
+      {node.registered && <div><dt>ブロック高</dt><dd>{peerMonitor ? "対象外" : `${node.height ?? "—"}${node.kind === "symbol" && node.finalizedHeight ? ` / F ${node.finalizedHeight}` : ""}`}</dd></div>}
+      {node.kind === "symbol" && node.registered && <div><dt>ライブ接続</dt><dd className={!peerMonitor && node.websocketConnected ? "text-good" : "muted"}>{peerMonitor ? "対象外" : node.websocketConnected ? "WebSocket接続中" : "RESTフォールバック"}</dd></div>}
+      {node.kind === "symbol" && node.registered && <div><dt>API / DB</dt><dd>{peerMonitor ? "対象外" : [node.apiStatus, node.dbStatus].filter(Boolean).join(" / ") || "—"}</dd></div>}
+      {node.kind === "symbol" && node.registered && !peerMonitor && <div><dt>委任者</dt><dd>{node.showHarvestMetrics ? node.delegatedHarvesterCount ?? "—" : "非表示"}</dd></div>}
+      {node.kind === "symbol" && node.registered && !peerMonitor && <div><dt>最新ハーベスト</dt><dd>{node.latestHarvestAt ? new Date(node.latestHarvestAt).toLocaleTimeString("ja-JP") : "—"}</dd></div>}
       {node.kind === "nis1" && node.registered && <div><dt>NIS状態コード</dt><dd>{node.nisStatusCode ?? "—"}</dd></div>}
     </dl>
     {node.roles.length > 0 && <div className="topology-role-list">{node.roles.map((role) => <span key={role}>{role}</span>)}</div>}
     {node.registered && <button className="link-button topology-inspector__link" onClick={onOpen}>ノード詳細を表示 <ChevronRight size={14} /></button>}
+    {!node.registered && node.kind === "symbol" && <button className="button topology-inspector__link" disabled={registering || !node.host} onClick={onRegister}><Plus size={14} />監視に追加</button>}
   </section>;
 }
 
@@ -60,6 +74,22 @@ export function TopologyPage() {
     queryKey: ["topology"],
     queryFn: api.topology,
     refetchInterval: 60_000,
+  });
+  const registerPeer = useMutation({
+    mutationFn: (node: TopologyNode) => api.upsertNode({
+      baseUrl: `${node.host}:${node.port ?? 7900}`,
+      displayName: node.label,
+      kind: "symbol",
+      monitorMode: "peer",
+      network: node.network ?? undefined,
+      version: node.version ?? undefined,
+      publicKey: node.publicKey ?? undefined,
+      roles: node.roles.length ? node.roles : ["Peer"],
+    }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+      await queryClient.invalidateQueries({ queryKey: ["topology"] });
+    },
   });
 
   useEffect(() => {
@@ -141,7 +171,7 @@ export function TopologyPage() {
       </section>
       <aside className={`panel topology-events${selectedNode ? " topology-events--inspecting" : ""}`}>
         {selectedNode ? (
-          <NodeInspector node={selectedNode} connections={summary.degrees.get(selectedNode.id) ?? 0} onOpen={() => navigate(`/nodes/${selectedNode.id}`)} />
+          <NodeInspector node={selectedNode} connections={summary.degrees.get(selectedNode.id) ?? 0} onOpen={() => navigate(`/nodes/${selectedNode.id}`)} onRegister={() => registerPeer.mutate(selectedNode)} registering={registerPeer.isPending} />
         ) : <>
           <section className="topology-network-summary">
             <h3>ネットワーク構成</h3>

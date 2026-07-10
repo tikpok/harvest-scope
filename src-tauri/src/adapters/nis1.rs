@@ -303,6 +303,7 @@ impl NodeAdapter for Nis1Adapter {
                         .and_then(|value| u16::try_from(value).ok()),
                     status: status.into(),
                     version: metadata.get("version").and_then(string_value),
+                    roles: Vec::new(),
                 });
             }
         }

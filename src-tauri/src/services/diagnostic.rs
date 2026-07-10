@@ -6,8 +6,8 @@ use std::{
 use tokio::net::{lookup_host, TcpStream};
 
 use crate::{
-    adapters::adapter_for,
-    domain::{DiagnosticCheck, DiagnosticRun, DiagnosticStatus, NodeKind, StoredNode},
+    adapters::{adapter_for, SymbolAdapter},
+    domain::{DiagnosticCheck, DiagnosticRun, DiagnosticStatus, MonitorMode, NodeKind, StoredNode},
     error::{AppError, AppResult},
     state::AppState,
 };
@@ -57,6 +57,135 @@ fn summarize(checks: &[DiagnosticCheck]) -> (DiagnosticStatus, String) {
     }
 }
 
+fn has_role(node: &StoredNode, role: &str) -> bool {
+    node.roles
+        .iter()
+        .any(|value| value.eq_ignore_ascii_case(role))
+}
+
+fn symbol_network_match_key(value: &str) -> String {
+    let normalized = value
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '_'], "")
+        .replace("--", "-");
+    match normalized.as_str() {
+        "104" | "-104" | "symbol104" | "symbol-104" | "symbolmainnet" | "symbolmain" => {
+            "symbol-mainnet".into()
+        }
+        "152" | "symbol152" | "symbol-152" | "symboltestnet" | "symboltest" => {
+            "symbol-testnet".into()
+        }
+        other => other.to_owned(),
+    }
+}
+
+async fn diagnose_peer_voting(state: &AppState, node: &StoredNode, checks: &mut Vec<DiagnosticCheck>) {
+    let started = Instant::now();
+    if !has_role(node, "Voting") {
+        checks.push(check(
+            "voting_key",
+            "Voting期限",
+            "skipped",
+            "Peerのみの監視ではVoting期限は対象外です。",
+            None,
+            started,
+        ));
+        return;
+    }
+    let Some(public_key) = node.public_key.as_deref().filter(|value| !value.trim().is_empty()) else {
+        checks.push(check(
+            "voting_key",
+            "Voting期限",
+            "fail",
+            "Voting期限確認に必要な公開鍵が登録されていません。",
+            Some("Peer + Votingノードとして公開鍵を登録してください。"),
+            started,
+        ));
+        return;
+    };
+    let Some(network) = node.network.as_deref().filter(|value| !value.trim().is_empty()) else {
+        checks.push(check(
+            "voting_key",
+            "Voting期限",
+            "fail",
+            "Voting期限確認に必要なネットワークが登録されていません。",
+            Some("Peer + Votingノードのネットワークを登録してください。"),
+            started,
+        ));
+        return;
+    };
+    let network_key = symbol_network_match_key(network);
+    let reference = state
+        .repository
+        .list_stored_nodes(true)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|candidate| {
+            candidate.id != node.id
+                && candidate.kind == NodeKind::Symbol
+                && candidate.monitor_mode == MonitorMode::Api
+                && candidate
+                    .network
+                    .as_deref()
+                    .map(symbol_network_match_key)
+                    .as_deref()
+                    == Some(network_key.as_str())
+        });
+    let Some(reference) = reference else {
+        checks.push(check(
+            "voting_key",
+            "Voting期限",
+            "warning",
+            "同一ネットワークの参照用Symbol APIノードがありません。",
+            Some("同じネットワークのSymbol APIノードを監視対象に追加してください。"),
+            started,
+        ));
+        return;
+    };
+    match tokio::time::timeout(
+        CHECK_TIMEOUT,
+        SymbolAdapter::new(reference.base_url, state.client.clone())
+            .fetch_voting_key_snapshot_for_public_key(public_key),
+    )
+    .await
+    {
+        Ok(Ok(snapshot)) => checks.push(check(
+            "voting_key",
+            "Voting期限",
+            snapshot
+                .voting_key_remaining_epochs
+                .map_or("warning", |epochs| if epochs <= 30 { "warning" } else { "pass" }),
+            snapshot.voting_key_remaining_epochs.map_or_else(
+                || "Voting期限を取得しましたが、残epochを特定できませんでした。".into(),
+                |epochs| format!("Voting期限まで残り{epochs} epochです。"),
+            ),
+            snapshot
+                .voting_key_remaining_epochs
+                .map_or(true, |epochs| epochs <= 30)
+                .then_some("Voting keyの更新時期を確認してください。"),
+            started,
+        )),
+        Ok(Err(error)) => checks.push(check(
+            "voting_key",
+            "Voting期限",
+            "warning",
+            error,
+            Some("参照APIノードと登録公開鍵を確認してください。"),
+            started,
+        )),
+        Err(_) => checks.push(check(
+            "voting_key",
+            "Voting期限",
+            "warning",
+            "Voting期限確認がタイムアウトしました。",
+            Some("参照APIノードの応答状態を確認してください。"),
+            started,
+        )),
+    }
+}
+
 async fn execute(state: &AppState, node: &StoredNode, alert_id: Option<String>) -> DiagnosticRun {
     let started_at = chrono::Utc::now().timestamp_millis();
     let mut checks = Vec::new();
@@ -64,7 +193,8 @@ async fn execute(state: &AppState, node: &StoredNode, alert_id: Option<String>) 
     let (host, port) = match parsed {
         Ok(url) => (
             url.host_str().map(str::to_owned),
-            url.port_or_known_default(),
+            url.port_or_known_default()
+                .or_else(|| (node.monitor_mode == MonitorMode::Peer).then_some(7900)),
         ),
         Err(error) => {
             checks.push(check(
@@ -154,7 +284,7 @@ async fn execute(state: &AppState, node: &StoredNode, alert_id: Option<String>) 
         match tokio::time::timeout(CHECK_TIMEOUT, TcpStream::connect(address)).await {
             Ok(Ok(_)) => checks.push(check(
                 "tcp",
-                "RESTポート",
+                if node.monitor_mode == MonitorMode::Peer { "P2Pポート" } else { "RESTポート" },
                 "pass",
                 format!("{address}へ接続できました。"),
                 None,
@@ -162,7 +292,7 @@ async fn execute(state: &AppState, node: &StoredNode, alert_id: Option<String>) 
             )),
             Ok(Err(error)) => checks.push(check(
                 "tcp",
-                "RESTポート",
+                if node.monitor_mode == MonitorMode::Peer { "P2Pポート" } else { "RESTポート" },
                 "fail",
                 error.to_string(),
                 Some("ノードプロセス、待受ポート、ファイアウォールを確認してください。"),
@@ -170,7 +300,7 @@ async fn execute(state: &AppState, node: &StoredNode, alert_id: Option<String>) 
             )),
             Err(_) => checks.push(check(
                 "tcp",
-                "RESTポート",
+                if node.monitor_mode == MonitorMode::Peer { "P2Pポート" } else { "RESTポート" },
                 "fail",
                 "TCP接続がタイムアウトしました。",
                 Some("ネットワーク経路とファイアウォールを確認してください。"),
@@ -180,12 +310,37 @@ async fn execute(state: &AppState, node: &StoredNode, alert_id: Option<String>) 
     } else {
         checks.push(check(
             "tcp",
-            "RESTポート",
+            if node.monitor_mode == MonitorMode::Peer { "P2Pポート" } else { "RESTポート" },
             "skipped",
             "接続先を解決できないため省略しました。",
             None,
             started,
         ));
+    }
+
+    if node.monitor_mode == MonitorMode::Peer {
+        for (key, label, message) in [
+            ("identity", "ノード識別", "APIなしPeerノードではREST識別情報は対象外です。"),
+            ("health", "ヘルス", "APIなしPeerノードではRESTヘルスは対象外です。"),
+            ("chain", "チェーン同期", "APIなしPeerノードではチェーンAPI確認は対象外です。"),
+            ("peers", "ピア接続", "APIなしPeerノード自身からpeer一覧は取得できません。"),
+            ("websocket", "WebSocket", "APIなしPeerノードではWebSocketは対象外です。"),
+            ("state_hash", "State hash", "APIなしPeerノードではState hash比較は対象外です。"),
+        ] {
+            checks.push(check(key, label, "skipped", message, None, Instant::now()));
+        }
+        diagnose_peer_voting(state, node, &mut checks).await;
+        let (status, summary) = summarize(&checks);
+        return DiagnosticRun {
+            id: uuid::Uuid::new_v4().to_string(),
+            node_id: node.id.clone(),
+            alert_id,
+            started_at,
+            completed_at: chrono::Utc::now().timestamp_millis(),
+            status,
+            summary,
+            checks,
+        };
     }
 
     let adapter = adapter_for(node.kind, node.base_url.clone(), state.client.clone());
