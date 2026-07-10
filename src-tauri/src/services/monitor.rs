@@ -17,7 +17,7 @@ use crate::{
     state::AppState,
 };
 
-use super::{desktop, websocket};
+use super::{desktop, monitor_alerts, websocket};
 
 const RESUME_LATE_THRESHOLD_MS: i64 = 15_000;
 const RESUME_GRACE_MS: i64 = 90_000;
@@ -32,48 +32,6 @@ fn wake_was_late(expected_at: i64, actual_at: i64) -> bool {
 
 fn latency_sample_is_slow(health_succeeded: bool, latency_ms: i64, warning_ms: u64) -> bool {
     health_succeeded && latency_ms as u64 >= warning_ms
-}
-
-fn certificate_expiry_severity(remaining: Option<i64>) -> Option<&'static str> {
-    remaining.and_then(|value| {
-        if value <= 7 {
-            Some("critical")
-        } else if value <= 30 {
-            Some("warning")
-        } else {
-            None
-        }
-    })
-}
-
-fn node_certificate_message(days: i64) -> String {
-    if days < 0 {
-        "ノード証明書の期限が切れています。".into()
-    } else {
-        format!("ノード証明書の期限まで残り{days}日です。")
-    }
-}
-
-fn voting_key_message(epochs: i64) -> String {
-    if epochs == 0 {
-        "投票キーの有効epochが終了しています。".into()
-    } else {
-        format!("投票キーの有効期限まで残り{epochs} epochです。")
-    }
-}
-
-fn supernode_failure_message(round: Option<i64>, failed_checks: &[String]) -> String {
-    let round = round
-        .map(|value| format!("ラウンド{value}"))
-        .unwrap_or_else(|| "最新ラウンド".into());
-    if failed_checks.is_empty() {
-        format!("NEM Supernodeの{round}でチェックに失敗しました。")
-    } else {
-        format!(
-            "NEM Supernodeの{round}で{}に失敗しました。",
-            failed_checks.join(", ")
-        )
-    }
 }
 
 fn empty_sample(
@@ -272,7 +230,7 @@ async fn monitor_peer_node_inner(
         || state.is_system_suspended()
         || state.in_resume_grace(chrono::Utc::now().timestamp_millis());
     if !evaluation_paused && offline {
-        update_alert(
+        monitor_alerts::update_alert(
             &app,
             &state,
             &node,
@@ -283,7 +241,7 @@ async fn monitor_peer_node_inner(
         )
         .await?;
     } else if !evaluation_paused && recovered {
-        update_alert(
+        monitor_alerts::update_alert(
             &app,
             &state,
             &node,
@@ -295,7 +253,7 @@ async fn monitor_peer_node_inner(
         .await?;
     }
     if !evaluation_paused && latency_alert {
-        update_alert(
+        monitor_alerts::update_alert(
             &app,
             &state,
             &node,
@@ -306,7 +264,7 @@ async fn monitor_peer_node_inner(
         )
         .await?;
     } else if !evaluation_paused && latency_recovered {
-        update_alert(
+        monitor_alerts::update_alert(
             &app,
             &state,
             &node,
@@ -318,12 +276,13 @@ async fn monitor_peer_node_inner(
         .await?;
     }
     if !evaluation_paused {
-        let voting_key_severity = certificate_expiry_severity(sample.voting_key_remaining_epochs);
+        let voting_key_severity =
+            monitor_alerts::certificate_expiry_severity(sample.voting_key_remaining_epochs);
         let voting_key_message = sample
             .voting_key_remaining_epochs
-            .map(voting_key_message)
+            .map(monitor_alerts::voting_key_message)
             .unwrap_or_else(|| "投票キー期限を確認できません。".into());
-        update_alert(
+        monitor_alerts::update_alert(
             &app,
             &state,
             &node,
@@ -373,45 +332,6 @@ async fn enter_resume_grace(state: &AppState, now: i64, reason: &str) {
 pub(crate) async fn handle_system_resume(state: &AppState, reason: &str) {
     let now = chrono::Utc::now().timestamp_millis();
     enter_resume_grace(state, now, reason).await;
-}
-
-async fn update_alert(
-    app: &AppHandle,
-    state: &AppState,
-    node: &StoredNode,
-    active: bool,
-    alert_type: &str,
-    severity: &str,
-    message: &str,
-) -> AppResult<()> {
-    let mutation = if active {
-        let mutation = state
-            .repository
-            .raise_alert(&node.id, alert_type, severity, message)
-            .await?;
-        mutation.changed.then_some(mutation.alert_id)
-    } else {
-        state.repository.resolve_alert(&node.id, alert_type).await?
-    };
-    if let Some(alert_id) = mutation {
-        let title = if active {
-            format!(
-                "{}: {}",
-                if severity == "critical" {
-                    "重大"
-                } else {
-                    "警告"
-                },
-                node.display_name
-            )
-        } else {
-            format!("復旧: {}", node.display_name)
-        };
-        desktop::notify_alert(app.clone(), state.clone(), &title, message, alert_id).await;
-        let _ = app.emit("alert-changed", &node.id);
-        desktop::refresh_tray(app, state).await;
-    }
-    Ok(())
 }
 
 async fn monitor_node_inner(
@@ -786,7 +706,7 @@ async fn monitor_node_inner(
         || state.is_system_suspended()
         || state.in_resume_grace(chrono::Utc::now().timestamp_millis());
     if !evaluation_paused && offline {
-        update_alert(
+        monitor_alerts::update_alert(
             &app,
             &state,
             &node,
@@ -797,7 +717,7 @@ async fn monitor_node_inner(
         )
         .await?;
     } else if !evaluation_paused && recovered {
-        update_alert(
+        monitor_alerts::update_alert(
             &app,
             &state,
             &node,
@@ -809,7 +729,7 @@ async fn monitor_node_inner(
         .await?;
     }
     if !evaluation_paused && latency_alert {
-        update_alert(
+        monitor_alerts::update_alert(
             &app,
             &state,
             &node,
@@ -820,7 +740,7 @@ async fn monitor_node_inner(
         )
         .await?;
     } else if !evaluation_paused && latency_recovered {
-        update_alert(
+        monitor_alerts::update_alert(
             &app,
             &state,
             &node,
@@ -836,7 +756,7 @@ async fn monitor_node_inner(
         desktop::refresh_tray(&app, &state).await;
         return Ok(());
     }
-    update_alert(
+    monitor_alerts::update_alert(
         &app,
         &state,
         &node,
@@ -846,7 +766,7 @@ async fn monitor_node_inner(
         "アクティブピアが0の状態が5分以上継続しています。",
     )
     .await?;
-    update_alert(
+    monitor_alerts::update_alert(
         &app,
         &state,
         &node,
@@ -867,7 +787,7 @@ async fn monitor_node_inner(
         } else {
             "warning"
         };
-        update_alert(
+        monitor_alerts::update_alert(
             &app,
             &state,
             &node,
@@ -878,11 +798,12 @@ async fn monitor_node_inner(
         )
         .await?;
     }
-    let node_certificate_severity = certificate_expiry_severity(node_certificate_remaining_days);
+    let node_certificate_severity =
+        monitor_alerts::certificate_expiry_severity(node_certificate_remaining_days);
     let node_certificate_message = node_certificate_remaining_days
-        .map(node_certificate_message)
+        .map(monitor_alerts::node_certificate_message)
         .unwrap_or_else(|| "ノード証明書期限を確認できません。".into());
-    update_alert(
+    monitor_alerts::update_alert(
         &app,
         &state,
         &node,
@@ -892,11 +813,12 @@ async fn monitor_node_inner(
         &node_certificate_message,
     )
     .await?;
-    let voting_key_severity = certificate_expiry_severity(voting_key_remaining_epochs);
+    let voting_key_severity =
+        monitor_alerts::certificate_expiry_severity(voting_key_remaining_epochs);
     let voting_key_message = voting_key_remaining_epochs
-        .map(voting_key_message)
+        .map(monitor_alerts::voting_key_message)
         .unwrap_or_else(|| "投票キー期限を確認できません。".into());
-    update_alert(
+    monitor_alerts::update_alert(
         &app,
         &state,
         &node,
@@ -908,14 +830,17 @@ async fn monitor_node_inner(
     .await?;
     if supernode_alert_evaluated {
         let supernode_failed = supernode_checks_passed == Some(false);
-        update_alert(
+        monitor_alerts::update_alert(
             &app,
             &state,
             &node,
             supernode_failed,
             "supernode_check_failed",
             "warning",
-            &supernode_failure_message(supernode_last_round, &supernode_failed_checks),
+            &monitor_alerts::supernode_failure_message(
+                supernode_last_round,
+                &supernode_failed_checks,
+            ),
         )
         .await?;
     }
@@ -1042,7 +967,7 @@ async fn compare_state_hashes(app: AppHandle, state: AppState) -> AppResult<()> 
             *counter
         };
         for (node, _) in members {
-            update_alert(
+            monitor_alerts::update_alert(
                 &app,
                 &state,
                 &node,
@@ -1140,15 +1065,6 @@ mod tests {
     fn connection_failures_are_not_latency_samples() {
         assert!(!latency_sample_is_slow(false, 5_000, 2_000));
         assert!(latency_sample_is_slow(true, 5_000, 2_000));
-    }
-
-    #[test]
-    fn certificate_expiry_thresholds_are_warning_then_critical() {
-        assert_eq!(certificate_expiry_severity(Some(31)), None);
-        assert_eq!(certificate_expiry_severity(Some(30)), Some("warning"));
-        assert_eq!(certificate_expiry_severity(Some(7)), Some("critical"));
-        assert_eq!(certificate_expiry_severity(Some(-1)), Some("critical"));
-        assert_eq!(certificate_expiry_severity(None), None);
     }
 
     #[test]
