@@ -36,6 +36,13 @@ export interface NodeSummary {
   finalizationEpoch: number | null;
   votingKeyRemainingEpochs: number | null;
   certificateMetricError: string | null;
+  supernodeId: number | null;
+  supernodeStatus: string | null;
+  supernodeLastRound: number | null;
+  supernodeLastRoundAt: number | null;
+  supernodeChecksPassed: boolean | null;
+  supernodeFailedChecks: string[];
+  supernodeMetricError: string | null;
 }
 
 export interface DashboardData {
@@ -149,6 +156,8 @@ export interface MetricPoint {
   totalBalanceMicroXym: string | null;
   nodeCertificateRemainingDays: number | null;
   votingKeyRemainingEpochs: number | null;
+  supernodeChecksPassed: boolean | null;
+  supernodeLastRound: number | null;
 }
 
 export interface AlertRecord {

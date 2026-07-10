@@ -4,7 +4,7 @@ use crate::error::AppResult;
 
 use super::{
     CertificateSnapshot, ChainSnapshot, HarvestSnapshot, HealthSnapshot, NodeIdentity, PeerInfo,
-    WebSocketSpec,
+    SupernodeProgramNode, SupernodeSnapshot, WebSocketSpec,
 };
 
 #[async_trait]
@@ -18,6 +18,12 @@ pub trait NodeAdapter: Send + Sync {
     }
     async fn fetch_certificate_metrics(&self) -> AppResult<CertificateSnapshot> {
         Ok(CertificateSnapshot::default())
+    }
+    async fn fetch_supernode_metrics(
+        &self,
+        _supernodes: &[SupernodeProgramNode],
+    ) -> AppResult<SupernodeSnapshot> {
+        Ok(SupernodeSnapshot::default())
     }
     async fn fetch_static_info(&self) -> AppResult<NodeIdentity> {
         self.probe().await

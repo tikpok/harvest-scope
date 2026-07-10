@@ -10,7 +10,7 @@ use reqwest::Client;
 use tokio::sync::{Mutex, RwLock, Semaphore};
 
 use crate::{
-    domain::{AppSettings, ChainSnapshot, NetworkEvent, PeerInfo},
+    domain::{AppSettings, ChainSnapshot, NetworkEvent, PeerInfo, SupernodeListCache},
     storage::Repository,
 };
 
@@ -24,6 +24,7 @@ pub struct NodeRuntime {
     pub last_chain_poll: i64,
     pub last_peer_poll: i64,
     pub last_static_poll: i64,
+    pub last_supernode_poll: i64,
     pub chain: ChainSnapshot,
     pub peers: Vec<PeerInfo>,
     pub websocket_connected: bool,
@@ -67,6 +68,7 @@ pub struct AppState {
     pub system_suspended: Arc<AtomicBool>,
     pub all_nodes_rechecking: Arc<AtomicBool>,
     pub all_nodes_refresh_lock: Arc<Mutex<()>>,
+    pub supernode_nodes_cache: Arc<Mutex<Option<SupernodeListCache>>>,
 }
 
 impl AppState {
@@ -90,6 +92,7 @@ impl AppState {
             system_suspended: Arc::new(AtomicBool::new(false)),
             all_nodes_rechecking: Arc::new(AtomicBool::new(false)),
             all_nodes_refresh_lock: Arc::new(Mutex::new(())),
+            supernode_nodes_cache: Arc::new(Mutex::new(None)),
         })
     }
 

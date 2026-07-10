@@ -46,6 +46,17 @@ struct CertificateMetricSnapshot {
     certificate_metric_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct SupernodeMetricSnapshot {
+    supernode_id: Option<i64>,
+    supernode_status: Option<String>,
+    supernode_last_round: Option<i64>,
+    supernode_last_round_at: Option<i64>,
+    supernode_checks_passed: Option<bool>,
+    supernode_failed_checks: Vec<String>,
+    supernode_metric_error: Option<String>,
+}
+
 fn parse_kind(value: &str) -> AppResult<NodeKind> {
     NodeKind::try_from(value).map_err(AppError::Configuration)
 }
@@ -62,6 +73,16 @@ fn parse_status(value: &str) -> NodeStatus {
 
 fn to_i64(value: Option<u64>) -> Option<i64> {
     value.and_then(|value| i64::try_from(value).ok())
+}
+
+fn bool_from_i64(value: Option<i64>) -> Option<bool> {
+    value.map(|value| value != 0)
+}
+
+fn parse_string_list(value: Option<String>) -> Vec<String> {
+    value
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default()
 }
 
 fn alert_from_row(row: &SqliteRow) -> AppResult<AlertRecord> {
@@ -182,6 +203,7 @@ impl Repository {
             None
         };
         let certificate = self.latest_certificate_metrics(&node.id).await?;
+        let supernode = self.latest_supernode_metrics(&node.id).await?;
         let summary = if let Some(row) = sample {
             NodeSummary {
                 id: node.id.clone(),
@@ -248,6 +270,33 @@ impl Repository {
                 certificate_metric_error: row
                     .try_get::<Option<String>, _>("certificate_metric_error")?
                     .or(certificate.certificate_metric_error),
+                supernode_id: row
+                    .try_get::<Option<i64>, _>("supernode_id")?
+                    .or(supernode.supernode_id),
+                supernode_status: row
+                    .try_get::<Option<String>, _>("supernode_status")?
+                    .or(supernode.supernode_status),
+                supernode_last_round: row
+                    .try_get::<Option<i64>, _>("supernode_last_round")?
+                    .or(supernode.supernode_last_round),
+                supernode_last_round_at: row
+                    .try_get::<Option<i64>, _>("supernode_last_round_at")?
+                    .or(supernode.supernode_last_round_at),
+                supernode_checks_passed: bool_from_i64(
+                    row.try_get::<Option<i64>, _>("supernode_checks_passed")?,
+                )
+                .or(supernode.supernode_checks_passed),
+                supernode_failed_checks: {
+                    let failed = parse_string_list(row.try_get("supernode_failed_checks_json")?);
+                    if failed.is_empty() {
+                        supernode.supernode_failed_checks
+                    } else {
+                        failed
+                    }
+                },
+                supernode_metric_error: row
+                    .try_get::<Option<String>, _>("supernode_metric_error")?
+                    .or(supernode.supernode_metric_error),
             }
         } else {
             NodeSummary {
@@ -281,6 +330,13 @@ impl Repository {
                 finalization_epoch: certificate.finalization_epoch,
                 voting_key_remaining_epochs: certificate.voting_key_remaining_epochs,
                 certificate_metric_error: certificate.certificate_metric_error,
+                supernode_id: supernode.supernode_id,
+                supernode_status: supernode.supernode_status,
+                supernode_last_round: supernode.supernode_last_round,
+                supernode_last_round_at: supernode.supernode_last_round_at,
+                supernode_checks_passed: supernode.supernode_checks_passed,
+                supernode_failed_checks: supernode.supernode_failed_checks,
+                supernode_metric_error: supernode.supernode_metric_error,
             }
         };
         Ok(summary)
@@ -381,9 +437,10 @@ impl Repository {
     }
 
     pub async fn save_sample(&self, node_id: &str, sample: &NodeSample) -> AppResult<()> {
+        let supernode_failed_checks = serde_json::to_string(&sample.supernode_failed_checks)?;
         sqlx::query(
-            "INSERT INTO node_samples (node_id, observed_at, reachable, status, latency_ms, height, finalized_height, network_height, lag, peer_count, chain_score, api_status, db_status, nis_status_code, last_error, delegated_harvester_count, delegated_harvester_delta, total_importance, total_balance_micro_xym, harvest_metric_error, node_certificate_not_after, node_certificate_remaining_days, voting_key_start_epoch, voting_key_end_epoch, finalization_epoch, voting_key_remaining_epochs, certificate_metric_error)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO node_samples (node_id, observed_at, reachable, status, latency_ms, height, finalized_height, network_height, lag, peer_count, chain_score, api_status, db_status, nis_status_code, last_error, delegated_harvester_count, delegated_harvester_delta, total_importance, total_balance_micro_xym, harvest_metric_error, node_certificate_not_after, node_certificate_remaining_days, voting_key_start_epoch, voting_key_end_epoch, finalization_epoch, voting_key_remaining_epochs, certificate_metric_error, supernode_id, supernode_status, supernode_last_round, supernode_last_round_at, supernode_checks_passed, supernode_failed_checks_json, supernode_metric_error)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         ).bind(node_id).bind(sample.observed_at).bind(sample.reachable as i64).bind(sample.status.as_str())
             .bind(sample.latency_ms).bind(to_i64(sample.height)).bind(to_i64(sample.finalized_height))
             .bind(to_i64(sample.network_height)).bind(to_i64(sample.lag)).bind(sample.peer_count)
@@ -393,6 +450,9 @@ impl Repository {
             .bind(sample.node_certificate_not_after).bind(sample.node_certificate_remaining_days)
             .bind(sample.voting_key_start_epoch).bind(sample.voting_key_end_epoch).bind(sample.finalization_epoch)
             .bind(sample.voting_key_remaining_epochs).bind(&sample.certificate_metric_error)
+            .bind(sample.supernode_id).bind(&sample.supernode_status).bind(sample.supernode_last_round)
+            .bind(sample.supernode_last_round_at).bind(sample.supernode_checks_passed.map(|value| if value { 1 } else { 0 }))
+            .bind(supernode_failed_checks).bind(&sample.supernode_metric_error)
             .execute(&self.pool).await?;
         Ok(())
     }
@@ -468,7 +528,10 @@ impl Repository {
         })
     }
 
-    async fn latest_certificate_metrics(&self, node_id: &str) -> AppResult<CertificateMetricSnapshot> {
+    async fn latest_certificate_metrics(
+        &self,
+        node_id: &str,
+    ) -> AppResult<CertificateMetricSnapshot> {
         let row = sqlx::query(
             "SELECT node_certificate_not_after, node_certificate_remaining_days, voting_key_start_epoch, voting_key_end_epoch, finalization_epoch, voting_key_remaining_epochs, certificate_metric_error
              FROM node_samples
@@ -523,6 +586,68 @@ impl Repository {
             finalization_epoch: row.try_get("finalization_epoch")?,
             voting_key_remaining_epochs: row.try_get("voting_key_remaining_epochs")?,
             certificate_metric_error: row.try_get("certificate_metric_error")?,
+        })
+    }
+
+    async fn latest_supernode_metrics(&self, node_id: &str) -> AppResult<SupernodeMetricSnapshot> {
+        let row = sqlx::query(
+            "SELECT supernode_id, supernode_status, supernode_last_round, supernode_last_round_at, supernode_checks_passed, supernode_failed_checks_json, supernode_metric_error
+             FROM node_samples
+             WHERE node_id = ?
+               AND (supernode_id IS NOT NULL OR supernode_status IS NOT NULL OR supernode_last_round IS NOT NULL OR supernode_checks_passed IS NOT NULL OR supernode_metric_error IS NOT NULL)
+             ORDER BY observed_at DESC
+             LIMIT 1",
+        )
+        .bind(node_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(SupernodeMetricSnapshot::default());
+        };
+        Ok(SupernodeMetricSnapshot {
+            supernode_id: row.try_get("supernode_id")?,
+            supernode_status: row.try_get("supernode_status")?,
+            supernode_last_round: row.try_get("supernode_last_round")?,
+            supernode_last_round_at: row.try_get("supernode_last_round_at")?,
+            supernode_checks_passed: bool_from_i64(row.try_get("supernode_checks_passed")?),
+            supernode_failed_checks: parse_string_list(
+                row.try_get("supernode_failed_checks_json")?,
+            ),
+            supernode_metric_error: row.try_get("supernode_metric_error")?,
+        })
+    }
+
+    async fn latest_supernode_metrics_at_or_before(
+        &self,
+        node_id: &str,
+        observed_at: i64,
+    ) -> AppResult<SupernodeMetricSnapshot> {
+        let row = sqlx::query(
+            "SELECT supernode_id, supernode_status, supernode_last_round, supernode_last_round_at, supernode_checks_passed, supernode_failed_checks_json, supernode_metric_error
+             FROM node_samples
+             WHERE node_id = ?
+               AND observed_at <= ?
+               AND (supernode_id IS NOT NULL OR supernode_status IS NOT NULL OR supernode_last_round IS NOT NULL OR supernode_checks_passed IS NOT NULL OR supernode_metric_error IS NOT NULL)
+             ORDER BY observed_at DESC
+             LIMIT 1",
+        )
+        .bind(node_id)
+        .bind(observed_at)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(SupernodeMetricSnapshot::default());
+        };
+        Ok(SupernodeMetricSnapshot {
+            supernode_id: row.try_get("supernode_id")?,
+            supernode_status: row.try_get("supernode_status")?,
+            supernode_last_round: row.try_get("supernode_last_round")?,
+            supernode_last_round_at: row.try_get("supernode_last_round_at")?,
+            supernode_checks_passed: bool_from_i64(row.try_get("supernode_checks_passed")?),
+            supernode_failed_checks: parse_string_list(
+                row.try_get("supernode_failed_checks_json")?,
+            ),
+            supernode_metric_error: row.try_get("supernode_metric_error")?,
         })
     }
 
@@ -799,6 +924,9 @@ impl Repository {
         let mut certificate = self
             .latest_certificate_metrics_at_or_before(node_id, from)
             .await?;
+        let mut supernode = self
+            .latest_supernode_metrics_at_or_before(node_id, from)
+            .await?;
         rows.into_iter()
             .map(|row| {
                 harvest.delegated_harvester_count = row
@@ -819,6 +947,12 @@ impl Repository {
                 certificate.voting_key_remaining_epochs = row
                     .try_get::<Option<i64>, _>("voting_key_remaining_epochs")?
                     .or(certificate.voting_key_remaining_epochs);
+                supernode.supernode_checks_passed =
+                    bool_from_i64(row.try_get::<Option<i64>, _>("supernode_checks_passed")?)
+                        .or(supernode.supernode_checks_passed);
+                supernode.supernode_last_round = row
+                    .try_get::<Option<i64>, _>("supernode_last_round")?
+                    .or(supernode.supernode_last_round);
                 Ok(MetricPoint {
                     observed_at: row.try_get("observed_at")?,
                     height: row
@@ -839,6 +973,8 @@ impl Repository {
                     total_balance_micro_xym: harvest.total_balance_micro_xym.clone(),
                     node_certificate_remaining_days: certificate.node_certificate_remaining_days,
                     voting_key_remaining_epochs: certificate.voting_key_remaining_epochs,
+                    supernode_checks_passed: supernode.supernode_checks_passed,
+                    supernode_last_round: supernode.supernode_last_round,
                 })
             })
             .collect()
@@ -1064,6 +1200,13 @@ mod tests {
             finalization_epoch: None,
             voting_key_remaining_epochs: None,
             certificate_metric_error: None,
+            supernode_id: None,
+            supernode_status: None,
+            supernode_last_round: None,
+            supernode_last_round_at: None,
+            supernode_checks_passed: None,
+            supernode_failed_checks: Vec::new(),
+            supernode_metric_error: None,
         }
     }
 
@@ -1219,6 +1362,12 @@ mod tests {
         harvest_sample.voting_key_end_epoch = Some(150);
         harvest_sample.finalization_epoch = Some(142);
         harvest_sample.voting_key_remaining_epochs = Some(8);
+        harvest_sample.supernode_id = Some(72052155);
+        harvest_sample.supernode_status = Some("active".into());
+        harvest_sample.supernode_last_round = Some(4956);
+        harvest_sample.supernode_last_round_at = Some(1_783_613_676_463);
+        harvest_sample.supernode_checks_passed = Some(false);
+        harvest_sample.supernode_failed_checks = vec!["bandwidth".into()];
         repository
             .save_sample("node-a", &harvest_sample)
             .await
@@ -1247,6 +1396,11 @@ mod tests {
         assert_eq!(summary.node_certificate_remaining_days, Some(12));
         assert_eq!(summary.voting_key_end_epoch, Some(150));
         assert_eq!(summary.voting_key_remaining_epochs, Some(8));
+        assert_eq!(summary.supernode_id, Some(72052155));
+        assert_eq!(summary.supernode_status.as_deref(), Some("active"));
+        assert_eq!(summary.supernode_last_round, Some(4956));
+        assert_eq!(summary.supernode_checks_passed, Some(false));
+        assert_eq!(summary.supernode_failed_checks, ["bandwidth"]);
         let metrics = repository
             .query_metrics("node-a", 1, 2)
             .await
@@ -1260,6 +1414,8 @@ mod tests {
         );
         assert_eq!(metrics[1].node_certificate_remaining_days, Some(12));
         assert_eq!(metrics[1].voting_key_remaining_epochs, Some(8));
+        assert_eq!(metrics[0].supernode_checks_passed, Some(false));
+        assert_eq!(metrics[1].supernode_last_round, Some(4956));
     }
 
     #[tokio::test]

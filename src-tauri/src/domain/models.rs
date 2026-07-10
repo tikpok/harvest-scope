@@ -105,6 +105,33 @@ pub struct CertificateSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct SupernodeProgramNode {
+    pub id: i64,
+    pub endpoint: String,
+    pub name: Option<String>,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SupernodeSnapshot {
+    pub supernode_id: Option<i64>,
+    pub supernode_status: Option<String>,
+    pub supernode_last_round: Option<i64>,
+    pub supernode_last_round_at: Option<i64>,
+    pub supernode_checks_passed: Option<bool>,
+    pub supernode_failed_checks: Vec<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SupernodeListCache {
+    pub observed_at: i64,
+    pub nodes: Vec<SupernodeProgramNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct PeerInfo {
     pub key: String,
     pub name: Option<String>,
@@ -213,6 +240,13 @@ pub struct NodeSummary {
     pub finalization_epoch: Option<i64>,
     pub voting_key_remaining_epochs: Option<i64>,
     pub certificate_metric_error: Option<String>,
+    pub supernode_id: Option<i64>,
+    pub supernode_status: Option<String>,
+    pub supernode_last_round: Option<i64>,
+    pub supernode_last_round_at: Option<i64>,
+    pub supernode_checks_passed: Option<bool>,
+    pub supernode_failed_checks: Vec<String>,
+    pub supernode_metric_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -288,6 +322,13 @@ pub struct NodeSample {
     pub finalization_epoch: Option<i64>,
     pub voting_key_remaining_epochs: Option<i64>,
     pub certificate_metric_error: Option<String>,
+    pub supernode_id: Option<i64>,
+    pub supernode_status: Option<String>,
+    pub supernode_last_round: Option<i64>,
+    pub supernode_last_round_at: Option<i64>,
+    pub supernode_checks_passed: Option<bool>,
+    pub supernode_failed_checks: Vec<String>,
+    pub supernode_metric_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -306,6 +347,8 @@ pub struct MetricPoint {
     pub total_balance_micro_xym: Option<String>,
     pub node_certificate_remaining_days: Option<i64>,
     pub voting_key_remaining_epochs: Option<i64>,
+    pub supernode_checks_passed: Option<bool>,
+    pub supernode_last_round: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

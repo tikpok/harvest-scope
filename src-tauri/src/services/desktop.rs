@@ -301,6 +301,13 @@ mod tests {
             finalization_epoch: None,
             voting_key_remaining_epochs: None,
             certificate_metric_error: None,
+            supernode_id: None,
+            supernode_status: None,
+            supernode_last_round: None,
+            supernode_last_round_at: None,
+            supernode_checks_passed: None,
+            supernode_failed_checks: Vec::new(),
+            supernode_metric_error: None,
         }
     }
 

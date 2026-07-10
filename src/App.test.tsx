@@ -19,9 +19,13 @@ vi.mock("./services/ipc", async () => {
       recentNetworkEvents: vi.fn().mockResolvedValue([]),
       recentHarvestEvents: vi.fn().mockResolvedValue([]),
       refreshAllNodes: vi.fn().mockResolvedValue(undefined),
+      refreshNode: vi.fn().mockResolvedValue(undefined),
       moveNode: vi.fn().mockResolvedValue(undefined),
       deleteNode: vi.fn().mockResolvedValue(undefined),
       upsertNode: vi.fn(),
+      nodeDetail: vi.fn(),
+      metrics: vi.fn().mockResolvedValue([]),
+      setNodeHarvestMetricsVisible: vi.fn().mockResolvedValue(undefined),
       alerts: vi.fn().mockResolvedValue([]),
       alert: vi.fn(),
       nodeDiagnostics: vi.fn().mockResolvedValue([]),
@@ -78,6 +82,13 @@ function node(id: string, displayName: string): NodeSummary {
     finalizationEpoch: null,
     votingKeyRemainingEpochs: null,
     certificateMetricError: null,
+    supernodeId: null,
+    supernodeStatus: null,
+    supernodeLastRound: null,
+    supernodeLastRoundAt: null,
+    supernodeChecksPassed: null,
+    supernodeFailedChecks: [],
+    supernodeMetricError: null,
   };
 }
 
@@ -146,8 +157,12 @@ beforeEach(() => {
   vi.mocked(api.recentHarvestEvents).mockResolvedValue([]);
   vi.mocked(api.moveNode).mockResolvedValue(undefined);
   vi.mocked(api.deleteNode).mockResolvedValue(undefined);
+  vi.mocked(api.refreshNode).mockResolvedValue(undefined);
   vi.mocked(api.refreshAllNodes).mockResolvedValue(undefined);
   vi.mocked(api.upsertNode).mockReset();
+  vi.mocked(api.nodeDetail).mockReset();
+  vi.mocked(api.metrics).mockResolvedValue([]);
+  vi.mocked(api.setNodeHarvestMetricsVisible).mockResolvedValue(undefined);
   vi.mocked(api.settings).mockResolvedValue({ ...defaultSettings, onboardingCompleted: true });
   vi.mocked(api.nodeDiagnostics).mockResolvedValue([]);
   vi.mocked(api.takePendingNavigation).mockResolvedValue(null);
@@ -233,6 +248,42 @@ test("全ノードを手動で再確認できる", async () => {
 
   await waitFor(() => expect(api.refreshAllNodes).toHaveBeenCalledOnce());
   expect(await screen.findByText("再確認中")).toBeInTheDocument();
+});
+
+test("NIS1詳細でSupernodeプログラムの失敗項目を表示する", async () => {
+  const nisNode = {
+    ...node("nem-1", "NEM Supernode"),
+    kind: "nis1" as const,
+    baseUrl: "http://xem35.ucanfork.duckdns.org:7890",
+    network: "NEM Mainnet",
+    finalizedHeight: null,
+    supernodeId: 72052155,
+    supernodeStatus: "active",
+    supernodeLastRound: 4955,
+    supernodeLastRoundAt: 1_783_592_659_998,
+    supernodeChecksPassed: false,
+    supernodeFailedChecks: ["bandwidth"],
+  };
+  vi.mocked(api.nodeDetail).mockResolvedValue({
+    node: nisNode,
+    publicKey: "ABC",
+    roles: ["NIS"],
+    restVersion: "0.6.102",
+    chainScore: "123",
+    apiStatus: null,
+    dbStatus: null,
+    nisStatusCode: 6,
+    peers: [],
+    websocketConnected: false,
+    recentHarvests: [],
+  });
+  renderApp("/nodes/nem-1");
+
+  expect(await screen.findByRole("heading", { name: "Supernodeプログラム" })).toBeInTheDocument();
+  expect(screen.getByText("72052155")).toBeInTheDocument();
+  expect(screen.getByText("4955")).toBeInTheDocument();
+  expect(screen.getByText("失敗")).toBeInTheDocument();
+  expect(screen.getByText("帯域")).toBeInTheDocument();
 });
 
 test("確認後に一覧からノードの登録を解除できる", async () => {

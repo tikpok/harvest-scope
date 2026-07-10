@@ -88,6 +88,35 @@ function formatEpochs(value: number | null) {
   return `${value} epoch`;
 }
 
+const supernodeCheckLabels: Record<string, string> = {
+  balance: "残高",
+  bandwidth: "帯域",
+  chainHeight: "チェーン高",
+  chainPart: "チェーン一致",
+  computingPower: "計算性能",
+  ping: "Ping",
+  responsiveness: "応答性",
+  version: "バージョン",
+};
+
+function supernodeLabel(passed: boolean | null, status: string | null) {
+  if (passed === true) return "SN OK";
+  if (passed === false) return "SN NG";
+  if (status === "not_found") return "SN —";
+  return "SN —";
+}
+
+function supernodeClass(passed: boolean | null, status: string | null) {
+  if (passed === true) return "supernode-chip--ok";
+  if (passed === false) return "supernode-chip--ng";
+  if (status === "not_found") return "supernode-chip--muted";
+  return "supernode-chip--muted";
+}
+
+function formatFailedChecks(values: string[]) {
+  return values.length ? values.map((value) => supernodeCheckLabels[value] ?? value).join(" / ") : "—";
+}
+
 function shortKey(value: string | null | undefined) {
   return value ? `${value.slice(0, 6)}…${value.slice(-6)}` : "—";
 }
@@ -284,7 +313,7 @@ function DashboardPage() {
           <div className="table-wrap"><table className="node-table">
             <thead><tr><th>ノード</th><th>種別</th><th>状態</th><th>チェーン高</th><th>ファイナライズ高</th><th>遅延</th><th>ピア</th><th>REST</th><th>最終確認</th><th aria-label="操作" /></tr></thead>
             <tbody>{nodes.map((node, index) => <tr key={node.id} className="clickable" onClick={() => navigate(`/nodes/${node.id}`)}>
-              <td className="node-table__node" title={`${node.displayName}\n${node.baseUrl}`}><strong>{node.displayName}</strong><small>{node.baseUrl}</small>{node.showHarvestMetrics && node.kind === "symbol" && <div className="harvest-chips"><span><Cherry size={12} />{node.delegatedHarvesterCount ?? "—"}</span><span className={node.delegatedHarvesterDelta && node.delegatedHarvesterDelta !== 0 ? (node.delegatedHarvesterDelta > 0 ? "text-good" : "text-warn") : undefined}>{formatDelta(node.delegatedHarvesterDelta)}</span><span>{formatXym(node.totalBalanceMicroXym)}</span></div>}</td>
+              <td className="node-table__node" title={`${node.displayName}\n${node.baseUrl}`}><strong>{node.displayName}</strong><small>{node.baseUrl}</small>{node.showHarvestMetrics && node.kind === "symbol" && <div className="harvest-chips"><span><Cherry size={12} />{node.delegatedHarvesterCount ?? "—"}</span><span className={node.delegatedHarvesterDelta && node.delegatedHarvesterDelta !== 0 ? (node.delegatedHarvesterDelta > 0 ? "text-good" : "text-warn") : undefined}>{formatDelta(node.delegatedHarvesterDelta)}</span><span>{formatXym(node.totalBalanceMicroXym)}</span></div>}{node.kind === "nis1" && <div className="supernode-chips"><span className={`supernode-chip ${supernodeClass(node.supernodeChecksPassed, node.supernodeStatus)}`}>{supernodeLabel(node.supernodeChecksPassed, node.supernodeStatus)}</span>{node.supernodeLastRound != null && <span>#{node.supernodeLastRound}</span>}</div>}</td>
               <td><span className={`kind kind--${node.kind}`}>{node.kind === "symbol" ? "Symbol" : "NIS1"}</span></td>
               <td><StatusBadge status={isRechecking ? "unknown" : node.status} label={isRechecking ? "再確認中" : undefined} /></td><td className="mono">{node.height ?? "—"}</td><td className="mono">{node.finalizedHeight ?? "—"}</td><td>{node.lag ?? "—"}</td><td>{node.peerCount ?? "—"}</td><td>{formatLatency(node.latencyMs)}</td><td>{formatTime(node.lastSeenAt)}</td>
               <td><div className="row-actions">
@@ -354,9 +383,10 @@ function NodeDetailPage() {
       <article className="panel detail-card"><h3>接続</h3><dl><div><dt>REST応答</dt><dd>{formatLatency(data.node.latencyMs)}</dd></div><div><dt>ピア</dt><dd>{data.node.peerCount ?? "—"}</dd></div><div><dt>API / DB</dt><dd>{[data.apiStatus, data.dbStatus].filter(Boolean).join(" / ") || "—"}</dd></div><div><dt>WebSocket</dt><dd>{data.node.kind === "symbol" ? (data.websocketConnected ? "接続中" : "RESTへフォールバック") : "対象外"}</dd></div></dl></article>
       <article className="panel detail-card certificate-card"><h3>証明書</h3>{data.node.kind !== "symbol" ? <p className="harvest-empty">Symbolノードのみ対象です。</p> : <><dl><div><dt>ノード証明書</dt><dd>{formatTime(data.node.nodeCertificateNotAfter)}</dd></div><div><dt>残り日数</dt><dd className={data.node.nodeCertificateRemainingDays != null && data.node.nodeCertificateRemainingDays <= 7 ? "text-warn" : undefined}>{formatDays(data.node.nodeCertificateRemainingDays)}</dd></div><div><dt>投票キー範囲</dt><dd>{data.node.votingKeyStartEpoch != null || data.node.votingKeyEndEpoch != null ? `${data.node.votingKeyStartEpoch ?? "—"} - ${data.node.votingKeyEndEpoch ?? "—"}` : "—"}</dd></div><div><dt>残りepoch</dt><dd className={data.node.votingKeyRemainingEpochs != null && data.node.votingKeyRemainingEpochs <= 7 ? "text-warn" : undefined}>{formatEpochs(data.node.votingKeyRemainingEpochs)}</dd></div><div><dt>現在epoch</dt><dd>{data.node.finalizationEpoch ?? "—"}</dd></div></dl>{data.node.certificateMetricError && <p className="harvest-error">取得エラー: {data.node.certificateMetricError}</p>}</>}</article>
       <article className="panel detail-card harvest-card"><div className="detail-card__heading"><h3>委任ハーベスト</h3>{data.node.kind === "symbol" && <label className="mini-toggle"><input type="checkbox" checked={data.node.showHarvestMetrics} disabled={toggleHarvest.isPending} onChange={(event) => toggleHarvest.mutate(event.target.checked)} />表示</label>}</div>{data.node.kind !== "symbol" ? <p className="harvest-empty">Symbolノードのみ対象です。</p> : data.node.showHarvestMetrics ? <><dl><div><dt>委任者数</dt><dd>{data.node.delegatedHarvesterCount ?? "—"}</dd></div><div><dt>24時間増減</dt><dd>{formatDelta(data.node.delegatedHarvesterDelta)}</dd></div><div><dt>合計XYM</dt><dd>{formatXym(data.node.totalBalanceMicroXym)}</dd></div><div><dt>最新検知</dt><dd>{formatTime(data.node.latestHarvestAt)}</dd></div></dl>{data.node.harvestMetricError && <p className="harvest-error">取得エラー: {data.node.harvestMetricError}</p>}<HarvestEventList events={data.recentHarvests} /></> : <p className="harvest-empty">表示をONにすると委任ハーベスト情報を表示します。</p>}</article>
+      <article className="panel detail-card supernode-card"><h3>Supernodeプログラム</h3>{data.node.kind !== "nis1" ? <p className="harvest-empty">NIS1ノードのみ対象です。</p> : data.node.supernodeStatus === "not_found" ? <p className="harvest-empty">Supernode対象リストに見つかりません。</p> : <><dl><div><dt>対象ID</dt><dd>{data.node.supernodeId ?? "—"}</dd></div><div><dt>状態</dt><dd>{data.node.supernodeStatus ?? "—"}</dd></div><div><dt>最新ラウンド</dt><dd>{data.node.supernodeLastRound ?? "—"}</dd></div><div><dt>最終チェック</dt><dd>{formatTime(data.node.supernodeLastRoundAt)}</dd></div><div><dt>総合合否</dt><dd className={data.node.supernodeChecksPassed === false ? "text-warn" : data.node.supernodeChecksPassed === true ? "text-good" : undefined}>{data.node.supernodeChecksPassed == null ? "—" : data.node.supernodeChecksPassed ? "合格" : "失敗"}</dd></div><div><dt>失敗項目</dt><dd>{formatFailedChecks(data.node.supernodeFailedChecks)}</dd></div></dl>{data.node.supernodeMetricError && <p className="harvest-error">取得エラー: {data.node.supernodeMetricError}</p>}</>}</article>
     </section>
     <DiagnosticPanel latest={diagnose.data ?? diagnostics[0]} history={diagnostics} isPending={diagnose.isPending} error={diagnose.error} onRun={() => diagnose.mutate()} />
-    <section className="panel"><div className="panel__header"><div><h2>監視期間メトリクス</h2><p>REST応答、ピア数、同期遅延、委任ハーベスト</p></div><button className="button" onClick={() => api.exportCsv("metrics", nodeId)}><Download size={16} />CSV</button></div>{metrics.length ? <MetricChart data={metrics} showHarvestMetrics={data.node.showHarvestMetrics} /> : <EmptyState title="履歴を収集中">最初の監視サンプルが保存されるとグラフが表示されます。</EmptyState>}</section>
+    <section className="panel"><div className="panel__header"><div><h2>監視期間メトリクス</h2><p>REST応答、ピア数、同期遅延、委任ハーベスト、Supernode合否</p></div><button className="button" onClick={() => api.exportCsv("metrics", nodeId)}><Download size={16} />CSV</button></div>{metrics.length ? <MetricChart data={metrics} showHarvestMetrics={data.node.showHarvestMetrics} showSupernodeMetrics={data.node.kind === "nis1"} /> : <EmptyState title="履歴を収集中">最初の監視サンプルが保存されるとグラフが表示されます。</EmptyState>}</section>
     <section className="panel"><div className="panel__header"><div><h2>現在のピア</h2><p>{data.peers.length}件</p></div></div>{data.peers.length ? <div className="table-wrap"><table><thead><tr><th>名前</th><th>ホスト</th><th>ポート</th><th>状態</th><th>バージョン</th></tr></thead><tbody>{data.peers.map((peer) => <tr key={peer.key}><td>{peer.name ?? "—"}</td><td>{peer.host ?? "—"}</td><td>{peer.port ?? "—"}</td><td>{peer.status}</td><td>{peer.version ?? "—"}</td></tr>)}</tbody></table></div> : <EmptyState title="ピア情報がありません">次回のピアポーリング後に表示されます。</EmptyState>}</section>
   </>;
 }

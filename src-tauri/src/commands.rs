@@ -325,6 +325,13 @@ async fn upsert_node_from_input(
             finalization_epoch: None,
             voting_key_remaining_epochs: None,
             certificate_metric_error: None,
+            supernode_id: None,
+            supernode_status: None,
+            supernode_last_round: None,
+            supernode_last_round_at: None,
+            supernode_checks_passed: None,
+            supernode_failed_checks: Vec::new(),
+            supernode_metric_error: None,
         },
         Err(error) => NodeSample {
             observed_at,
@@ -353,6 +360,13 @@ async fn upsert_node_from_input(
             finalization_epoch: None,
             voting_key_remaining_epochs: None,
             certificate_metric_error: None,
+            supernode_id: None,
+            supernode_status: None,
+            supernode_last_round: None,
+            supernode_last_round_at: None,
+            supernode_checks_passed: None,
+            supernode_failed_checks: Vec::new(),
+            supernode_metric_error: None,
         },
     };
     state
@@ -828,6 +842,13 @@ pub async fn export_csv(
                 "投票キー終了epoch".into(),
                 "投票キー残epoch".into(),
                 "証明書取得エラー".into(),
+                "Supernode ID".into(),
+                "Supernode状態".into(),
+                "Supernode最新ラウンド".into(),
+                "Supernode最終確認UTCms".into(),
+                "Supernode合格".into(),
+                "Supernode失敗項目".into(),
+                "Supernode取得エラー".into(),
             ]];
             rows.extend(
                 state
@@ -867,6 +888,21 @@ pub async fn export_csv(
                                 .map(|value| value.to_string())
                                 .unwrap_or_default(),
                             node.certificate_metric_error.unwrap_or_default(),
+                            node.supernode_id
+                                .map(|value| value.to_string())
+                                .unwrap_or_default(),
+                            node.supernode_status.unwrap_or_default(),
+                            node.supernode_last_round
+                                .map(|value| value.to_string())
+                                .unwrap_or_default(),
+                            node.supernode_last_round_at
+                                .map(|value| value.to_string())
+                                .unwrap_or_default(),
+                            node.supernode_checks_passed
+                                .map(|value| value.to_string())
+                                .unwrap_or_default(),
+                            node.supernode_failed_checks.join("|"),
+                            node.supernode_metric_error.unwrap_or_default(),
                         ]
                     }),
             );
@@ -920,6 +956,8 @@ pub async fn export_csv(
                 "合計importance".into(),
                 "ノード証明書残日数".into(),
                 "投票キー残epoch".into(),
+                "Supernode合格".into(),
+                "Supernode最新ラウンド".into(),
             ]];
             let metrics = state
                 .repository
@@ -956,6 +994,14 @@ pub async fn export_csv(
                         .unwrap_or_default(),
                     point
                         .voting_key_remaining_epochs
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                    point
+                        .supernode_checks_passed
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                    point
+                        .supernode_last_round
                         .map(|value| value.to_string())
                         .unwrap_or_default(),
                 ]

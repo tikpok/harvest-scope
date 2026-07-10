@@ -7,8 +7,8 @@ use rand::Rng;
 use tauri::{AppHandle, Emitter};
 
 use crate::{
-    adapters::adapter_for,
-    domain::{NetworkEvent, NodeKind, NodeSample, NodeStatus, StoredNode},
+    adapters::{adapter_for, Nis1Adapter},
+    domain::{NetworkEvent, NodeKind, NodeSample, NodeStatus, StoredNode, SupernodeProgramNode},
     error::{AppError, AppResult},
     state::AppState,
 };
@@ -18,6 +18,8 @@ use super::{desktop, websocket};
 const RESUME_LATE_THRESHOLD_MS: i64 = 15_000;
 const RESUME_GRACE_MS: i64 = 90_000;
 const SUSPENDED_REQUEST_THRESHOLD: Duration = Duration::from_secs(10);
+const SUPERNODE_INTERVAL_MS: i64 = 15 * 60 * 1_000;
+const SUPERNODE_CACHE_MS: i64 = 10 * 60 * 1_000;
 
 fn wake_was_late(expected_at: i64, actual_at: i64) -> bool {
     actual_at.saturating_sub(expected_at) >= RESUME_LATE_THRESHOLD_MS
@@ -53,6 +55,36 @@ fn voting_key_message(epochs: i64) -> String {
     } else {
         format!("投票キーの有効期限まで残り{epochs} epochです。")
     }
+}
+
+fn supernode_failure_message(round: Option<i64>, failed_checks: &[String]) -> String {
+    let round = round
+        .map(|value| format!("ラウンド{value}"))
+        .unwrap_or_else(|| "最新ラウンド".into());
+    if failed_checks.is_empty() {
+        format!("NEM Supernodeの{round}でチェックに失敗しました。")
+    } else {
+        format!(
+            "NEM Supernodeの{round}で{}に失敗しました。",
+            failed_checks.join(", ")
+        )
+    }
+}
+
+async fn supernode_nodes(state: &AppState, now: i64) -> AppResult<Vec<SupernodeProgramNode>> {
+    let mut cache = state.supernode_nodes_cache.lock().await;
+    if let Some(cache) = cache
+        .as_ref()
+        .filter(|cache| now.saturating_sub(cache.observed_at) <= SUPERNODE_CACHE_MS)
+    {
+        return Ok(cache.nodes.clone());
+    }
+    let nodes = Nis1Adapter::fetch_supernode_nodes(&state.client).await?;
+    *cache = Some(crate::domain::SupernodeListCache {
+        observed_at: now,
+        nodes: nodes.clone(),
+    });
+    Ok(nodes)
 }
 
 async fn enter_resume_grace(state: &AppState, now: i64, reason: &str) {
@@ -284,6 +316,34 @@ async fn monitor_node_inner(
             Err(err) => certificate_metric_error = Some(err.to_string()),
         }
     }
+    let supernode_due = force || now - runtime.last_supernode_poll >= SUPERNODE_INTERVAL_MS;
+    let mut supernode_id = None;
+    let mut supernode_status = None;
+    let mut supernode_last_round = None;
+    let mut supernode_last_round_at = None;
+    let mut supernode_checks_passed = None;
+    let mut supernode_failed_checks = Vec::new();
+    let mut supernode_metric_error = None;
+    let mut supernode_alert_evaluated = false;
+    if node.kind == NodeKind::Nis1 && health.is_some() && supernode_due {
+        match supernode_nodes(&state, now).await {
+            Ok(nodes) => match adapter.fetch_supernode_metrics(&nodes).await {
+                Ok(snapshot) => {
+                    supernode_alert_evaluated = snapshot.error.is_none();
+                    supernode_id = snapshot.supernode_id;
+                    supernode_status = snapshot.supernode_status;
+                    supernode_last_round = snapshot.supernode_last_round;
+                    supernode_last_round_at = snapshot.supernode_last_round_at;
+                    supernode_checks_passed = snapshot.supernode_checks_passed;
+                    supernode_failed_checks = snapshot.supernode_failed_checks;
+                    supernode_metric_error = snapshot.error;
+                    runtime.last_supernode_poll = now;
+                }
+                Err(err) => supernode_metric_error = Some(err.to_string()),
+            },
+            Err(err) => supernode_metric_error = Some(err.to_string()),
+        }
+    }
     if health.is_some() && static_due {
         if let Ok(identity) = adapter.fetch_static_info().await {
             match state
@@ -340,7 +400,10 @@ async fn monitor_node_inner(
         NodeStatus::Warning
     } else if lag_critical_active {
         NodeStatus::Critical
-    } else if lag_warning_active || latency_ms as u64 >= settings.latency_warning_ms {
+    } else if lag_warning_active
+        || latency_ms as u64 >= settings.latency_warning_ms
+        || supernode_checks_passed == Some(false)
+    {
         NodeStatus::Warning
     } else {
         NodeStatus::Healthy
@@ -435,6 +498,13 @@ async fn monitor_node_inner(
         finalization_epoch,
         voting_key_remaining_epochs,
         certificate_metric_error,
+        supernode_id,
+        supernode_status,
+        supernode_last_round,
+        supernode_last_round_at,
+        supernode_checks_passed,
+        supernode_failed_checks: supernode_failed_checks.clone(),
+        supernode_metric_error,
     };
     state.repository.save_sample(&node.id, &sample).await?;
     // Power events can arrive while a request or database write is in flight.
@@ -536,8 +606,7 @@ async fn monitor_node_inner(
         )
         .await?;
     }
-    let node_certificate_severity =
-        certificate_expiry_severity(node_certificate_remaining_days);
+    let node_certificate_severity = certificate_expiry_severity(node_certificate_remaining_days);
     let node_certificate_message = node_certificate_remaining_days
         .map(node_certificate_message)
         .unwrap_or_else(|| "ノード証明書期限を確認できません。".into());
@@ -565,6 +634,19 @@ async fn monitor_node_inner(
         &voting_key_message,
     )
     .await?;
+    if supernode_alert_evaluated {
+        let supernode_failed = supernode_checks_passed == Some(false);
+        update_alert(
+            &app,
+            &state,
+            &node,
+            supernode_failed,
+            "supernode_check_failed",
+            "warning",
+            &supernode_failure_message(supernode_last_round, &supernode_failed_checks),
+        )
+        .await?;
+    }
     let _ = app.emit("node-updated", &node.id);
     desktop::refresh_tray(&app, &state).await;
     Ok(())

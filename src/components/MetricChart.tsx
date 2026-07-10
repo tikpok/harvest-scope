@@ -17,13 +17,22 @@ function microXymToWholeNumber(value: string | null) {
   }
 }
 
-export function MetricChart({ data, showHarvestMetrics = true }: { data: MetricPoint[]; showHarvestMetrics?: boolean }) {
+export function MetricChart({
+  data,
+  showHarvestMetrics = true,
+  showSupernodeMetrics = false,
+}: {
+  data: MetricPoint[];
+  showHarvestMetrics?: boolean;
+  showSupernodeMetrics?: boolean;
+}) {
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!ref.current) return;
     const chart = echarts.init(ref.current);
     const harvestLegend = showHarvestMetrics ? ["委任者", "合計XYM"] : [];
+    const supernodeLegend = showSupernodeMetrics ? ["Supernode合否"] : [];
     const harvestSeries = showHarvestMetrics
       ? [
           {
@@ -45,13 +54,28 @@ export function MetricChart({ data, showHarvestMetrics = true }: { data: MetricP
           },
         ]
       : [];
+    const supernodeAxisIndex = showHarvestMetrics ? 4 : 2;
+    const supernodeSeries = showSupernodeMetrics
+      ? [
+          {
+            name: "Supernode合否",
+            type: "line",
+            yAxisIndex: supernodeAxisIndex,
+            step: "end",
+            showSymbol: true,
+            symbolSize: 6,
+            lineStyle: { color: "#8de5a1", width: 2 },
+            data: data.map((point) => [point.observedAt, point.supernodeChecksPassed == null ? null : point.supernodeChecksPassed ? 1 : 0]),
+          },
+        ]
+      : [];
     chart.setOption({
       backgroundColor: "transparent",
-      color: showHarvestMetrics ? ["#55d6be", "#73a9ff", "#ffca5c", "#d58cff", "#ff8fb3"] : ["#55d6be", "#73a9ff", "#ffca5c"],
+      color: ["#55d6be", "#73a9ff", "#ffca5c", "#d58cff", "#ff8fb3", "#8de5a1"],
       animationDuration: 350,
       tooltip: { trigger: "axis" },
-      legend: { textStyle: { color: "#91a3b8" }, data: ["REST応答", "ピア数", "同期遅延", ...harvestLegend] },
-      grid: { left: 52, right: showHarvestMetrics ? 82 : 32, top: 46, bottom: 42 },
+      legend: { textStyle: { color: "#91a3b8" }, data: ["REST応答", "ピア数", "同期遅延", ...harvestLegend, ...supernodeLegend] },
+      grid: { left: 52, right: showHarvestMetrics || showSupernodeMetrics ? 82 : 32, top: 46, bottom: 42 },
       xAxis: {
         type: "time",
         axisLabel: { color: "#91a3b8" },
@@ -77,6 +101,18 @@ export function MetricChart({ data, showHarvestMetrics = true }: { data: MetricP
             type: "value",
             show: false,
             scale: true,
+            splitLine: { show: false },
+          },
+        ] : []),
+        ...(showSupernodeMetrics ? [
+          {
+            type: "value",
+            name: "SN",
+            position: "right",
+            min: 0,
+            max: 1,
+            interval: 1,
+            axisLabel: { color: "#8de5a1", formatter: (value: number) => value === 1 ? "OK" : "NG" },
             splitLine: { show: false },
           },
         ] : []),
@@ -108,6 +144,7 @@ export function MetricChart({ data, showHarvestMetrics = true }: { data: MetricP
           data: data.map((point) => [point.observedAt, point.lag ? Number(point.lag) : null]),
         },
         ...harvestSeries,
+        ...supernodeSeries,
       ],
     });
     const resize = new ResizeObserver(() => chart.resize());
@@ -116,7 +153,7 @@ export function MetricChart({ data, showHarvestMetrics = true }: { data: MetricP
       resize.disconnect();
       chart.dispose();
     };
-  }, [data, showHarvestMetrics]);
+  }, [data, showHarvestMetrics, showSupernodeMetrics]);
 
   return <div ref={ref} className="chart" role="img" aria-label="ノードメトリクスの時系列グラフ" />;
 }

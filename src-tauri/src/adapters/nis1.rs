@@ -1,17 +1,51 @@
 use async_trait::async_trait;
 use reqwest::Client;
+use serde::Deserialize;
 use serde_json::Value;
+use url::Url;
 
 use crate::{
-    domain::{ChainSnapshot, HealthSnapshot, NodeAdapter, NodeIdentity, NodeKind, PeerInfo},
+    domain::{
+        ChainSnapshot, HealthSnapshot, NodeAdapter, NodeIdentity, NodeKind, PeerInfo,
+        SupernodeProgramNode, SupernodeSnapshot,
+    },
     error::{AppError, AppResult},
 };
 
 use super::{string_value, u64_value};
 
+const SUPERNODE_API_BASE: &str = "https://nem.io/supernode/api";
+const SUPERNODE_PAGE_SIZE: usize = 100;
+const SUPERNODE_TEST_KEYS: &[&str] = &[
+    "balance",
+    "bandwidth",
+    "chainHeight",
+    "chainPart",
+    "computingPower",
+    "ping",
+    "responsiveness",
+    "version",
+];
+
 pub struct Nis1Adapter {
     base_url: String,
     client: Client,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SupernodeInfo {
+    last_results_round: Option<i64>,
+    status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SupernodeRoundResult {
+    round_id: i64,
+    timestamp: Option<String>,
+    #[serde(flatten)]
+    checks: std::collections::HashMap<String, bool>,
 }
 
 impl Nis1Adapter {
@@ -32,6 +66,73 @@ impl Nis1Adapter {
             )));
         }
         response.json().await.map_err(Into::into)
+    }
+
+    async fn get_supernode_json<T: serde::de::DeserializeOwned>(
+        client: &Client,
+        path: &str,
+    ) -> AppResult<T> {
+        let response = client
+            .get(format!("{SUPERNODE_API_BASE}{path}"))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(AppError::Network(format!(
+                "HTTP {} ({path})",
+                response.status()
+            )));
+        }
+        response.json().await.map_err(Into::into)
+    }
+
+    pub async fn fetch_supernode_nodes(client: &Client) -> AppResult<Vec<SupernodeProgramNode>> {
+        let mut nodes = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let page: Vec<SupernodeProgramNode> = Self::get_supernode_json(
+                client,
+                &format!("/nodes?count={SUPERNODE_PAGE_SIZE}&offset={offset}"),
+            )
+            .await?;
+            let page_len = page.len();
+            nodes.extend(page);
+            if page_len < SUPERNODE_PAGE_SIZE {
+                break;
+            }
+            offset = offset.saturating_add(SUPERNODE_PAGE_SIZE);
+        }
+        Ok(nodes)
+    }
+
+    fn supernode_match_key(input: &str) -> Option<String> {
+        let url = Url::parse(input).ok()?;
+        let host = url.host_str()?.to_ascii_lowercase();
+        let port = url.port().unwrap_or(7890);
+        Some(format!("{host}:{port}"))
+    }
+
+    fn parse_round_timestamp(value: Option<&str>) -> Option<i64> {
+        value.and_then(|value| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .ok()
+                .map(|value| value.timestamp_millis())
+        })
+    }
+
+    fn summarize_round(round: SupernodeRoundResult) -> SupernodeSnapshot {
+        let mut failed = SUPERNODE_TEST_KEYS
+            .iter()
+            .filter(|key| round.checks.get(**key) == Some(&false))
+            .map(|key| (*key).to_owned())
+            .collect::<Vec<_>>();
+        failed.sort();
+        SupernodeSnapshot {
+            supernode_last_round: Some(round.round_id),
+            supernode_last_round_at: Self::parse_round_timestamp(round.timestamp.as_deref()),
+            supernode_checks_passed: Some(failed.is_empty()),
+            supernode_failed_checks: failed,
+            ..SupernodeSnapshot::default()
+        }
     }
 
     fn node_identity(root: &Value) -> NodeIdentity {
@@ -207,6 +308,59 @@ impl NodeAdapter for Nis1Adapter {
         }
         Ok(peers)
     }
+
+    async fn fetch_supernode_metrics(
+        &self,
+        supernodes: &[SupernodeProgramNode],
+    ) -> AppResult<SupernodeSnapshot> {
+        let Some(local_key) = Self::supernode_match_key(&self.base_url) else {
+            return Ok(SupernodeSnapshot {
+                error: Some("Supernode照合用URLを解析できません。".into()),
+                ..SupernodeSnapshot::default()
+            });
+        };
+        let Some(program_node) = supernodes
+            .iter()
+            .find(|node| Self::supernode_match_key(&node.endpoint).as_deref() == Some(&local_key))
+        else {
+            return Ok(SupernodeSnapshot {
+                supernode_status: Some("not_found".into()),
+                ..SupernodeSnapshot::default()
+            });
+        };
+        let info: SupernodeInfo =
+            Self::get_supernode_json(&self.client, &format!("/node/{}", program_node.id)).await?;
+        let round_id = match info.last_results_round {
+            Some(round_id) if round_id >= 0 => round_id,
+            _ => {
+                return Ok(SupernodeSnapshot {
+                    supernode_id: Some(program_node.id),
+                    supernode_status: info.status.or_else(|| program_node.status.clone()),
+                    ..SupernodeSnapshot::default()
+                })
+            }
+        };
+        let rounds: Vec<SupernodeRoundResult> = Self::get_supernode_json(
+            &self.client,
+            &format!(
+                "/node/{}/results/rounds/{}/to/{}",
+                program_node.id, round_id, round_id
+            ),
+        )
+        .await?;
+        let Some(round) = rounds.into_iter().find(|round| round.round_id == round_id) else {
+            return Ok(SupernodeSnapshot {
+                supernode_id: Some(program_node.id),
+                supernode_status: info.status.or_else(|| program_node.status.clone()),
+                supernode_last_round: Some(round_id),
+                ..SupernodeSnapshot::default()
+            });
+        };
+        let mut snapshot = Self::summarize_round(round);
+        snapshot.supernode_id = Some(program_node.id);
+        snapshot.supernode_status = info.status.or_else(|| program_node.status.clone());
+        Ok(snapshot)
+    }
 }
 
 #[cfg(test)]
@@ -227,6 +381,42 @@ mod tests {
         assert_eq!(identity.kind, NodeKind::Nis1);
         assert_eq!(identity.network.as_deref(), Some("NEM Mainnet"));
         assert_eq!(identity.version.as_deref(), Some("0.6.101"));
+    }
+
+    #[test]
+    fn normalizes_supernode_endpoints_for_matching() {
+        assert_eq!(
+            Nis1Adapter::supernode_match_key("HTTP://Example.COM:7890/"),
+            Some("example.com:7890".into())
+        );
+        assert_eq!(
+            Nis1Adapter::supernode_match_key("http://example.com"),
+            Some("example.com:7890".into())
+        );
+    }
+
+    #[test]
+    fn summarizes_failed_supernode_round() {
+        let round: SupernodeRoundResult = serde_json::from_value(serde_json::json!({
+            "roundId": 4955,
+            "timestamp": "2026-07-09T10:10:59.998507+00:00",
+            "balance": true,
+            "bandwidth": false,
+            "chainHeight": true,
+            "chainPart": true,
+            "computingPower": true,
+            "ping": true,
+            "responsiveness": true,
+            "version": true
+        }))
+        .expect("round should parse");
+
+        let snapshot = Nis1Adapter::summarize_round(round);
+
+        assert_eq!(snapshot.supernode_last_round, Some(4955));
+        assert_eq!(snapshot.supernode_checks_passed, Some(false));
+        assert_eq!(snapshot.supernode_failed_checks, ["bandwidth"]);
+        assert_eq!(snapshot.supernode_last_round_at, Some(1_783_591_859_998));
     }
 
     #[test]
