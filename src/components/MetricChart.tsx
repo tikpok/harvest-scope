@@ -1,11 +1,14 @@
-import { useEffect, useRef } from "react";
-import * as echarts from "echarts/core";
-import { LineChart } from "echarts/charts";
-import { DataZoomComponent, GridComponent, LegendComponent, TooltipComponent } from "echarts/components";
-import { CanvasRenderer } from "echarts/renderers";
 import type { MetricPoint } from "../types";
 
-echarts.use([LineChart, DataZoomComponent, GridComponent, LegendComponent, TooltipComponent, CanvasRenderer]);
+interface Series {
+  name: string;
+  color: string;
+  values: Array<number | null>;
+}
+
+const WIDTH = 920;
+const HEIGHT = 370;
+const PADDING = { top: 34, right: 28, bottom: 44, left: 54 };
 
 function microXymToWholeNumber(value: string | null) {
   if (!value) return null;
@@ -15,6 +18,59 @@ function microXymToWholeNumber(value: string | null) {
     const micro = Number(value);
     return Number.isFinite(micro) ? Math.trunc(micro / 1_000_000) : null;
   }
+}
+
+function numeric(value: string | number | null) {
+  if (value == null) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function extent(values: Array<number | null>) {
+  const numbers = values.filter((value): value is number => value != null && Number.isFinite(value));
+  if (numbers.length === 0) return null;
+  let min = Math.min(...numbers);
+  let max = Math.max(...numbers);
+  if (min === max) {
+    min -= 1;
+    max += 1;
+  }
+  return { min, max };
+}
+
+function formatTime(value: number) {
+  return new Intl.DateTimeFormat("ja-JP", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(value);
+}
+
+function formatRange(values: Array<number | null>) {
+  const range = extent(values);
+  if (!range) return "データなし";
+  return `${Math.round(range.min).toLocaleString("ja-JP")} - ${Math.round(range.max).toLocaleString("ja-JP")}`;
+}
+
+function linePaths(series: Series, timestamps: number[]) {
+  const range = extent(series.values);
+  if (!range || timestamps.length === 0) return [];
+  const minTime = Math.min(...timestamps);
+  const maxTime = Math.max(...timestamps);
+  const timeSpan = Math.max(1, maxTime - minTime);
+  const plotWidth = WIDTH - PADDING.left - PADDING.right;
+  const plotHeight = HEIGHT - PADDING.top - PADDING.bottom;
+  const paths: string[] = [];
+  let current = "";
+
+  series.values.forEach((value, index) => {
+    if (value == null) {
+      if (current) paths.push(current);
+      current = "";
+      return;
+    }
+    const x = PADDING.left + ((timestamps[index] - minTime) / timeSpan) * plotWidth;
+    const y = PADDING.top + (1 - (value - range.min) / (range.max - range.min)) * plotHeight;
+    current += `${current ? " L" : "M"} ${x.toFixed(1)} ${y.toFixed(1)}`;
+  });
+  if (current) paths.push(current);
+  return paths;
 }
 
 export function MetricChart({
@@ -28,134 +84,61 @@ export function MetricChart({
   showSupernodeMetrics?: boolean;
   latencyLabel?: string;
 }) {
-  const ref = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!ref.current) return;
-    const chart = echarts.init(ref.current);
-    const harvestLegend = showHarvestMetrics ? ["委任者", "合計XYM"] : [];
-    const supernodeLegend = showSupernodeMetrics ? ["Supernode合否"] : [];
-    const harvestSeries = showHarvestMetrics
+  const timestamps = data.map((point) => point.observedAt);
+  const series: Series[] = [
+    { name: latencyLabel, color: "#55d6be", values: data.map((point) => point.latencyMs) },
+    { name: "ピア数", color: "#73a9ff", values: data.map((point) => point.peerCount) },
+    { name: "同期遅延", color: "#ffca5c", values: data.map((point) => numeric(point.lag)) },
+    ...(showHarvestMetrics
       ? [
-          {
-            name: "委任者",
-            type: "line",
-            yAxisIndex: 2,
-            showSymbol: true,
-            symbolSize: 4,
-            lineStyle: { color: "#d58cff", width: 3 },
-            data: data.map((point) => [point.observedAt, point.delegatedHarvesterCount]),
-          },
-          {
-            name: "合計XYM",
-            type: "line",
-            yAxisIndex: 3,
-            showSymbol: false,
-            lineStyle: { color: "#ff8fb3", width: 2 },
-            data: data.map((point) => [point.observedAt, microXymToWholeNumber(point.totalBalanceMicroXym)]),
-          },
+          { name: "委任者", color: "#d58cff", values: data.map((point) => point.delegatedHarvesterCount) },
+          { name: "合計XYM", color: "#ff8fb3", values: data.map((point) => microXymToWholeNumber(point.totalBalanceMicroXym)) },
         ]
-      : [];
-    const supernodeAxisIndex = showHarvestMetrics ? 4 : 2;
-    const supernodeSeries = showSupernodeMetrics
+      : []),
+    ...(showSupernodeMetrics
       ? [
           {
             name: "Supernode合否",
-            type: "line",
-            yAxisIndex: supernodeAxisIndex,
-            step: "end",
-            showSymbol: true,
-            symbolSize: 6,
-            lineStyle: { color: "#8de5a1", width: 2 },
-            data: data.map((point) => [point.observedAt, point.supernodeChecksPassed == null ? null : point.supernodeChecksPassed ? 1 : 0]),
+            color: "#8de5a1",
+            values: data.map((point) => point.supernodeChecksPassed == null ? null : point.supernodeChecksPassed ? 1 : 0),
           },
         ]
-      : [];
-    chart.setOption({
-      backgroundColor: "transparent",
-      color: ["#55d6be", "#73a9ff", "#ffca5c", "#d58cff", "#ff8fb3", "#8de5a1"],
-      animationDuration: 350,
-      tooltip: { trigger: "axis" },
-      legend: { textStyle: { color: "#91a3b8" }, data: [latencyLabel, "ピア数", "同期遅延", ...harvestLegend, ...supernodeLegend] },
-      grid: { left: 52, right: showHarvestMetrics || showSupernodeMetrics ? 82 : 32, top: 46, bottom: 42 },
-      xAxis: {
-        type: "time",
-        axisLabel: { color: "#91a3b8" },
-        splitLine: { show: false },
-      },
-      yAxis: [
-        { type: "value", name: "ms", axisLabel: { color: "#91a3b8" }, splitLine: { lineStyle: { color: "#1d2b3d" } } },
-        { type: "value", axisLabel: { color: "#91a3b8" }, splitLine: { show: false } },
-        ...(showHarvestMetrics ? [
-          {
-            type: "value",
-            name: "委任者",
-            position: "right",
-            scale: true,
-            minInterval: 1,
-            interval: 1,
-            min: (value: { min: number }) => Math.max(0, Math.floor(value.min - 1)),
-            max: (value: { max: number }) => Math.ceil(value.max + 1),
-            axisLabel: { color: "#d58cff", formatter: (value: number) => Number.isInteger(value) ? String(value) : "" },
-            splitLine: { show: false },
-          },
-          {
-            type: "value",
-            show: false,
-            scale: true,
-            splitLine: { show: false },
-          },
-        ] : []),
-        ...(showSupernodeMetrics ? [
-          {
-            type: "value",
-            name: "SN",
-            position: "right",
-            min: 0,
-            max: 1,
-            interval: 1,
-            axisLabel: { color: "#8de5a1", formatter: (value: number) => value === 1 ? "OK" : "NG" },
-            splitLine: { show: false },
-          },
-        ] : []),
-      ],
-      dataZoom: [{ type: "inside" }, { type: "slider", height: 18, bottom: 5 }],
-      series: [
-        {
-          name: latencyLabel,
-          type: "line",
-          showSymbol: false,
-          smooth: true,
-          lineStyle: { color: "#55d6be", width: 2 },
-          data: data.map((point) => [point.observedAt, point.latencyMs]),
-        },
-        {
-          name: "ピア数",
-          type: "line",
-          yAxisIndex: 1,
-          showSymbol: false,
-          lineStyle: { color: "#73a9ff", width: 2 },
-          data: data.map((point) => [point.observedAt, point.peerCount]),
-        },
-        {
-          name: "同期遅延",
-          type: "line",
-          yAxisIndex: 1,
-          showSymbol: false,
-          lineStyle: { color: "#ffca5c", width: 2 },
-          data: data.map((point) => [point.observedAt, point.lag ? Number(point.lag) : null]),
-        },
-        ...harvestSeries,
-        ...supernodeSeries,
-      ],
-    });
-    const resize = new ResizeObserver(() => chart.resize());
-    resize.observe(ref.current);
-    return () => {
-      resize.disconnect();
-      chart.dispose();
-    };
-  }, [data, showHarvestMetrics, showSupernodeMetrics, latencyLabel]);
+      : []),
+  ];
+  const minTime = Math.min(...timestamps);
+  const maxTime = Math.max(...timestamps);
+  const midTime = minTime + (maxTime - minTime) / 2;
+  const gridLines = [0, 1, 2, 3, 4].map((index) => PADDING.top + index * ((HEIGHT - PADDING.top - PADDING.bottom) / 4));
 
-  return <div ref={ref} className="chart" role="img" aria-label="ノードメトリクスの時系列グラフ" />;
+  return (
+    <div className="chart" role="img" aria-label="ノードメトリクスの時系列グラフ">
+      <svg viewBox={`0 0 ${WIDTH} ${HEIGHT}`} width="100%" height="100%" preserveAspectRatio="none">
+        <rect width={WIDTH} height={HEIGHT} rx="10" fill="transparent" />
+        {gridLines.map((y) => (
+          <line key={y} x1={PADDING.left} x2={WIDTH - PADDING.right} y1={y} y2={y} stroke="#1d2b3d" strokeWidth="1" />
+        ))}
+        {[minTime, midTime, maxTime].map((value, index) => (
+          <text key={`${value}-${index}`} x={index === 0 ? PADDING.left : index === 1 ? WIDTH / 2 : WIDTH - PADDING.right} y={HEIGHT - 16} textAnchor={index === 0 ? "start" : index === 1 ? "middle" : "end"} fill="#91a3b8" fontSize="12">
+            {formatTime(value)}
+          </text>
+        ))}
+        {series.map((item) => (
+          <g key={item.name}>
+            {linePaths(item, timestamps).map((path, index) => (
+              <path key={`${item.name}-${index}`} d={path} fill="none" stroke={item.color} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" vectorEffect="non-scaling-stroke" />
+            ))}
+          </g>
+        ))}
+        <g transform={`translate(${PADDING.left} 18)`}>
+          {series.map((item, index) => (
+            <g key={item.name} transform={`translate(${index * 136} 0)`}>
+              <circle r="5" fill={item.color} />
+              <text x="10" y="4" fill="#c8d5e5" fontSize="12">{item.name}</text>
+              <title>{`${item.name}: ${formatRange(item.values)}`}</title>
+            </g>
+          ))}
+        </g>
+      </svg>
+    </div>
+  );
 }

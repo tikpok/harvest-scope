@@ -9,7 +9,7 @@ mod storage;
 use std::{
     any::Any,
     panic::{catch_unwind, AssertUnwindSafe},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -47,12 +47,12 @@ fn run_app() -> tauri::Result<()> {
             None,
         ))
         .setup(|app| {
-            let data_dir = app.path().app_local_data_dir()?.join("node-watcher.db");
+            let data_dir = app_database_path(app)?;
             let client = reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(2))
                 .timeout(Duration::from_secs(5))
                 .pool_max_idle_per_host(2)
-                .user_agent("Node-Watcher/0.1")
+                .user_agent("Harvest-Scope/0.1")
                 .build()?;
             let repository = tauri::async_runtime::block_on(storage::Repository::open(&data_dir))?;
             let state = tauri::async_runtime::block_on(AppState::new(repository, client))?;
@@ -121,6 +121,32 @@ fn run_app() -> tauri::Result<()> {
         .run(tauri::generate_context!())
 }
 
+fn app_database_path(app: &tauri::App) -> tauri::Result<PathBuf> {
+    let data_dir = app.path().app_local_data_dir()?.join("harvest-scope.db");
+    migrate_legacy_database(&data_dir);
+    Ok(data_dir)
+}
+
+fn migrate_legacy_database(data_dir: &Path) {
+    if data_dir.exists() {
+        return;
+    }
+    let Some(legacy_data_dir) = legacy_app_data_file("node-watcher.db") else {
+        return;
+    };
+    if !legacy_data_dir.exists() {
+        return;
+    }
+    let result = data_dir
+        .parent()
+        .map(std::fs::create_dir_all)
+        .transpose()
+        .and_then(|_| std::fs::copy(&legacy_data_dir, data_dir).map(|_| ()));
+    if let Err(error) = result {
+        tracing::warn!(%error, legacy = %legacy_data_dir.display(), target = %data_dir.display(), "failed to migrate legacy database");
+    }
+}
+
 fn panic_message(payload: &(dyn Any + Send)) -> String {
     payload
         .downcast_ref::<String>()
@@ -156,10 +182,22 @@ fn report_startup_failure(message: &str) {
 }
 
 fn startup_error_log_path() -> Option<PathBuf> {
+    legacy_app_data_file("startup-error.log").map(|path| {
+        path.parent()
+            .and_then(|root| root.parent())
+            .map(|root| {
+                root.join("com.tikpok.harvest-scope")
+                    .join("startup-error.log")
+            })
+            .unwrap_or(path)
+    })
+}
+
+fn legacy_app_data_file(file_name: &str) -> Option<PathBuf> {
     std::env::var_os("LOCALAPPDATA").map(|root| {
         PathBuf::from(root)
             .join("com.tikpok.node-watcher")
-            .join("startup-error.log")
+            .join(file_name)
     })
 }
 

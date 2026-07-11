@@ -1084,7 +1084,7 @@ pub async fn export_csv(
     };
     let bytes = csv_bytes(records)?;
     let file_name = format!(
-        "node-watcher-{dataset}-{}.csv",
+        "harvest-scope-{dataset}-{}.csv",
         chrono::Local::now().format("%Y%m%d-%H%M%S")
     );
     let path = app

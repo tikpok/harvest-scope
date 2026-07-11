@@ -55,6 +55,6 @@ npm run version:check
 
 ## License
 
-Copyright (c) 2026 tikpok. All rights reserved.
+Copyright (c) 2026 tikpok.
 
-このリポジトリは非公開です。明示的な許諾なく利用・複製・再配布できません。
+このソースコードは公開されていますが、ライセンス条件は `LICENSE` を参照してください。

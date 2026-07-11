@@ -18,10 +18,10 @@ async function readVersions() {
   const cargoLock = await readFile(files.cargoLock, "utf8");
   const tauriConfig = JSON.parse(await readFile(files.tauri, "utf8"));
   const cargoVersion = cargoToml.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
-  const cargoLockVersion = cargoLock.match(/\[\[package\]\]\r?\nname = "node-watcher"\r?\nversion = "([^"]+)"/)?.[1];
+  const cargoLockVersion = cargoLock.match(/\[\[package\]\]\r?\nname = "harvest-scope"\r?\nversion = "([^"]+)"/)?.[1];
 
   if (!cargoVersion) throw new Error(`${files.cargo}のpackage.versionを読み取れません。`);
-  if (!cargoLockVersion) throw new Error(`${files.cargoLock}のnode-watcher版番号を読み取れません。`);
+  if (!cargoLockVersion) throw new Error(`${files.cargoLock}のharvest-scope版番号を読み取れません。`);
 
   return {
     packageJson,
@@ -73,7 +73,7 @@ async function setVersion(version) {
     `$1"${version}"`,
   );
   const updatedCargoLock = cargoLock.replace(
-    /(\[\[package\]\]\r?\nname = "node-watcher"\r?\nversion = )"[^"]+"/,
+    /(\[\[package\]\]\r?\nname = "harvest-scope"\r?\nversion = )"[^"]+"/,
     `$1"${version}"`,
   );
 

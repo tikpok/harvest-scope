@@ -1252,7 +1252,7 @@ mod tests {
     #[tokio::test]
     async fn persists_manual_node_order() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
-        let database = directory.path().join("node-watcher.db");
+        let database = directory.path().join("harvest-scope.db");
         let repository = Repository::open(&database)
             .await
             .expect("repository should open");
@@ -1292,7 +1292,7 @@ mod tests {
     #[tokio::test]
     async fn move_node_handles_boundaries_and_unknown_nodes() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
-        let repository = Repository::open(&directory.path().join("node-watcher.db"))
+        let repository = Repository::open(&directory.path().join("harvest-scope.db"))
             .await
             .expect("repository should open");
         repository
@@ -1321,7 +1321,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_peer_keys_do_not_abort_snapshot_replacement() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
-        let repository = Repository::open(&directory.path().join("node-watcher.db"))
+        let repository = Repository::open(&directory.path().join("harvest-scope.db"))
             .await
             .expect("repository should open");
         repository
@@ -1373,7 +1373,7 @@ mod tests {
     #[tokio::test]
     async fn latest_node_summary_keeps_previous_harvest_metrics_when_new_sample_has_none() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
-        let repository = Repository::open(&directory.path().join("node-watcher.db"))
+        let repository = Repository::open(&directory.path().join("harvest-scope.db"))
             .await
             .expect("repository should open");
         repository
@@ -1462,7 +1462,7 @@ mod tests {
     #[tokio::test]
     async fn alert_mutations_return_a_stable_alert_id() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
-        let repository = Repository::open(&directory.path().join("node-watcher.db"))
+        let repository = Repository::open(&directory.path().join("harvest-scope.db"))
             .await
             .expect("repository should open");
         repository
@@ -1497,7 +1497,7 @@ mod tests {
     #[tokio::test]
     async fn preserves_legacy_settings_and_skips_onboarding() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
-        let repository = Repository::open(&directory.path().join("node-watcher.db"))
+        let repository = Repository::open(&directory.path().join("harvest-scope.db"))
             .await
             .expect("repository should open");
         sqlx::query("INSERT INTO settings (key,value_json,updated_at) VALUES ('app', ?, 1)")
@@ -1516,7 +1516,7 @@ mod tests {
     #[tokio::test]
     async fn persists_and_expires_diagnostic_runs() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
-        let repository = Repository::open(&directory.path().join("node-watcher.db"))
+        let repository = Repository::open(&directory.path().join("harvest-scope.db"))
             .await
             .expect("repository should open");
         repository

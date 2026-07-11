@@ -406,7 +406,7 @@ test("上部バーからライトテーマへ切り替える", async () => {
 });
 
 test("設定画面からノード設定をエクスポートする", async () => {
-  vi.mocked(api.exportNodeConfig).mockResolvedValue("C:\\tmp\\node-watcher-config.json");
+  vi.mocked(api.exportNodeConfig).mockResolvedValue("C:\\tmp\\harvest-scope-config.json");
   renderApp("/settings");
 
   fireEvent.click(await screen.findByRole("button", { name: "エクスポート" }));
