@@ -178,7 +178,7 @@ input, select { color:var(--text); background:#0b1727; border:1px solid var(--bo
 .topology-event { cursor:pointer; border-radius:7px; transition:background .15s,border-color .15s; }
 .topology-event:hover,.topology-event:focus { background:rgba(115,169,255,.07); outline:none; }
 .topology-disclaimer { margin-top:auto; }
-.topology-space-button { color:#06181c; border-color:var(--green); background:linear-gradient(135deg,var(--green),#8ebfff); font-weight:650; }
+.topology-space-button { width:38px; min-width:38px; padding:0; color:#06181c; border-color:var(--green); background:linear-gradient(135deg,var(--green),#8ebfff); font-weight:650; }
 .topology-space-button:hover { background:linear-gradient(135deg,#74e3d0,#a7caff); }
 .topology-space-button:disabled { color:var(--muted); border-color:var(--border); background:#13243a; }
 .space-explorer { position:fixed; inset:0; z-index:140; overflow:hidden; color:#ecf6ff; background:radial-gradient(circle at 30% 20%,rgba(45,103,173,.38),transparent 32%),radial-gradient(circle at 78% 12%,rgba(85,214,190,.22),transparent 28%),#020713; }

@@ -81,6 +81,7 @@ export const api = {
   alerts: () => call<AlertRecord[]>("list_alerts", undefined, []),
   alert: (alertId: string) => invoke<AlertRecord>("get_alert", { alertId }),
   acknowledgeAlert: (alertId: string) => invoke<void>("acknowledge_alert", { alertId }),
+  deleteResolvedAlerts: () => invoke<number>("delete_resolved_alerts"),
   runNodeDiagnostic: (nodeId: string, alertId?: string) =>
     invoke<DiagnosticRun>("run_node_diagnostic", { nodeId, alertId }),
   diagnosticRun: (runId: string) => invoke<DiagnosticRun>("get_diagnostic_run", { runId }),

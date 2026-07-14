@@ -89,6 +89,134 @@ fn parse_string_list(value: Option<String>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn optional_i64_string(row: &SqliteRow, column: &str) -> AppResult<Option<String>> {
+    Ok(row
+        .try_get::<Option<i64>, _>(column)?
+        .map(|value| value.to_string()))
+}
+
+fn summary_from_row(row: &SqliteRow) -> AppResult<NodeSummary> {
+    let enabled = row.try_get::<i64, _>("enabled")? != 0;
+    let show_harvest_metrics = row.try_get::<i64, _>("show_harvest_metrics")? != 0;
+    let sample_status = row.try_get::<Option<String>, _>("sample_status")?;
+    let sample_failed_checks =
+        parse_string_list(row.try_get("sample_supernode_failed_checks_json")?);
+    let supernode_failed_checks = if sample_failed_checks.is_empty() {
+        parse_string_list(row.try_get("supernode_failed_checks_json")?)
+    } else {
+        sample_failed_checks
+    };
+    Ok(NodeSummary {
+        id: row.try_get("node_id")?,
+        display_name: row.try_get("display_name")?,
+        kind: parse_kind(row.try_get::<String, _>("kind")?.as_str())?,
+        monitor_mode: parse_monitor_mode(row.try_get::<String, _>("monitor_mode")?.as_str())?,
+        base_url: row.try_get("base_url")?,
+        network: row.try_get("network")?,
+        version: row.try_get("version")?,
+        roles: parse_string_list(row.try_get("roles_json")?),
+        enabled,
+        favorite: row.try_get::<i64, _>("favorite")? != 0,
+        status: if enabled {
+            sample_status
+                .as_deref()
+                .map(parse_status)
+                .unwrap_or(NodeStatus::Unknown)
+        } else {
+            NodeStatus::Unknown
+        },
+        height: optional_i64_string(row, "sample_height")?,
+        finalized_height: optional_i64_string(row, "sample_finalized_height")?,
+        lag: optional_i64_string(row, "sample_lag")?,
+        peer_count: row.try_get("sample_peer_count")?,
+        latency_ms: row.try_get("sample_latency_ms")?,
+        last_seen_at: row.try_get("sample_observed_at")?,
+        last_error: row.try_get("sample_last_error")?,
+        show_harvest_metrics,
+        delegated_harvester_count: row
+            .try_get::<Option<i64>, _>("sample_delegated_harvester_count")?
+            .or_else(|| {
+                show_harvest_metrics
+                    .then(|| row.try_get("harvest_delegated_harvester_count").ok())
+                    .flatten()
+            }),
+        delegated_harvester_delta: row
+            .try_get::<Option<i64>, _>("sample_delegated_harvester_delta")?
+            .or_else(|| {
+                show_harvest_metrics
+                    .then(|| row.try_get("harvest_delegated_harvester_delta").ok())
+                    .flatten()
+            }),
+        total_importance: row
+            .try_get::<Option<String>, _>("sample_total_importance")?
+            .or_else(|| {
+                show_harvest_metrics
+                    .then(|| row.try_get("harvest_total_importance").ok())
+                    .flatten()
+            }),
+        total_balance_micro_xym: row
+            .try_get::<Option<String>, _>("sample_total_balance_micro_xym")?
+            .or_else(|| {
+                show_harvest_metrics
+                    .then(|| row.try_get("harvest_total_balance_micro_xym").ok())
+                    .flatten()
+            }),
+        harvest_metric_error: row
+            .try_get::<Option<String>, _>("sample_harvest_metric_error")?
+            .or_else(|| {
+                show_harvest_metrics
+                    .then(|| row.try_get("harvest_metric_error").ok())
+                    .flatten()
+            }),
+        latest_harvest_at: if show_harvest_metrics {
+            row.try_get("latest_harvest_at")?
+        } else {
+            None
+        },
+        node_certificate_not_after: row
+            .try_get::<Option<i64>, _>("sample_node_certificate_not_after")?
+            .or(row.try_get("certificate_node_certificate_not_after")?),
+        node_certificate_remaining_days: row
+            .try_get::<Option<i64>, _>("sample_node_certificate_remaining_days")?
+            .or(row.try_get("certificate_node_certificate_remaining_days")?),
+        voting_key_start_epoch: row
+            .try_get::<Option<i64>, _>("sample_voting_key_start_epoch")?
+            .or(row.try_get("certificate_voting_key_start_epoch")?),
+        voting_key_end_epoch: row
+            .try_get::<Option<i64>, _>("sample_voting_key_end_epoch")?
+            .or(row.try_get("certificate_voting_key_end_epoch")?),
+        finalization_epoch: row
+            .try_get::<Option<i64>, _>("sample_finalization_epoch")?
+            .or(row.try_get("certificate_finalization_epoch")?),
+        voting_key_remaining_epochs: row
+            .try_get::<Option<i64>, _>("sample_voting_key_remaining_epochs")?
+            .or(row.try_get("certificate_voting_key_remaining_epochs")?),
+        certificate_metric_error: row
+            .try_get::<Option<String>, _>("sample_certificate_metric_error")?
+            .or(row.try_get("certificate_metric_error")?),
+        supernode_id: row
+            .try_get::<Option<i64>, _>("sample_supernode_id")?
+            .or(row.try_get("supernode_id")?),
+        supernode_status: row
+            .try_get::<Option<String>, _>("sample_supernode_status")?
+            .or(row.try_get("supernode_status")?),
+        supernode_last_round: row
+            .try_get::<Option<i64>, _>("sample_supernode_last_round")?
+            .or(row.try_get("supernode_last_round")?),
+        supernode_last_round_at: row
+            .try_get::<Option<i64>, _>("sample_supernode_last_round_at")?
+            .or(row.try_get("supernode_last_round_at")?),
+        supernode_checks_passed: bool_from_i64(
+            row.try_get::<Option<i64>, _>("sample_supernode_checks_passed")?,
+        )
+        .or(bool_from_i64(row.try_get("supernode_checks_passed")?)),
+        supernode_failed_checks,
+        supernode_metric_error: row
+            .try_get::<Option<String>, _>("sample_supernode_metric_error")?
+            .or(row.try_get("supernode_metric_error")?),
+    })
+}
+
 fn alert_from_row(row: &SqliteRow) -> AppResult<AlertRecord> {
     Ok(AlertRecord {
         id: row.try_get("id")?,
@@ -184,12 +312,117 @@ impl Repository {
     }
 
     pub async fn list_nodes(&self) -> AppResult<Vec<NodeSummary>> {
-        let nodes = self.list_stored_nodes(false).await?;
-        let mut summaries = Vec::with_capacity(nodes.len());
-        for node in &nodes {
-            summaries.push(self.node_summary(node).await?);
-        }
-        Ok(summaries)
+        let rows = sqlx::query(
+            r#"
+            SELECT
+              n.id AS node_id,
+              n.display_name,
+              n.kind,
+              n.monitor_mode,
+              n.base_url,
+              n.network,
+              n.version,
+              n.roles_json,
+              n.enabled,
+              n.favorite,
+              n.show_harvest_metrics,
+              s.observed_at AS sample_observed_at,
+              s.status AS sample_status,
+              s.height AS sample_height,
+              s.finalized_height AS sample_finalized_height,
+              s.lag AS sample_lag,
+              s.peer_count AS sample_peer_count,
+              s.latency_ms AS sample_latency_ms,
+              s.last_error AS sample_last_error,
+              s.delegated_harvester_count AS sample_delegated_harvester_count,
+              s.delegated_harvester_delta AS sample_delegated_harvester_delta,
+              s.total_importance AS sample_total_importance,
+              s.total_balance_micro_xym AS sample_total_balance_micro_xym,
+              s.harvest_metric_error AS sample_harvest_metric_error,
+              s.node_certificate_not_after AS sample_node_certificate_not_after,
+              s.node_certificate_remaining_days AS sample_node_certificate_remaining_days,
+              s.voting_key_start_epoch AS sample_voting_key_start_epoch,
+              s.voting_key_end_epoch AS sample_voting_key_end_epoch,
+              s.finalization_epoch AS sample_finalization_epoch,
+              s.voting_key_remaining_epochs AS sample_voting_key_remaining_epochs,
+              s.certificate_metric_error AS sample_certificate_metric_error,
+              s.supernode_id AS sample_supernode_id,
+              s.supernode_status AS sample_supernode_status,
+              s.supernode_last_round AS sample_supernode_last_round,
+              s.supernode_last_round_at AS sample_supernode_last_round_at,
+              s.supernode_checks_passed AS sample_supernode_checks_passed,
+              s.supernode_failed_checks_json AS sample_supernode_failed_checks_json,
+              s.supernode_metric_error AS sample_supernode_metric_error,
+              h.delegated_harvester_count AS harvest_delegated_harvester_count,
+              h.delegated_harvester_delta AS harvest_delegated_harvester_delta,
+              h.total_importance AS harvest_total_importance,
+              h.total_balance_micro_xym AS harvest_total_balance_micro_xym,
+              h.harvest_metric_error AS harvest_metric_error,
+              he.observed_at AS latest_harvest_at,
+              c.node_certificate_not_after AS certificate_node_certificate_not_after,
+              c.node_certificate_remaining_days AS certificate_node_certificate_remaining_days,
+              c.voting_key_start_epoch AS certificate_voting_key_start_epoch,
+              c.voting_key_end_epoch AS certificate_voting_key_end_epoch,
+              c.finalization_epoch AS certificate_finalization_epoch,
+              c.voting_key_remaining_epochs AS certificate_voting_key_remaining_epochs,
+              c.certificate_metric_error AS certificate_metric_error,
+              sn.supernode_id AS supernode_id,
+              sn.supernode_status AS supernode_status,
+              sn.supernode_last_round AS supernode_last_round,
+              sn.supernode_last_round_at AS supernode_last_round_at,
+              sn.supernode_checks_passed AS supernode_checks_passed,
+              sn.supernode_failed_checks_json AS supernode_failed_checks_json,
+              sn.supernode_metric_error AS supernode_metric_error
+            FROM nodes n
+            LEFT JOIN node_samples s ON s.id = (
+              SELECT id
+              FROM node_samples
+              WHERE node_id = n.id
+              ORDER BY observed_at DESC, id DESC
+              LIMIT 1
+            )
+            LEFT JOIN node_samples h ON h.id = (
+              SELECT id
+              FROM node_samples
+              WHERE node_id = n.id
+                AND (delegated_harvester_count IS NOT NULL OR total_importance IS NOT NULL OR total_balance_micro_xym IS NOT NULL OR harvest_metric_error IS NOT NULL)
+              ORDER BY observed_at DESC, id DESC
+              LIMIT 1
+            )
+            LEFT JOIN harvest_events he ON he.id = (
+              SELECT id
+              FROM harvest_events
+              WHERE node_id = n.id
+              ORDER BY observed_at DESC, id DESC
+              LIMIT 1
+            )
+            LEFT JOIN node_samples c ON c.id = (
+              SELECT id
+              FROM node_samples
+              WHERE node_id = n.id
+                AND (node_certificate_not_after IS NOT NULL OR node_certificate_remaining_days IS NOT NULL OR voting_key_start_epoch IS NOT NULL OR voting_key_end_epoch IS NOT NULL OR finalization_epoch IS NOT NULL OR voting_key_remaining_epochs IS NOT NULL OR certificate_metric_error IS NOT NULL)
+              ORDER BY observed_at DESC, id DESC
+              LIMIT 1
+            )
+            LEFT JOIN node_samples sn ON sn.id = (
+              SELECT id
+              FROM node_samples
+              WHERE node_id = n.id
+                AND (supernode_id IS NOT NULL OR supernode_status IS NOT NULL OR supernode_last_round IS NOT NULL OR supernode_checks_passed IS NOT NULL OR supernode_metric_error IS NOT NULL)
+              ORDER BY observed_at DESC, id DESC
+              LIMIT 1
+            )
+            ORDER BY n.sort_order, n.display_name COLLATE NOCASE, n.id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(summary_from_row).collect()
+    }
+
+    pub async fn get_node_summary(&self, id: &str) -> AppResult<NodeSummary> {
+        let node = self.get_stored_node(id).await?;
+        self.node_summary(&node).await
     }
 
     async fn node_summary(&self, node: &StoredNode) -> AppResult<NodeSummary> {
@@ -1066,6 +1299,13 @@ impl Repository {
         sqlx::query("UPDATE alerts SET state='acknowledged', acknowledged_at=?, updated_at=? WHERE id=? AND state='open'")
             .bind(now).bind(now).bind(id).execute(&self.pool).await?;
         Ok(())
+    }
+
+    pub async fn delete_resolved_alerts(&self) -> AppResult<u64> {
+        let result = sqlx::query("DELETE FROM alerts WHERE state='resolved'")
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn raise_alert(

@@ -33,13 +33,19 @@ fn run_app() -> tauri::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(not(debug_assertions))]
+    let builder = builder
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.set_focus();
             }
-        }))
+        }));
+    #[cfg(debug_assertions)]
+    let builder = builder;
+
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
@@ -108,6 +114,7 @@ fn run_app() -> tauri::Result<()> {
             commands::list_alerts,
             commands::get_alert,
             commands::acknowledge_alert,
+            commands::delete_resolved_alerts,
             commands::run_node_diagnostic,
             commands::get_diagnostic_run,
             commands::list_node_diagnostics,
@@ -122,7 +129,15 @@ fn run_app() -> tauri::Result<()> {
 }
 
 fn app_database_path(app: &tauri::App) -> tauri::Result<PathBuf> {
-    let data_dir = app.path().app_local_data_dir()?.join("harvest-scope.db");
+    let database_name = if cfg!(debug_assertions) {
+        "harvest-scope-dev.db"
+    } else {
+        "harvest-scope.db"
+    };
+    let data_dir = app.path().app_local_data_dir()?.join(database_name);
+    if cfg!(debug_assertions) {
+        return Ok(data_dir);
+    }
     migrate_legacy_database(&data_dir);
     Ok(data_dir)
 }

@@ -40,7 +40,7 @@ import { StatusBadge } from "./components/StatusBadge";
 import { MetricChart } from "./components/MetricChart";
 import { TopologyPage } from "./components/TopologyPage";
 import packageJson from "../package.json";
-import type { AppSettings, DashboardData, DiagnosticRun, HarvestEvent, NodeDetail, NodeStatus, ScanCandidate, TopologySnapshot } from "./types";
+import type { AppSettings, DashboardData, DiagnosticRun, HarvestEvent, NodeDetail, NodeStatus, NodeSummary, ScanCandidate, TopologySnapshot } from "./types";
 
 function formatTime(value: number | null) {
   return value ? new Intl.DateTimeFormat("ja-JP", { dateStyle: "short", timeStyle: "medium" }).format(value) : "—";
@@ -265,6 +265,35 @@ function emptyDashboard() {
   return { total: 0, healthy: 0, warning: 0, critical: 0, offline: 0, rechecking: false, nodes: [] };
 }
 
+function dashboardFromNodes(nodes: NodeSummary[], rechecking = false): DashboardData {
+  return {
+    total: nodes.length,
+    healthy: nodes.filter((node) => node.status === "healthy").length,
+    warning: nodes.filter((node) => node.status === "warning").length,
+    critical: nodes.filter((node) => node.status === "critical").length,
+    offline: nodes.filter((node) => node.status === "offline").length,
+    rechecking,
+    nodes,
+  };
+}
+
+function updateDashboard(
+  queryClient: ReturnType<typeof useQueryClient>,
+  updater: (nodes: NodeSummary[]) => NodeSummary[],
+) {
+  queryClient.setQueryData<DashboardData>(["dashboard"], (current) => {
+    if (!current) return current;
+    return dashboardFromNodes(updater(current.nodes), current.rechecking);
+  });
+}
+
+function restoreDashboard(
+  queryClient: ReturnType<typeof useQueryClient>,
+  context: { previous?: DashboardData } | undefined,
+) {
+  if (context?.previous) queryClient.setQueryData(["dashboard"], context.previous);
+}
+
 function DashboardPage() {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
@@ -279,15 +308,40 @@ function DashboardPage() {
   const isRechecking = refreshAll.isPending || data.rechecking;
   const pause = useMutation({
     mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) => enabled ? api.pauseNode(id) : api.resumeNode(id),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
+    onMutate: async ({ id, enabled }) => {
+      await queryClient.cancelQueries({ queryKey: ["dashboard"] });
+      const previous = queryClient.getQueryData<DashboardData>(["dashboard"]);
+      updateDashboard(queryClient, (current) => current.map((node) => node.id === id ? { ...node, enabled: !enabled, status: "unknown" } : node));
+      return { previous };
+    },
+    onError: (_error, _variables, context) => restoreDashboard(queryClient, context),
   });
   const reorder = useMutation({
     mutationFn: ({ id, direction }: { id: string; direction: "up" | "down" }) => api.moveNode(id, direction),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
+    onMutate: async ({ id, direction }) => {
+      await queryClient.cancelQueries({ queryKey: ["dashboard"] });
+      const previous = queryClient.getQueryData<DashboardData>(["dashboard"]);
+      updateDashboard(queryClient, (current) => {
+        const next = [...current];
+        const index = next.findIndex((node) => node.id === id);
+        const target = direction === "up" ? index - 1 : index + 1;
+        if (index < 0 || target < 0 || target >= next.length) return current;
+        [next[index], next[target]] = [next[target], next[index]];
+        return next;
+      });
+      return { previous };
+    },
+    onError: (_error, _variables, context) => restoreDashboard(queryClient, context),
   });
   const remove = useMutation({
     mutationFn: (id: string) => api.deleteNode(id),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
+    onMutate: async (id) => {
+      await queryClient.cancelQueries({ queryKey: ["dashboard"] });
+      const previous = queryClient.getQueryData<DashboardData>(["dashboard"]);
+      updateDashboard(queryClient, (current) => current.filter((node) => node.id !== id));
+      return { previous };
+    },
+    onError: (_error, _variables, context) => restoreDashboard(queryClient, context),
   });
   const nodes = useMemo(() => data.nodes.filter((node) => {
     const text = `${node.displayName} ${node.baseUrl} ${node.network ?? ""}`.toLowerCase();
@@ -415,7 +469,18 @@ function DiscoveryPage() {
   const [peerPublicKey, setPeerPublicKey] = useState("");
   const [peerNetwork, setPeerNetwork] = useState("Symbol Mainnet");
   const scan = useMutation({ mutationFn: api.scan });
-  const add = useMutation({ mutationFn: api.upsertNode, onSuccess: () => queryClient.invalidateQueries({ queryKey: ["dashboard"] }) });
+  const add = useMutation({
+    mutationFn: api.upsertNode,
+    onSuccess: (registered) => {
+      queryClient.setQueryData<DashboardData>(["dashboard"], (current) => {
+        if (!current) return current;
+        const nodes = current.nodes.some((node) => node.id === registered.id)
+          ? current.nodes.map((node) => node.id === registered.id ? registered : node)
+          : [...current.nodes, registered];
+        return dashboardFromNodes(nodes, current.rechecking);
+      });
+    },
+  });
   useEffect(() => {
     if (!cidr && interfaces.length > 0) setCidr(interfaces[0].cidr);
   }, [cidr, interfaces]);
@@ -445,10 +510,10 @@ function DiscoveryPage() {
   }
   function addCandidate(candidate: ScanCandidate) { add.mutate({ baseUrl: candidate.baseUrl, displayName: candidate.name ?? undefined, kind: candidate.kind }); }
   return <>
-    <div className="page-heading"><div><h2>ノード検出</h2><p>選択したCIDRだけを明示的にスキャンします。候補は確認後に登録されます。</p></div></div>
+    <div className="page-heading"><div><h2>ノード検出</h2><p>選択したCIDRだけを明示的にスキャンします。URLから手動登録する事もできます。</p></div></div>
     <section className="split-grid">
       <form className="panel form-card" onSubmit={submitScan}><h3>LANをスキャン</h3><label>ネットワーク候補<select value={cidr} onChange={(event) => setCidr(event.target.value)}>{!cidr && <option value="">ネットワークを選択</option>}{cidr && !interfaces.some((item) => item.cidr === cidr) && <option value={cidr}>{cidr}</option>}{interfaces.map((item) => <option key={`${item.name}-${item.cidr}`} value={item.cidr}>{item.name} — {item.cidr}</option>)}</select></label><label>CIDR<input value={cidr} onChange={(event) => setCidr(event.target.value)} required /></label><label>ポート（カンマ区切り）<input value={ports} onChange={(event) => setPorts(event.target.value)} required /></label><div className="actions"><button className="button button--primary" disabled={scan.isPending}><Search size={16} />{scan.isPending ? "スキャン中…" : "スキャン開始"}</button>{scan.isPending && <button type="button" className="button" onClick={() => api.cancelScan()}>キャンセル</button>}</div><p className="form-hint">最大1,024アドレス、既定ポート3000 / 3001 / 7890</p></form>
-      <form className="panel form-card" onSubmit={addManual}><h3>ノードを手動登録</h3><label>監視モード<select value={manualMode} onChange={(event) => { setManualMode(event.target.value as "api" | "peer" | "peer-voting"); if (add.isSuccess || add.isError) add.reset(); }}><option value="api">REST APIノード</option><option value="peer">Peerノード</option><option value="peer-voting">Peer + Votingノード</option></select></label><label>{manualMode === "api" ? "REST URL" : "Peerエンドポイント"}<input type={manualMode === "api" ? "url" : "text"} value={manualUrl} onChange={(event) => { setManualUrl(event.target.value); if (add.isSuccess || add.isError) add.reset(); }} placeholder={manualMode === "api" ? "http://192.0.2.10:3000" : "192.0.2.10:7900"} required /></label>{manualMode !== "api" && <label>ネットワーク<input value={peerNetwork} onChange={(event) => setPeerNetwork(event.target.value)} placeholder="Symbol Mainnet" required={manualMode === "peer-voting"} /></label>}{manualMode === "peer-voting" && <label>公開鍵<input value={peerPublicKey} onChange={(event) => setPeerPublicKey(event.target.value)} placeholder="必須" required /></label>}<button className="button button--primary" disabled={add.isPending}><Plus size={16} />{add.isPending ? "接続確認中…" : "接続確認して登録"}</button><p className="form-hint">{manualMode === "api" ? "表示名はノード情報から自動取得します。HTTP/HTTPSのみ指定できます。" : manualMode === "peer-voting" ? "P2P疎通に加えて、同一ネットワークの監視APIノード経由でVoting期限を確認します。" : "P2Pポートの疎通を監視します。"}</p></form>
+      <form className="panel form-card" onSubmit={addManual}><h3>ノードを手動登録</h3><label>監視モード<select value={manualMode} onChange={(event) => { setManualMode(event.target.value as "api" | "peer" | "peer-voting"); if (add.isSuccess || add.isError) add.reset(); }}><option value="api">REST APIノード</option><option value="peer">Peerノード</option><option value="peer-voting">Peer + Votingノード</option></select></label><label>{manualMode === "api" ? "REST URL" : "Peerエンドポイント"}<input type={manualMode === "api" ? "url" : "text"} value={manualUrl} onChange={(event) => { setManualUrl(event.target.value); if (add.isSuccess || add.isError) add.reset(); }} placeholder={manualMode === "api" ? "http://192.0.2.10:3000" : "192.0.2.10:7900"} required /></label>{manualMode !== "api" && <label>ネットワーク<input value={peerNetwork} onChange={(event) => setPeerNetwork(event.target.value)} placeholder="Symbol Mainnet" required={manualMode === "peer-voting"} /></label>}{manualMode === "peer-voting" && <label>公開鍵<input value={peerPublicKey} onChange={(event) => setPeerPublicKey(event.target.value)} placeholder="必須" required /></label>}<button className="button button--primary" disabled={add.isPending}><Plus size={16} />{add.isPending ? "登録中…" : "登録して確認開始"}</button><p className="form-hint">{manualMode === "api" ? "登録後すぐ一覧に追加し、表示名と接続状態はバックグラウンドで確認します。HTTP/HTTPSのみ指定できます。" : manualMode === "peer-voting" ? "登録後すぐ一覧に追加し、P2P疎通とVoting期限をバックグラウンドで確認します。" : "登録後すぐ一覧に追加し、P2Pポートの疎通をバックグラウンドで確認します。"}</p></form>
     </section>
     {(scan.error || add.error) && <div className="notice notice--error">{String(scan.error ?? add.error)}</div>}
     {add.isSuccess && <div className="notice notice--success">「{add.data.displayName}」を登録しました。<small>{add.data.baseUrl}</small></div>}
@@ -459,9 +524,25 @@ function DiscoveryPage() {
 function AlertsPage() {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
+  const [nodeSearch, setNodeSearch] = useState("");
   const { data = [], isLoading } = useQuery({ queryKey: ["alerts"], queryFn: api.alerts, refetchInterval: 10_000 });
   const ack = useMutation({ mutationFn: api.acknowledgeAlert, onSuccess: () => queryClient.invalidateQueries({ queryKey: ["alerts"] }) });
-  return <section className="panel"><div className="panel__header"><div><h2>アラート</h2><p>継続中の障害と復旧履歴</p></div><button className="button" onClick={() => api.exportCsv("alerts")}><Download size={16} />CSV</button></div>{isLoading ? <div className="loading">読み込み中…</div> : data.length ? <div className="alert-list">{data.map((alert) => <article className={`alert-item alert-item--${alert.severity}`} key={alert.id} onClick={() => navigate(`/alerts/${alert.id}`)}><div className="alert-item__icon"><Bell size={18} /></div><div><div className="alert-item__heading"><strong>{alert.nodeName}</strong><span>{alert.severity === "critical" ? "重大" : "警告"}</span><span className="muted">{alert.state === "resolved" ? "復旧" : alert.state === "acknowledged" ? "確認済み" : "未確認"}</span></div><p>{alert.message}</p><small>{formatTime(alert.updatedAt)} · 発生{alert.occurrenceCount}回</small></div><div className="actions">{alert.state === "open" && <button className="button" onClick={(event) => { event.stopPropagation(); ack.mutate(alert.id); }}>確認</button>}<ChevronRight size={17} /></div></article>)}</div> : <EmptyState title="アラートはありません">異常を検出するとWindows通知とここに表示されます。</EmptyState>}</section>;
+  const clearHistory = useMutation({
+    mutationFn: api.deleteResolvedAlerts,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["alerts"] }),
+  });
+  const filtered = useMemo(() => {
+    const keyword = nodeSearch.trim().toLowerCase();
+    if (!keyword) return data;
+    return data.filter((alert) => alert.nodeName.toLowerCase().includes(keyword));
+  }, [data, nodeSearch]);
+  const resolvedCount = data.filter((alert) => alert.state === "resolved").length;
+  function deleteHistory() {
+    if (resolvedCount === 0) return;
+    const confirmed = window.confirm(`復旧済みアラート履歴 ${resolvedCount}件を削除しますか？\n未解決のアラートは残ります。`);
+    if (confirmed) clearHistory.mutate();
+  }
+  return <section className="panel"><div className="panel__header"><div><h2>アラート</h2><p>継続中の障害と復旧履歴</p></div><div className="actions"><label className="search-field"><Search size={17} /><input value={nodeSearch} onChange={(event) => setNodeSearch(event.target.value)} placeholder="ノード名で検索" /></label><button className="button" disabled={clearHistory.isPending || resolvedCount === 0} onClick={deleteHistory}><Trash2 size={16} />履歴削除</button><button className="button" onClick={() => api.exportCsv("alerts")}><Download size={16} />CSV</button></div></div>{(ack.error || clearHistory.error) && <div className="notice notice--error">アラート操作に失敗しました: {String(ack.error ?? clearHistory.error)}</div>}{isLoading ? <div className="loading">読み込み中…</div> : filtered.length ? <div className="alert-list">{filtered.map((alert) => <article className={`alert-item alert-item--${alert.severity}`} key={alert.id} onClick={() => navigate(`/alerts/${alert.id}`)}><div className="alert-item__icon"><Bell size={18} /></div><div><div className="alert-item__heading"><strong>{alert.nodeName}</strong><span>{alert.severity === "critical" ? "重大" : "警告"}</span><span className="muted">{alert.state === "resolved" ? "復旧" : alert.state === "acknowledged" ? "確認済み" : "未確認"}</span></div><p>{alert.message}</p><small>{formatTime(alert.updatedAt)} · 発生{alert.occurrenceCount}回</small></div><div className="actions">{alert.state === "open" && <button className="button" onClick={(event) => { event.stopPropagation(); ack.mutate(alert.id); }}>確認</button>}<ChevronRight size={17} /></div></article>)}</div> : <EmptyState title={data.length ? "該当するアラートはありません" : "アラートはありません"}>{data.length ? "検索条件を変えてください。" : "異常を検出するとWindows通知とここに表示されます。"}</EmptyState>}</section>;
 }
 
 function AlertDetailPage() {

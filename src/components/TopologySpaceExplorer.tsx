@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { RotateCcw, Route, X } from "lucide-react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
@@ -47,6 +47,23 @@ const eventLabels: Record<NetworkEvent["kind"], string> = {
 };
 
 const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
+const MAX_DEVICE_PIXEL_RATIO = 1.35;
+
+function performanceProfile(nodeCount: number, edgeCount: number) {
+  const dense = nodeCount >= 90 || edgeCount >= 240;
+  const veryDense = nodeCount >= 150 || edgeCount >= 420;
+  return {
+    dense,
+    starCount: veryDense ? 260 : dense ? 420 : 700,
+    sphereWidthSegments: veryDense ? 18 : dense ? 24 : 32,
+    sphereHeightSegments: veryDense ? 12 : dense ? 16 : 20,
+    ringSegments: veryDense ? 28 : dense ? 40 : 52,
+    maxEventParticles: veryDense ? 14 : dense ? 22 : 30,
+    maxEdgesPerEvent: veryDense ? 2 : dense ? 3 : 4,
+    activeFps: veryDense ? 24 : 30,
+    idleFps: veryDense ? 12 : 18,
+  };
+}
 
 function supportsWebGl() {
   if (typeof window === "undefined" || navigator.userAgent.includes("jsdom")) return false;
@@ -142,6 +159,11 @@ export function TopologySpaceExplorer({
     };
   }
   const sceneData = sceneDataRef.current;
+  const eventNodes = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
+  const visibleEvents = useMemo(() => events
+    .slice()
+    .sort((left, right) => right.observedAt - left.observedAt)
+    .slice(0, 20), [events]);
 
   useEffect(() => {
     eventsRef.current = events;
@@ -184,8 +206,9 @@ export function TopologySpaceExplorer({
       return undefined;
     }
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    const profile = performanceProfile(sceneNodes.length, sceneEdges.length);
+    const renderer = new THREE.WebGLRenderer({ antialias: !profile.dense, alpha: true, powerPreference: "high-performance" });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, MAX_DEVICE_PIXEL_RATIO));
     renderer.setSize(mount.clientWidth, mount.clientHeight);
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     mount.appendChild(renderer.domElement);
@@ -222,7 +245,7 @@ export function TopologySpaceExplorer({
 
     const starGeometry = new THREE.BufferGeometry();
     const starValues: number[] = [];
-    for (let index = 0; index < 900; index += 1) {
+    for (let index = 0; index < profile.starCount; index += 1) {
       const seed = hashValue(`star-${index}`);
       const radius = 82 + (seed % 5200) / 100;
       const theta = ((seed % 360) / 360) * Math.PI * 2;
@@ -238,10 +261,19 @@ export function TopologySpaceExplorer({
     scene.add(stars);
 
     const edgeGroup = new THREE.Group();
+    const activeEdgesByNode = new Map<string, TopologyEdge[]>();
     sceneEdges.forEach((edge) => {
       const source = nodePositions.get(edge.source);
       const target = nodePositions.get(edge.target);
       if (!source || !target) return;
+      if (edge.status === "active") {
+        const sourceEdges = activeEdgesByNode.get(edge.source) ?? [];
+        sourceEdges.push(edge);
+        activeEdgesByNode.set(edge.source, sourceEdges);
+        const targetEdges = activeEdgesByNode.get(edge.target) ?? [];
+        targetEdges.push(edge);
+        activeEdgesByNode.set(edge.target, targetEdges);
+      }
       const geometry = new THREE.BufferGeometry().setFromPoints([source, target]);
       const material = new THREE.LineBasicMaterial({
         color: edgeColor(edge.status),
@@ -255,7 +287,7 @@ export function TopologySpaceExplorer({
 
     const planetGroup = new THREE.Group();
     const planets: PlanetRecord[] = [];
-    const planetGeometry = new THREE.SphereGeometry(1, 40, 24);
+    const planetGeometry = new THREE.SphereGeometry(1, profile.sphereWidthSegments, profile.sphereHeightSegments);
     sceneNodes.forEach((node) => {
       const position = nodePositions.get(node.id);
       if (!position) return;
@@ -277,7 +309,7 @@ export function TopologySpaceExplorer({
 
       if (node.registered || connections > 1) {
         const ring = new THREE.Mesh(
-          new THREE.TorusGeometry(radius * 1.7, 0.012, 8, 56),
+          new THREE.TorusGeometry(radius * 1.7, 0.012, 8, profile.ringSegments),
           new THREE.MeshBasicMaterial({ color, transparent: true, opacity: node.registered ? 0.45 : 0.24 }),
         );
         ring.position.copy(position);
@@ -289,24 +321,24 @@ export function TopologySpaceExplorer({
     scene.add(planetGroup);
 
     const selectedRing = new THREE.Mesh(
-      new THREE.TorusGeometry(1.4, 0.035, 12, 80),
+      new THREE.TorusGeometry(1.4, 0.035, profile.dense ? 8 : 12, profile.ringSegments),
       new THREE.MeshBasicMaterial({ color: 0x73a9ff, transparent: true, opacity: 0.9 }),
     );
     selectedRing.visible = false;
     scene.add(selectedRing);
 
-    const particleGeometry = new THREE.SphereGeometry(0.12, 16, 10);
+    const particleGeometry = new THREE.SphereGeometry(0.12, profile.dense ? 8 : 12, profile.dense ? 6 : 8);
     const particles = new Map<string, ParticleRecord>();
 
     const ensureParticles = () => {
+      const currentNow = nowRef.current;
       const liveKeys = new Set<string>();
       eventsRef.current
-        .filter((event) => nowRef.current - event.observedAt < 4_500)
-        .slice(0, 36)
+        .filter((event) => currentNow - event.observedAt < 4_500)
+        .slice(0, profile.maxEventParticles)
         .forEach((event) => {
-          sceneEdges
-            .filter((edge) => edge.status === "active" && (edge.source === event.nodeId || edge.target === event.nodeId))
-            .slice(0, 4)
+          (activeEdgesByNode.get(event.nodeId) ?? [])
+            .slice(0, profile.maxEdgesPerEvent)
             .forEach((edge) => {
               const keyName = `${event.id}-${edge.id}`;
               liveKeys.add(keyName);
@@ -367,11 +399,27 @@ export function TopologySpaceExplorer({
     window.addEventListener("resize", onResize);
 
     let frame = 0;
+    let lastFrameAt = 0;
+    let lastParticleSyncAt = 0;
+    let interactionUntil = 0;
+    const onControlsChange = () => {
+      interactionUntil = performance.now() + 650;
+    };
+    controls.addEventListener("change", onControlsChange);
     const animate = () => {
       frame = window.requestAnimationFrame(animate);
-      const elapsed = performance.now() / 1000;
+      const frameNow = performance.now();
+      const activeParticles = eventsRef.current.some((event) => nowRef.current - event.observedAt < 4_500);
+      const activeScene = autoRotateRef.current || activeParticles || frameNow < interactionUntil;
+      const targetFps = activeScene ? profile.activeFps : profile.idleFps;
+      if (frameNow - lastFrameAt < 1000 / targetFps) return;
+      lastFrameAt = frameNow;
+      const elapsed = frameNow / 1000;
       const currentSelectedNodeId = selectedNodeIdRef.current;
-      ensureParticles();
+      if (frameNow - lastParticleSyncAt >= 120) {
+        lastParticleSyncAt = frameNow;
+        ensureParticles();
+      }
       stars.rotation.y = elapsed * 0.012;
       edgeGroup.visible = routesVisibleRef.current;
       controls.autoRotate = autoRotateRef.current;
@@ -389,11 +437,12 @@ export function TopologySpaceExplorer({
         }
       });
       if (!currentSelectedNodeId) selectedRing.visible = false;
+      const wallNow = Date.now();
       particles.forEach((particle) => {
-        const age = (Date.now() - particle.observedAt) / 1400;
+        const age = (wallNow - particle.observedAt) / 1400;
         const progress = ((age % 1) + 1) % 1;
         particle.mesh.position.copy(particle.source).lerp(particle.target, progress);
-        particle.mesh.visible = Date.now() - particle.observedAt < 6_000;
+        particle.mesh.visible = wallNow - particle.observedAt < 6_000;
       });
       controls.update();
       cameraStateRef.current = {
@@ -410,6 +459,7 @@ export function TopologySpaceExplorer({
       renderer.domElement.removeEventListener("pointerdown", onPointerDown);
       renderer.domElement.removeEventListener("pointermove", onPointerMove);
       renderer.domElement.removeEventListener("pointerup", onPointerUp);
+      controls.removeEventListener("change", onControlsChange);
       controls.dispose();
       renderer.dispose();
       scene.traverse((object) => {
@@ -424,11 +474,6 @@ export function TopologySpaceExplorer({
   }, [sceneData, onInspectNode]);
 
   const selectedNode = nodes.find((node) => node.id === selectedNodeId);
-  const eventNodes = new Map(nodes.map((node) => [node.id, node]));
-  const visibleEvents = events
-    .slice()
-    .sort((left, right) => right.observedAt - left.observedAt)
-    .slice(0, 20);
 
   return (
     <div className="space-explorer" role="dialog" aria-modal="true" aria-label="トポロジー宇宙探索ビュー">

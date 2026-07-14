@@ -98,11 +98,19 @@ export function TopologyPage() {
   }, []);
 
   useEffect(() => {
+    let timer: number | null = null;
     const unlistener = listen("topology-updated", () => {
-      void queryClient.invalidateQueries({ queryKey: ["topology"] });
+      if (timer != null) window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        timer = null;
+        void queryClient.invalidateQueries({ queryKey: ["topology"] });
+      }, spaceExplorerOpen ? 600 : 250);
     }).catch(() => () => undefined);
-    return () => { void unlistener.then((unlisten) => unlisten()); };
-  }, [queryClient]);
+    return () => {
+      if (timer != null) window.clearTimeout(timer);
+      void unlistener.then((unlisten) => unlisten());
+    };
+  }, [queryClient, spaceExplorerOpen]);
 
   const graph = useMemo(() => {
     const registered = data.nodes.filter((node) => node.registered && (kind === "all" || node.kind === kind));
@@ -155,7 +163,7 @@ export function TopologyPage() {
           <option value="symbol">Symbol</option><option value="nis1">NEM</option><option value="all">Symbol / NEM</option>
         </select>
         <label className="topology-toggle"><input type="checkbox" checked={showExternal} onChange={(event) => setShowExternal(event.target.checked)} />外部ピア</label>
-        <button className="button topology-space-button" disabled={graph.nodes.length === 0 || isLoading} onClick={() => setSpaceExplorerOpen(true)}><Rocket size={16} />宇宙探索</button>
+        <button className="button topology-space-button" aria-label="宇宙探索を開く" title="宇宙探索" disabled={graph.nodes.length === 0 || isLoading} onClick={() => setSpaceExplorerOpen(true)}><Rocket size={16} /></button>
         <button className="button" onClick={() => setPaused((value) => !value)}>{paused ? <Play size={16} /> : <Pause size={16} />}{paused ? "再開" : "一時停止"}</button>
         <button className="icon-button" title="再取得" aria-label="トポロジーを再取得" onClick={() => void refetch()}><RefreshCw size={16} /></button>
       </div>

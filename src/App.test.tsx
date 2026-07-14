@@ -28,6 +28,7 @@ vi.mock("./services/ipc", async () => {
       setNodeHarvestMetricsVisible: vi.fn().mockResolvedValue(undefined),
       alerts: vi.fn().mockResolvedValue([]),
       alert: vi.fn(),
+      deleteResolvedAlerts: vi.fn().mockResolvedValue(0),
       nodeDiagnostics: vi.fn().mockResolvedValue([]),
       runNodeDiagnostic: vi.fn(),
       takePendingNavigation: vi.fn().mockResolvedValue(null),
@@ -165,6 +166,7 @@ beforeEach(() => {
   vi.mocked(api.deleteNode).mockResolvedValue(undefined);
   vi.mocked(api.refreshNode).mockResolvedValue(undefined);
   vi.mocked(api.refreshAllNodes).mockResolvedValue(undefined);
+  vi.mocked(api.deleteResolvedAlerts).mockResolvedValue(0);
   vi.mocked(api.upsertNode).mockReset();
   vi.mocked(api.nodeDetail).mockReset();
   vi.mocked(api.metrics).mockResolvedValue([]);
@@ -193,7 +195,7 @@ test("トポロジー画面から宇宙探索ビューを開閉できる", async
   ]);
   renderApp("/topology");
 
-  const openButton = await screen.findByRole("button", { name: "宇宙探索" });
+  const openButton = await screen.findByRole("button", { name: "宇宙探索を開く" });
   expect(openButton).toBeEnabled();
   fireEvent.click(openButton);
 
@@ -211,7 +213,7 @@ test("トポロジー画面から宇宙探索ビューを開閉できる", async
   fireEvent.keyDown(window, { key: "Escape" });
   await waitFor(() => expect(screen.queryByRole("dialog", { name: "トポロジー宇宙探索ビュー" })).not.toBeInTheDocument());
 
-  fireEvent.click(screen.getByRole("button", { name: "宇宙探索" }));
+  fireEvent.click(screen.getByRole("button", { name: "宇宙探索を開く" }));
   expect(await screen.findByRole("dialog", { name: "トポロジー宇宙探索ビュー" })).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "宇宙探索を閉じる" }));
   await waitFor(() => expect(screen.queryByRole("dialog", { name: "トポロジー宇宙探索ビュー" })).not.toBeInTheDocument());
@@ -323,7 +325,7 @@ test("URLだけで登録し成功結果を表示する", async () => {
   expect(screen.queryByLabelText("表示名")).not.toBeInTheDocument();
   const url = await screen.findByLabelText("REST URL");
   fireEvent.change(url, { target: { value: registered.baseUrl } });
-  fireEvent.click(screen.getByRole("button", { name: "接続確認して登録" }));
+  fireEvent.click(screen.getByRole("button", { name: "登録して確認開始" }));
 
   await waitFor(() => expect(api.upsertNode).toHaveBeenCalled());
   expect(vi.mocked(api.upsertNode).mock.calls[0][0]).toEqual({ baseUrl: registered.baseUrl });
