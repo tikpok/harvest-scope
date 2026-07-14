@@ -21,6 +21,8 @@ use super::{desktop, websocket};
 
 const RESUME_LATE_THRESHOLD_MS: i64 = 15_000;
 const RESUME_GRACE_MS: i64 = 90_000;
+const OFFLINE_CONFIRMATION_DELAY_MS: i64 = 90_000;
+const OFFLINE_CONFIRMATION_FAILURES: u32 = 3;
 const SUSPENDED_REQUEST_THRESHOLD: Duration = Duration::from_secs(10);
 const SUPERNODE_INTERVAL_MS: i64 = 15 * 60 * 1_000;
 const SUPERNODE_CACHE_MS: i64 = 10 * 60 * 1_000;
@@ -202,22 +204,10 @@ async fn monitor_peer_node_inner(
     let mut last_error = None;
     match probe_result {
         Ok(()) => {
-            if resume_grace {
-                runtime.consecutive_successes = 0;
-                runtime.consecutive_failures = 0;
-            } else {
-                runtime.consecutive_successes += 1;
-                runtime.consecutive_failures = 0;
-            }
+            runtime.record_connectivity_success(resume_grace);
         }
         Err(error) => {
-            if resume_grace {
-                runtime.consecutive_successes = 0;
-                runtime.consecutive_failures = 0;
-            } else {
-                runtime.consecutive_failures += 1;
-                runtime.consecutive_successes = 0;
-            }
+            runtime.record_connectivity_failure(resume_grace, now, OFFLINE_CONFIRMATION_DELAY_MS);
             last_error = Some(error.to_string());
         }
     }
@@ -234,7 +224,7 @@ async fn monitor_peer_node_inner(
         runtime.latency_failures = 0;
         runtime.latency_successes = 0;
     }
-    let offline = runtime.consecutive_failures >= 3;
+    let offline = runtime.offline_confirmed(OFFLINE_CONFIRMATION_FAILURES);
     let recovered = runtime.consecutive_successes >= 2;
     let latency_alert = runtime.latency_failures >= 3;
     let latency_recovered = runtime.latency_successes >= 3;
@@ -461,23 +451,11 @@ async fn monitor_node_inner(
     let mut error = None;
     let health = match health_result {
         Ok(health) => {
-            if resume_grace {
-                runtime.consecutive_successes = 0;
-                runtime.consecutive_failures = 0;
-            } else {
-                runtime.consecutive_successes += 1;
-                runtime.consecutive_failures = 0;
-            }
+            runtime.record_connectivity_success(resume_grace);
             Some(health)
         }
         Err(err) => {
-            if resume_grace {
-                runtime.consecutive_failures = 0;
-                runtime.consecutive_successes = 0;
-            } else {
-                runtime.consecutive_failures += 1;
-                runtime.consecutive_successes = 0;
-            }
+            runtime.record_connectivity_failure(resume_grace, now, OFFLINE_CONFIRMATION_DELAY_MS);
             error = Some(err.to_string());
             None
         }
@@ -666,7 +644,7 @@ async fn monitor_node_inner(
     let health_degraded = health.as_ref().is_some_and(|health| !health.healthy);
     let status = if resume_grace && health.is_none() {
         NodeStatus::Unknown
-    } else if runtime.consecutive_failures >= 3 {
+    } else if runtime.offline_confirmed(OFFLINE_CONFIRMATION_FAILURES) {
         NodeStatus::Offline
     } else if runtime.consecutive_failures > 0 || health_degraded {
         NodeStatus::Warning
@@ -704,7 +682,7 @@ async fn monitor_node_inner(
     } else {
         runtime.zero_peers_since = None;
     }
-    let offline = runtime.consecutive_failures >= 3;
+    let offline = runtime.offline_confirmed(OFFLINE_CONFIRMATION_FAILURES);
     let recovered = runtime.consecutive_successes >= 2;
     let latency_alert = runtime.latency_failures >= 3;
     let latency_recovered = runtime.latency_successes >= 3;

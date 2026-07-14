@@ -18,6 +18,8 @@ use crate::{
 pub struct NodeRuntime {
     pub consecutive_failures: u32,
     pub consecutive_successes: u32,
+    pub offline_candidate_since: Option<i64>,
+    pub offline_confirmation_failures: u32,
     pub latency_failures: u32,
     pub latency_successes: u32,
     pub zero_peers_since: Option<i64>,
@@ -36,9 +38,58 @@ pub struct NodeRuntime {
 }
 
 impl NodeRuntime {
-    pub fn reset_after_resume(&mut self, now: i64) {
+    pub fn record_connectivity_success(&mut self, paused: bool) {
+        if paused {
+            self.reset_connectivity_counters();
+            return;
+        }
+
+        self.consecutive_successes += 1;
+        self.consecutive_failures = 0;
+        self.offline_candidate_since = None;
+        self.offline_confirmation_failures = 0;
+    }
+
+    pub fn record_connectivity_failure(
+        &mut self,
+        paused: bool,
+        now: i64,
+        confirmation_delay_ms: i64,
+    ) {
+        if paused {
+            self.reset_connectivity_counters();
+            return;
+        }
+
+        self.consecutive_failures += 1;
+        self.consecutive_successes = 0;
+        match self.offline_candidate_since {
+            Some(since) if now.saturating_sub(since) >= confirmation_delay_ms => {
+                self.offline_confirmation_failures += 1;
+            }
+            Some(_) => {
+                self.offline_confirmation_failures = 0;
+            }
+            None => {
+                self.offline_candidate_since = Some(now);
+                self.offline_confirmation_failures = 0;
+            }
+        }
+    }
+
+    pub fn offline_confirmed(&self, required_failures: u32) -> bool {
+        self.offline_confirmation_failures >= required_failures
+    }
+
+    fn reset_connectivity_counters(&mut self) {
         self.consecutive_failures = 0;
         self.consecutive_successes = 0;
+        self.offline_candidate_since = None;
+        self.offline_confirmation_failures = 0;
+    }
+
+    pub fn reset_after_resume(&mut self, now: i64) {
+        self.reset_connectivity_counters();
         self.latency_failures = 0;
         self.latency_successes = 0;
         self.zero_peers_since = None;
@@ -140,6 +191,8 @@ mod tests {
         let mut runtime = NodeRuntime {
             consecutive_failures: 3,
             consecutive_successes: 2,
+            offline_candidate_since: Some(1),
+            offline_confirmation_failures: 3,
             latency_failures: 3,
             latency_successes: 3,
             zero_peers_since: Some(1),
@@ -153,11 +206,46 @@ mod tests {
 
         assert_eq!(runtime.consecutive_failures, 0);
         assert_eq!(runtime.consecutive_successes, 0);
+        assert_eq!(runtime.offline_candidate_since, None);
+        assert_eq!(runtime.offline_confirmation_failures, 0);
         assert_eq!(runtime.latency_failures, 0);
         assert_eq!(runtime.latency_successes, 0);
         assert_eq!(runtime.zero_peers_since, None);
         assert_eq!(runtime.lag_warning_since, None);
         assert_eq!(runtime.lag_critical_since, None);
         assert_eq!(runtime.finalized_changed_at, Some(10_000));
+    }
+
+    #[test]
+    fn offline_confirmation_requires_delay_then_more_failures() {
+        let mut runtime = NodeRuntime::default();
+        for now in [0, 10_000, 20_000, 80_000] {
+            runtime.record_connectivity_failure(false, now, 90_000);
+            assert!(!runtime.offline_confirmed(3));
+        }
+
+        runtime.record_connectivity_failure(false, 90_000, 90_000);
+        assert_eq!(runtime.offline_confirmation_failures, 1);
+        assert!(!runtime.offline_confirmed(3));
+
+        runtime.record_connectivity_failure(false, 100_000, 90_000);
+        assert_eq!(runtime.offline_confirmation_failures, 2);
+        assert!(!runtime.offline_confirmed(3));
+
+        runtime.record_connectivity_failure(false, 110_000, 90_000);
+        assert!(runtime.offline_confirmed(3));
+    }
+
+    #[test]
+    fn success_clears_offline_candidate_state() {
+        let mut runtime = NodeRuntime::default();
+        runtime.record_connectivity_failure(false, 0, 90_000);
+        runtime.record_connectivity_failure(false, 90_000, 90_000);
+        runtime.record_connectivity_success(false);
+
+        assert_eq!(runtime.consecutive_failures, 0);
+        assert_eq!(runtime.consecutive_successes, 1);
+        assert_eq!(runtime.offline_candidate_since, None);
+        assert_eq!(runtime.offline_confirmation_failures, 0);
     }
 }
