@@ -111,6 +111,32 @@ impl Nis1Adapter {
         Some(format!("{host}:{port}"))
     }
 
+    fn find_supernode_program_node<'a>(
+        supernodes: &'a [SupernodeProgramNode],
+        local_endpoint: &str,
+        local_name: Option<&str>,
+    ) -> Option<&'a SupernodeProgramNode> {
+        let local_key = Self::supernode_match_key(local_endpoint)?;
+        if let Some(program_node) = supernodes
+            .iter()
+            .find(|node| Self::supernode_match_key(&node.endpoint).as_deref() == Some(&local_key))
+        {
+            return Some(program_node);
+        }
+
+        let local_name = local_name?.trim();
+        if local_name.is_empty() {
+            return None;
+        }
+        let mut matching_names = supernodes.iter().filter(|node| {
+            node.name
+                .as_deref()
+                .is_some_and(|name| name.trim().eq_ignore_ascii_case(local_name))
+        });
+        let program_node = matching_names.next()?;
+        matching_names.next().is_none().then_some(program_node)
+    }
+
     fn parse_round_timestamp(value: Option<&str>) -> Option<i64> {
         value.and_then(|value| {
             chrono::DateTime::parse_from_rfc3339(value)
@@ -314,16 +340,22 @@ impl NodeAdapter for Nis1Adapter {
         &self,
         supernodes: &[SupernodeProgramNode],
     ) -> AppResult<SupernodeSnapshot> {
-        let Some(local_key) = Self::supernode_match_key(&self.base_url) else {
+        if Self::supernode_match_key(&self.base_url).is_none() {
             return Ok(SupernodeSnapshot {
                 error: Some("Supernode照合用URLを解析できません。".into()),
                 ..SupernodeSnapshot::default()
             });
+        }
+        let endpoint_match = Self::find_supernode_program_node(supernodes, &self.base_url, None);
+        let local_name = if endpoint_match.is_none() {
+            self.probe().await.ok().and_then(|identity| identity.name)
+        } else {
+            None
         };
-        let Some(program_node) = supernodes
-            .iter()
-            .find(|node| Self::supernode_match_key(&node.endpoint).as_deref() == Some(&local_key))
-        else {
+        let program_node = endpoint_match.or_else(|| {
+            Self::find_supernode_program_node(supernodes, &self.base_url, local_name.as_deref())
+        });
+        let Some(program_node) = program_node else {
             return Ok(SupernodeSnapshot {
                 supernode_status: Some("not_found".into()),
                 ..SupernodeSnapshot::default()
@@ -394,6 +426,58 @@ mod tests {
             Nis1Adapter::supernode_match_key("http://example.com"),
             Some("example.com:7890".into())
         );
+    }
+
+    #[test]
+    fn matches_supernode_by_unique_name_when_monitoring_through_lan_url() {
+        let supernodes = vec![
+            SupernodeProgramNode {
+                id: 6021,
+                endpoint: "http://7338.work:7890".into(),
+                name: Some("7338tkpk".into()),
+                status: Some("active".into()),
+            },
+            SupernodeProgramNode {
+                id: 72052155,
+                endpoint: "http://xem35.ucanfork.duckdns.org:7890".into(),
+                name: Some("Another node".into()),
+                status: Some("active".into()),
+            },
+        ];
+
+        let matched = Nis1Adapter::find_supernode_program_node(
+            &supernodes,
+            "http://192.0.2.115:7890",
+            Some("7338tkpk"),
+        );
+
+        assert_eq!(matched.map(|node| node.id), Some(6021));
+    }
+
+    #[test]
+    fn does_not_match_supernode_when_fallback_name_is_duplicated() {
+        let supernodes = vec![
+            SupernodeProgramNode {
+                id: 1,
+                endpoint: "http://node-1.example:7890".into(),
+                name: Some("Shared name".into()),
+                status: Some("active".into()),
+            },
+            SupernodeProgramNode {
+                id: 2,
+                endpoint: "http://node-2.example:7890".into(),
+                name: Some("shared NAME".into()),
+                status: Some("active".into()),
+            },
+        ];
+
+        let matched = Nis1Adapter::find_supernode_program_node(
+            &supernodes,
+            "http://192.0.2.10:7890",
+            Some(" shared name "),
+        );
+
+        assert!(matched.is_none());
     }
 
     #[test]

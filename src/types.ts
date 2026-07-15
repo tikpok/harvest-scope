@@ -15,6 +15,8 @@ export interface NodeSummary {
   network: string | null;
   version: string | null;
   roles: string[];
+  observedRoles: string[];
+  restPrivate: boolean;
   enabled: boolean;
   favorite: boolean;
   status: NodeStatus;
@@ -54,8 +56,28 @@ export interface DashboardData {
   warning: number;
   critical: number;
   offline: number;
+  unknown: number;
   rechecking: boolean;
   nodes: NodeSummary[];
+}
+
+export interface RefreshAllFailure {
+  nodeId: string;
+  nodeName: string;
+  message: string;
+}
+
+export interface RefreshAllProgress {
+  completed: number;
+  total: number;
+  failed: number;
+}
+
+export interface RefreshAllResult {
+  total: number;
+  succeeded: number;
+  failed: number;
+  failures: RefreshAllFailure[];
 }
 
 export interface PeerInfo {

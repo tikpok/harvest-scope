@@ -6,7 +6,7 @@ import packageJson from "../package.json";
 import { api, defaultSettings } from "./services/ipc";
 import type { AlertRecord, DashboardData, DiagnosticRun, NodeSummary, TopologySnapshot } from "./types";
 
-const emptyDashboard: DashboardData = { total: 0, healthy: 0, warning: 0, critical: 0, offline: 0, rechecking: false, nodes: [] };
+const emptyDashboard: DashboardData = { total: 0, healthy: 0, warning: 0, critical: 0, offline: 0, unknown: 0, rechecking: false, nodes: [] };
 
 vi.mock("./services/ipc", async () => {
   const mod = await vi.importActual<typeof import("./services/ipc")>("./services/ipc");
@@ -14,11 +14,11 @@ vi.mock("./services/ipc", async () => {
     ...mod,
     api: {
       ...mod.api,
-      dashboard: vi.fn().mockResolvedValue({ total: 0, healthy: 0, warning: 0, critical: 0, offline: 0, rechecking: false, nodes: [] }),
+      dashboard: vi.fn().mockResolvedValue({ total: 0, healthy: 0, warning: 0, critical: 0, offline: 0, unknown: 0, rechecking: false, nodes: [] }),
       topology: vi.fn().mockResolvedValue({ nodes: [], edges: [], observedAt: 0 }),
       recentNetworkEvents: vi.fn().mockResolvedValue([]),
       recentHarvestEvents: vi.fn().mockResolvedValue([]),
-      refreshAllNodes: vi.fn().mockResolvedValue(undefined),
+      refreshAllNodes: vi.fn().mockResolvedValue({ total: 0, succeeded: 0, failed: 0, failures: [] }),
       refreshNode: vi.fn().mockResolvedValue(undefined),
       moveNode: vi.fn().mockResolvedValue(undefined),
       deleteNode: vi.fn().mockResolvedValue(undefined),
@@ -61,6 +61,8 @@ function node(id: string, displayName: string): NodeSummary {
     network: "Symbol Mainnet",
     version: "1.0.0",
     roles: ["Peer", "API"],
+    observedRoles: [],
+    restPrivate: false,
     enabled: true,
     favorite: false,
     status: "healthy",
@@ -165,7 +167,7 @@ beforeEach(() => {
   vi.mocked(api.moveNode).mockResolvedValue(undefined);
   vi.mocked(api.deleteNode).mockResolvedValue(undefined);
   vi.mocked(api.refreshNode).mockResolvedValue(undefined);
-  vi.mocked(api.refreshAllNodes).mockResolvedValue(undefined);
+  vi.mocked(api.refreshAllNodes).mockResolvedValue({ total: 0, succeeded: 0, failed: 0, failures: [] });
   vi.mocked(api.deleteResolvedAlerts).mockResolvedValue(0);
   vi.mocked(api.upsertNode).mockReset();
   vi.mocked(api.nodeDetail).mockReset();
@@ -186,6 +188,61 @@ test("日本語ダッシュボードを表示する", async () => {
   renderApp();
   expect(await screen.findByRole("heading", { name: "Harvest Scope" })).toBeInTheDocument();
   expect(screen.getByLabelText("アプリバージョン")).toHaveTextContent(`v${packageJson.version}`);
+});
+
+test("SymbolノードのAPI・PeerとVotingの組み合わせを種別に表示する", async () => {
+  vi.mocked(api.dashboard).mockResolvedValue({
+    total: 6,
+    healthy: 4,
+    warning: 0,
+    critical: 0,
+    offline: 2,
+    unknown: 0,
+    rechecking: false,
+    nodes: [
+      { ...node("1", "API Node"), roles: ["API"] },
+      { ...node("2", "API Voting Node"), roles: ["Peer", "API", "Voting"] },
+      { ...node("3", "Peer Node"), monitorMode: "peer", roles: ["Peer"] },
+      { ...node("4", "Peer Voting Node"), monitorMode: "peer", roles: ["Peer", "Voting"] },
+      { ...node("5", "Observed API Node"), roles: [], observedRoles: ["API"], restPrivate: true, status: "offline" },
+      { ...node("6", "Dual Voting Node"), roles: ["Peer", "Voting"], observedRoles: ["API"] },
+      { ...node("7", "Unverified Address"), roles: [], status: "offline" },
+      { ...node("8", "Verified API Node"), roles: [], observedRoles: ["API"], restPrivate: false },
+    ],
+  });
+
+  renderApp();
+
+  expect(within(await screen.findByRole("row", { name: /^API Node/ })).getByText("Symbol API")).toBeInTheDocument();
+  expect(within(screen.getByRole("row", { name: /API Voting Node/ })).getByText("Symbol API Voting")).toBeInTheDocument();
+  expect(within(screen.getByRole("row", { name: /Peer Node/ })).getByText("Symbol Peer")).toBeInTheDocument();
+  expect(within(screen.getByRole("row", { name: /Peer Voting Node/ })).getByText("Symbol Peer Voting")).toBeInTheDocument();
+  expect(within(screen.getByRole("row", { name: /Observed API Node/ })).getByText("REST未検出")).toBeInTheDocument();
+  expect(within(screen.getByRole("row", { name: /Observed API Node/ })).getByText("観測のみ")).toBeInTheDocument();
+  expect(within(screen.getByRole("row", { name: /Dual Voting Node/ })).getByText("Symbol API Voting")).toBeInTheDocument();
+  expect(within(screen.getByRole("row", { name: /Unverified Address/ })).getByText("未判定")).toBeInTheDocument();
+  expect(within(screen.getByRole("row", { name: /Verified API Node/ })).getByText("Symbol API")).toBeInTheDocument();
+});
+
+test("NIS1のSupernode対象ノードを種別に表示する", async () => {
+  vi.mocked(api.dashboard).mockResolvedValue({
+    total: 2,
+    healthy: 2,
+    warning: 0,
+    critical: 0,
+    offline: 0,
+    unknown: 0,
+    rechecking: false,
+    nodes: [
+      { ...node("1", "NIS1 Node"), kind: "nis1", supernodeId: null },
+      { ...node("2", "NIS1 Supernode"), kind: "nis1", supernodeId: 6021 },
+    ],
+  });
+
+  renderApp();
+
+  expect(within(await screen.findByRole("row", { name: /NIS1 Node/ })).getByText("NIS1")).toBeInTheDocument();
+  expect(within(screen.getByRole("row", { name: /NIS1 Supernode/ })).getByText("NIS1 S/N")).toBeInTheDocument();
 });
 
 test("トポロジー画面から宇宙探索ビューを開閉できる", async () => {
@@ -226,6 +283,7 @@ test("一覧からノードを上下に移動できる", async () => {
     warning: 0,
     critical: 0,
     offline: 0,
+    unknown: 0,
     rechecking: false,
     nodes: [node("1", "Node A"), node("2", "Node B")],
   });
@@ -247,6 +305,7 @@ test("全ノードを手動で再確認できる", async () => {
     warning: 0,
     critical: 0,
     offline: 1,
+    unknown: 0,
     rechecking: false,
     nodes: [{ ...node("1", "Node A"), status: "offline" }],
   });
@@ -256,6 +315,46 @@ test("全ノードを手動で再確認できる", async () => {
 
   await waitFor(() => expect(api.refreshAllNodes).toHaveBeenCalledOnce());
   expect(await screen.findByText("再確認中")).toBeInTheDocument();
+});
+
+test("REST未検出ノードを未確認カードへ集計する", async () => {
+  vi.mocked(api.dashboard).mockResolvedValue({
+    total: 51,
+    healthy: 48,
+    warning: 0,
+    critical: 1,
+    offline: 0,
+    unknown: 2,
+    rechecking: false,
+    nodes: [],
+  });
+  renderApp();
+
+  await waitFor(() => {
+    const cards = screen
+      .getAllByText("未確認")
+      .map((item) => item.closest("article"))
+      .filter((item): item is HTMLElement => item !== null);
+    expect(cards.some((card) => card.textContent?.includes("2"))).toBe(true);
+  });
+});
+
+test("全ノード再確認の部分失敗を成功件数とともに表示する", async () => {
+  vi.mocked(api.refreshAllNodes).mockResolvedValue({
+    total: 51,
+    succeeded: 49,
+    failed: 2,
+    failures: [
+      { nodeId: "1", nodeName: "REST未検出A", message: "タイムアウトしました" },
+      { nodeId: "2", nodeName: "REST未検出B", message: "タイムアウトしました" },
+    ],
+  });
+  renderApp();
+
+  fireEvent.click(await screen.findByRole("button", { name: "全ノード再確認" }));
+
+  expect(await screen.findByText("49/51台成功、2台失敗")).toBeInTheDocument();
+  expect(screen.queryByText(/操作に失敗しました/)).not.toBeInTheDocument();
 });
 
 test("NIS1詳細でSupernodeプログラムの失敗項目を表示する", async () => {
@@ -294,6 +393,43 @@ test("NIS1詳細でSupernodeプログラムの失敗項目を表示する", asyn
   expect(screen.getByText("帯域")).toBeInTheDocument();
 });
 
+test("REST未検出ノード詳細のピア情報はトポロジー案内を表示する", async () => {
+  const observedOnlyNode = {
+    ...node("4", "Observed API Node"),
+    roles: [],
+    observedRoles: ["API"],
+    restPrivate: true,
+    status: "unknown" as const,
+  };
+  vi.mocked(api.nodeDetail).mockResolvedValue({
+    node: observedOnlyNode,
+    publicKey: null,
+    roles: [],
+    restVersion: null,
+    chainScore: null,
+    apiStatus: null,
+    dbStatus: null,
+    nisStatusCode: null,
+    peers: [{
+      key: "peer-1",
+      name: "Peer A",
+      host: "example.test",
+      port: 7900,
+      status: "active",
+      version: "1.0.0",
+      roles: ["Peer"],
+    }],
+    websocketConnected: false,
+    recentHarvests: [],
+  });
+  renderApp("/nodes/4");
+
+  expect(await screen.findByRole("heading", { name: "現在のピア" })).toBeInTheDocument();
+  expect(screen.getByText("ピア一覧は対象外です")).toBeInTheDocument();
+  expect(screen.getByText(/トポロジーでは他の監視APIノードが報告した接続として表示されます/)).toBeInTheDocument();
+  expect(screen.queryByText("Peer A")).not.toBeInTheDocument();
+});
+
 test("確認後に一覧からノードの登録を解除できる", async () => {
   vi.mocked(api.dashboard).mockResolvedValue({
     total: 1,
@@ -301,6 +437,7 @@ test("確認後に一覧からノードの登録を解除できる", async () =>
     warning: 0,
     critical: 0,
     offline: 0,
+    unknown: 0,
     rechecking: false,
     nodes: [node("1", "Node A")],
   });
@@ -314,6 +451,68 @@ test("確認後に一覧からノードの登録を解除できる", async () =>
   confirm.mockRestore();
 });
 
+test("別ノードの削除完了を待たずに連続して登録解除できる", async () => {
+  vi.mocked(api.dashboard).mockResolvedValue({
+    total: 2,
+    healthy: 2,
+    warning: 0,
+    critical: 0,
+    offline: 0,
+    unknown: 0,
+    rechecking: false,
+    nodes: [node("1", "Node A"), node("2", "Node B")],
+  });
+  let resolveFirstDelete: (() => void) | undefined;
+  const firstDelete = new Promise<void>((resolve) => {
+    resolveFirstDelete = resolve;
+  });
+  vi.mocked(api.deleteNode).mockImplementation((id) => id === "1" ? firstDelete : Promise.resolve());
+  const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+  renderApp();
+
+  fireEvent.click(await screen.findByRole("button", { name: "Node Aの登録を解除" }));
+  await waitFor(() => expect(api.deleteNode).toHaveBeenCalledWith("1"));
+
+  const secondDelete = screen.getByRole("button", { name: "Node Bの登録を解除" });
+  expect(secondDelete).toBeEnabled();
+  fireEvent.click(secondDelete);
+  await waitFor(() => expect(api.deleteNode).toHaveBeenCalledWith("2"));
+
+  resolveFirstDelete?.();
+  confirm.mockRestore();
+});
+
+test("連続した登録解除の一部が失敗しても成功したノードは一覧に戻さない", async () => {
+  vi.mocked(api.dashboard).mockResolvedValue({
+    total: 2,
+    healthy: 2,
+    warning: 0,
+    critical: 0,
+    offline: 0,
+    unknown: 0,
+    rechecking: false,
+    nodes: [node("1", "Node A"), node("2", "Node B")],
+  });
+  let rejectFirstDelete: ((error: Error) => void) | undefined;
+  const firstDelete = new Promise<void>((_resolve, reject) => {
+    rejectFirstDelete = reject;
+  });
+  vi.mocked(api.deleteNode).mockImplementation((id) => id === "1" ? firstDelete : Promise.resolve());
+  const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+  renderApp();
+
+  fireEvent.click(await screen.findByRole("button", { name: "Node Aの登録を解除" }));
+  await waitFor(() => expect(api.deleteNode).toHaveBeenCalledWith("1"));
+  fireEvent.click(screen.getByRole("button", { name: "Node Bの登録を解除" }));
+  await waitFor(() => expect(api.deleteNode).toHaveBeenCalledWith("2"));
+
+  rejectFirstDelete?.(new Error("削除できませんでした"));
+  expect(await screen.findByRole("button", { name: "Node Aの登録を解除" })).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Node Bの登録を解除" })).not.toBeInTheDocument();
+
+  confirm.mockRestore();
+});
+
 test("URLだけで登録し成功結果を表示する", async () => {
   const registered = {
     ...node("3", "Symbol API Node"),
@@ -323,7 +522,7 @@ test("URLだけで登録し成功結果を表示する", async () => {
   renderApp("/discovery");
 
   expect(screen.queryByLabelText("表示名")).not.toBeInTheDocument();
-  const url = await screen.findByLabelText("REST URL");
+  const url = await screen.findByLabelText("IP・DNS");
   fireEvent.change(url, { target: { value: registered.baseUrl } });
   fireEvent.click(screen.getByRole("button", { name: "登録して確認開始" }));
 
@@ -332,6 +531,22 @@ test("URLだけで登録し成功結果を表示する", async () => {
   expect(await screen.findByText("「Symbol API Node」を登録しました。")).toBeInTheDocument();
   expect(screen.getByText(registered.baseUrl)).toBeInTheDocument();
   expect(url).toHaveValue("");
+});
+
+test("APIノード登録はIP・DNSをそのまま自動検出へ渡す", async () => {
+  const registered = {
+    ...node("4", "Observed API Node"),
+    baseUrl: "https://203.0.113.227:3001",
+  };
+  vi.mocked(api.upsertNode).mockResolvedValue(registered);
+  renderApp("/discovery");
+
+  const url = await screen.findByLabelText("IP・DNS");
+  fireEvent.change(url, { target: { value: "202.61.248.218" } });
+  fireEvent.click(screen.getByRole("button", { name: "登録して確認開始" }));
+
+  await waitFor(() => expect(api.upsertNode).toHaveBeenCalled());
+  expect(vi.mocked(api.upsertNode).mock.calls[0][0]).toEqual({ baseUrl: "202.61.248.218" });
 });
 
 const alert: AlertRecord = {

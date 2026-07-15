@@ -279,6 +279,8 @@ mod tests {
             network: None,
             version: None,
             roles: Vec::new(),
+            observed_roles: Vec::new(),
+            rest_private: false,
             enabled,
             favorite: false,
             status,

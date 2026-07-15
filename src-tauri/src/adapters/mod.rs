@@ -2,7 +2,7 @@ mod nis1;
 mod symbol;
 
 use reqwest::Client;
-use std::time::Duration;
+use std::{net::Ipv6Addr, time::Duration};
 use tokio::net::{lookup_host, TcpStream};
 use url::Url;
 
@@ -37,6 +37,70 @@ pub fn normalize_base_url(input: &str) -> AppResult<String> {
     url.set_path("");
     let normalized = url.as_str().trim_end_matches('/').to_string();
     Ok(normalized)
+}
+
+pub fn normalize_api_registration_target(input: &str) -> AppResult<String> {
+    let raw = input.trim();
+    if raw.is_empty() {
+        return Err(AppError::InvalidUrl(
+            "IPまたはDNS名を入力してください".into(),
+        ));
+    }
+    if raw.contains("://") {
+        return normalize_base_url(raw);
+    }
+
+    let authority = if raw.parse::<Ipv6Addr>().is_ok() {
+        format!("[{raw}]")
+    } else {
+        raw.to_owned()
+    };
+    let mut url = Url::parse(&format!("https://{authority}"))?;
+    if url.port().is_none() {
+        url.set_port(Some(3001))
+            .map_err(|_| AppError::InvalidUrl("RESTポートを設定できません".into()))?;
+    }
+    normalize_base_url(url.as_str())
+}
+
+pub fn api_probe_candidates(base_url: &str) -> AppResult<Vec<String>> {
+    let normalized = normalize_base_url(base_url)?;
+    let requested = Url::parse(&normalized)?;
+    let mut candidates = vec![normalized];
+
+    let mut push = |scheme: &str, port: u16| -> AppResult<()> {
+        let mut candidate = requested.clone();
+        candidate
+            .set_scheme(scheme)
+            .map_err(|_| AppError::InvalidUrl("REST URLを正規化できません".into()))?;
+        candidate
+            .set_port(Some(port))
+            .map_err(|_| AppError::InvalidUrl("RESTポートを設定できません".into()))?;
+        candidate.set_path("");
+        let candidate = candidate.as_str().trim_end_matches('/').to_owned();
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+        Ok(())
+    };
+
+    if let Some(port) = requested
+        .port()
+        .filter(|port| ![3000, 3001, 7890].contains(port))
+    {
+        push(
+            if requested.scheme() == "https" {
+                "http"
+            } else {
+                "https"
+            },
+            port,
+        )?;
+    }
+    push("https", 3001)?;
+    push("http", 3000)?;
+    push("http", 7890)?;
+    Ok(candidates)
 }
 
 pub fn normalize_peer_endpoint(input: &str) -> AppResult<String> {
@@ -145,4 +209,35 @@ pub(crate) fn u64_value(value: Option<&serde_json::Value>) -> Option<u64> {
         serde_json::Value::Number(value) => value.as_u64(),
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_host_only_api_registration_to_symbol_https() {
+        assert_eq!(
+            normalize_api_registration_target("202.61.248.218").unwrap(),
+            "https://202.61.248.218:3001"
+        );
+        assert_eq!(
+            normalize_api_registration_target("node.example.com:3003").unwrap(),
+            "https://node.example.com:3003"
+        );
+    }
+
+    #[test]
+    fn probes_the_requested_endpoint_before_standard_rest_candidates() {
+        assert_eq!(
+            api_probe_candidates("https://202.61.248.218:3003").unwrap(),
+            [
+                "https://202.61.248.218:3003",
+                "http://202.61.248.218:3003",
+                "https://202.61.248.218:3001",
+                "http://202.61.248.218:3000",
+                "http://202.61.248.218:7890",
+            ]
+        );
+    }
 }

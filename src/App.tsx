@@ -1,5 +1,6 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { listen } from "@tauri-apps/api/event";
 import {
   Activity,
   ArrowDown,
@@ -40,7 +41,7 @@ import { StatusBadge } from "./components/StatusBadge";
 import { MetricChart } from "./components/MetricChart";
 import { TopologyPage } from "./components/TopologyPage";
 import packageJson from "../package.json";
-import type { AppSettings, DashboardData, DiagnosticRun, HarvestEvent, NodeDetail, NodeStatus, NodeSummary, ScanCandidate, TopologySnapshot } from "./types";
+import type { AppSettings, DashboardData, DiagnosticRun, HarvestEvent, NodeDetail, NodeStatus, NodeSummary, RefreshAllProgress, ScanCandidate, TopologySnapshot } from "./types";
 
 function formatTime(value: number | null) {
   return value ? new Intl.DateTimeFormat("ja-JP", { dateStyle: "short", timeStyle: "medium" }).format(value) : "—";
@@ -58,10 +59,30 @@ function hasRole(node: { roles?: string[] }, role: string) {
   return node.roles?.some((value) => value.toLowerCase() === role.toLowerCase()) ?? false;
 }
 
-function nodeKindLabel(node: { kind: string; monitorMode: string; roles?: string[] }) {
-  if (node.kind === "nis1") return "NIS1";
-  if (node.monitorMode === "peer") return hasRole(node, "Voting") ? "Symbol Voting" : "Symbol Peer";
-  return "Symbol API";
+function nodeKindLabel(node: { kind: string; monitorMode: string; roles?: string[]; observedRoles?: string[]; restPrivate?: boolean; supernodeId?: number | null }) {
+  if (node.kind === "nis1") return node.supernodeId != null ? "NIS1 S/N" : "NIS1";
+  if (node.monitorMode === "api" && node.restPrivate) return "REST未検出";
+  if (node.monitorMode === "api" && (node.roles?.length ?? 0) === 0) {
+    const observedApi = hasRole({ roles: node.observedRoles }, "API");
+    if (!observedApi) return "未判定";
+  }
+  const connectionType = node.monitorMode === "peer" ? "Peer" : "API";
+  const votingType = hasRole(node, "Voting") ? " Voting" : "";
+  return `Symbol ${connectionType}${votingType}`;
+}
+
+function nodeKindClass(label: string, kind: string) {
+  if (label === "未判定") return "unverified";
+  if (label === "REST未検出") return "observed";
+  return kind;
+}
+
+function nodeStatusLabel(node: { kind: string; monitorMode: string; roles?: string[]; observedRoles?: string[]; restPrivate?: boolean; supernodeId?: number | null }) {
+  return nodeKindLabel(node) === "REST未検出" ? "観測のみ" : undefined;
+}
+
+function usesTopologyPeerView(node: { kind: string; monitorMode: string; roles?: string[]; observedRoles?: string[]; restPrivate?: boolean; supernodeId?: number | null }) {
+  return isPeerMonitor(node) || nodeKindLabel(node) === "REST未検出";
 }
 
 function formatNetwork(value: string | null) {
@@ -253,16 +274,17 @@ function Layout({ children }: { children: React.ReactNode }) {
   );
 }
 
-const statMeta: { key: keyof Pick<ReturnType<typeof emptyDashboard>, "total" | "healthy" | "warning" | "critical" | "offline">; label: string; tone: string }[] = [
+const statMeta: { key: keyof Pick<ReturnType<typeof emptyDashboard>, "total" | "healthy" | "warning" | "critical" | "offline" | "unknown">; label: string; tone: string }[] = [
   { key: "total", label: "監視ノード", tone: "blue" },
   { key: "healthy", label: "正常", tone: "green" },
   { key: "warning", label: "警告", tone: "amber" },
   { key: "critical", label: "重大", tone: "red" },
   { key: "offline", label: "オフライン", tone: "muted" },
+  { key: "unknown", label: "未確認", tone: "muted" },
 ];
 
 function emptyDashboard() {
-  return { total: 0, healthy: 0, warning: 0, critical: 0, offline: 0, rechecking: false, nodes: [] };
+  return { total: 0, healthy: 0, warning: 0, critical: 0, offline: 0, unknown: 0, rechecking: false, nodes: [] };
 }
 
 function dashboardFromNodes(nodes: NodeSummary[], rechecking = false): DashboardData {
@@ -272,6 +294,7 @@ function dashboardFromNodes(nodes: NodeSummary[], rechecking = false): Dashboard
     warning: nodes.filter((node) => node.status === "warning").length,
     critical: nodes.filter((node) => node.status === "critical").length,
     offline: nodes.filter((node) => node.status === "offline").length,
+    unknown: nodes.filter((node) => node.status === "unknown").length,
     rechecking,
     nodes,
   };
@@ -294,17 +317,53 @@ function restoreDashboard(
   if (context?.previous) queryClient.setQueryData(["dashboard"], context.previous);
 }
 
+function restoreRemovedDashboardNode(
+  queryClient: ReturnType<typeof useQueryClient>,
+  context: { previous?: DashboardData } | undefined,
+  nodeId: string,
+) {
+  const previousNodes = context?.previous?.nodes;
+  const removedNode = previousNodes?.find((node) => node.id === nodeId);
+  if (!removedNode || !previousNodes) return;
+  const originalIndex = previousNodes.findIndex((node) => node.id === nodeId);
+  updateDashboard(queryClient, (current) => {
+    if (current.some((node) => node.id === nodeId)) return current;
+    const restored = [...current];
+    restored.splice(Math.min(originalIndex, restored.length), 0, removedNode);
+    return restored;
+  });
+}
+
 function DashboardPage() {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const { nodeFilter, setNodeFilter } = useUiStore();
   const [statusFilter, setStatusFilter] = useState<NodeStatus | "all">("all");
+  const [refreshProgress, setRefreshProgress] = useState<RefreshAllProgress | null>(null);
   const { data = emptyDashboard(), isLoading, error } = useQuery({ queryKey: ["dashboard"], queryFn: api.dashboard, refetchInterval: 10_000 });
   const refreshNode = useMutation({ mutationFn: api.refreshNode, onSuccess: () => queryClient.invalidateQueries({ queryKey: ["dashboard"] }) });
   const refreshAll = useMutation({
     mutationFn: api.refreshAllNodes,
-    onSettled: () => queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
+    onMutate: () => setRefreshProgress({ completed: 0, total: data.total, failed: 0 }),
+    onSettled: () => {
+      setRefreshProgress(null);
+      void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+    },
   });
+  useEffect(() => {
+    let dispose: (() => void) | undefined;
+    let active = true;
+    void listen<RefreshAllProgress>("refresh-all-progress", ({ payload }) => {
+      if (active) setRefreshProgress(payload);
+    }).then((unlisten) => {
+      if (active) dispose = unlisten;
+      else unlisten();
+    }).catch(() => undefined);
+    return () => {
+      active = false;
+      dispose?.();
+    };
+  }, []);
   const isRechecking = refreshAll.isPending || data.rechecking;
   const pause = useMutation({
     mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) => enabled ? api.pauseNode(id) : api.resumeNode(id),
@@ -341,7 +400,7 @@ function DashboardPage() {
       updateDashboard(queryClient, (current) => current.filter((node) => node.id !== id));
       return { previous };
     },
-    onError: (_error, _variables, context) => restoreDashboard(queryClient, context),
+    onError: (_error, id, context) => restoreRemovedDashboardNode(queryClient, context, id),
   });
   const nodes = useMemo(() => data.nodes.filter((node) => {
     const text = `${node.displayName} ${node.baseUrl} ${node.network ?? ""}`.toLowerCase();
@@ -374,7 +433,8 @@ function DashboardPage() {
         </div>
         {error && <div className="notice notice--error">監視サービスに接続できません: {String(error)}</div>}
         {(reorder.error || remove.error || refreshAll.error) && <div className="notice notice--error">操作に失敗しました: {String(reorder.error ?? remove.error ?? refreshAll.error)}</div>}
-        {isRechecking && <div className="notice notice--info">全ノードの接続状態を再確認しています。完了すると自動的に表示を更新します。</div>}
+        {refreshAll.data && <div className={`notice ${refreshAll.data.failed > 0 ? "notice--warning" : "notice--success"}`}>{refreshAll.data.succeeded}/{refreshAll.data.total}台成功、{refreshAll.data.failed}台失敗</div>}
+        {isRechecking && <div className="notice notice--info">全ノードの接続状態を再確認しています。{refreshProgress && refreshProgress.total > 0 ? `${refreshProgress.completed}/${refreshProgress.total}` : ""}</div>}
         {isLoading ? <div className="loading">監視データを読み込み中…</div> : nodes.length === 0 ? (
           <EmptyState title="監視ノードがありません">「ノード追加」からURLを登録するか、LAN内をスキャンしてください。</EmptyState>
         ) : (
@@ -382,14 +442,14 @@ function DashboardPage() {
             <thead><tr><th>ノード</th><th>種別</th><th>状態</th><th>チェーン高</th><th>ファイナライズ高</th><th>遅延</th><th>ピア</th><th>REST</th><th>最終確認</th><th aria-label="操作" /></tr></thead>
             <tbody>{nodes.map((node, index) => <tr key={node.id} className="clickable" onClick={() => navigate(`/nodes/${node.id}`)}>
               <td className="node-table__node" title={`${node.displayName}\n${node.baseUrl}`}><strong>{node.displayName}</strong><small>{node.baseUrl}</small>{node.showHarvestMetrics && node.kind === "symbol" && <div className="harvest-chips"><span><Cherry size={12} />{node.delegatedHarvesterCount ?? "—"}</span><span className={node.delegatedHarvesterDelta && node.delegatedHarvesterDelta !== 0 ? (node.delegatedHarvesterDelta > 0 ? "text-good" : "text-warn") : undefined}>{formatDelta(node.delegatedHarvesterDelta)}</span><span>{formatXym(node.totalBalanceMicroXym)}</span></div>}{node.kind === "nis1" && <div className="supernode-chips"><span className={`supernode-chip ${supernodeClass(node.supernodeChecksPassed, node.supernodeStatus)}`}>{supernodeLabel(node.supernodeChecksPassed, node.supernodeStatus)}</span>{node.supernodeLastRound != null && <span>#{node.supernodeLastRound}</span>}</div>}</td>
-              <td><span className={`kind kind--${node.kind}`}>{nodeKindLabel(node)}</span></td>
-              <td><StatusBadge status={isRechecking ? "unknown" : node.status} label={isRechecking ? "再確認中" : undefined} /></td><td className="mono">{node.height ?? "—"}</td><td className="mono">{node.finalizedHeight ?? "—"}</td><td>{node.lag ?? "—"}</td><td>{node.peerCount ?? "—"}</td><td>{formatLatency(node.latencyMs)}</td><td>{formatTime(node.lastSeenAt)}</td>
+              <td><span className={`kind kind--${nodeKindClass(nodeKindLabel(node), node.kind)}`}>{nodeKindLabel(node)}</span></td>
+              <td><StatusBadge status={isRechecking ? "unknown" : node.status} label={isRechecking ? "再確認中" : nodeStatusLabel(node)} /></td><td className="mono">{node.height ?? "—"}</td><td className="mono">{node.finalizedHeight ?? "—"}</td><td>{node.lag ?? "—"}</td><td>{node.peerCount ?? "—"}</td><td>{formatLatency(node.latencyMs)}</td><td>{formatTime(node.lastSeenAt)}</td>
               <td><div className="row-actions">
                 <button className="icon-button" aria-label={`${node.displayName}を上へ移動`} title={reorderTitle ?? "上へ移動"} disabled={filterActive || index === 0 || reorder.isPending} onClick={(event) => { event.stopPropagation(); reorder.mutate({ id: node.id, direction: "up" }); }}><ArrowUp size={16} /></button>
                 <button className="icon-button" aria-label={`${node.displayName}を下へ移動`} title={reorderTitle ?? "下へ移動"} disabled={filterActive || index === nodes.length - 1 || reorder.isPending} onClick={(event) => { event.stopPropagation(); reorder.mutate({ id: node.id, direction: "down" }); }}><ArrowDown size={16} /></button>
                 <button className="icon-button" title="今すぐ更新" onClick={(event) => { event.stopPropagation(); refreshNode.mutate(node.id); }}><RefreshCw size={16} /></button>
                 <button className="icon-button" title={node.enabled ? "監視を停止" : "監視を再開"} onClick={(event) => { event.stopPropagation(); pause.mutate({ id: node.id, enabled: node.enabled }); }}>{node.enabled ? <Pause size={16} /> : <Play size={16} />}</button>
-                <button className="icon-button icon-button--danger" aria-label={`${node.displayName}の登録を解除`} title="登録解除" disabled={remove.isPending} onClick={(event) => { event.stopPropagation(); unregisterNode(node.id, node.displayName); }}><Trash2 size={16} /></button>
+                <button className="icon-button icon-button--danger" aria-label={`${node.displayName}の登録を解除`} title="登録解除" onClick={(event) => { event.stopPropagation(); unregisterNode(node.id, node.displayName); }}><Trash2 size={16} /></button>
                 <ChevronRight size={17} />
               </div></td>
             </tr>)}</tbody>
@@ -443,11 +503,13 @@ function NodeDetailPage() {
   });
   if (isLoading) return <div className="loading">ノード詳細を読み込み中…</div>;
   if (error || !data) return <div className="notice notice--error">ノード情報を取得できません。</div>;
+  const detailNode = { ...data.node, roles: data.roles };
+  const peerListUsesTopology = usesTopologyPeerView(detailNode);
   return <>
-    <div className="page-heading"><div><button className="link-button" onClick={() => navigate("/")}>← ダッシュボード</button><h2>{data.node.displayName}</h2><p>{data.node.baseUrl}</p></div><div className="actions"><StatusBadge status={data.node.status} /><button className="button button--danger" onClick={() => remove.mutate()}><Trash2 size={16} />削除</button></div></div>
+    <div className="page-heading"><div><button className="link-button" onClick={() => navigate("/")}>← ダッシュボード</button><h2>{data.node.displayName}</h2><p>{data.node.baseUrl}</p></div><div className="actions"><StatusBadge status={data.node.status} label={nodeStatusLabel(data.node)} /><button className="button button--danger" onClick={() => remove.mutate()}><Trash2 size={16} />削除</button></div></div>
     <section className="detail-grid">
       <article className="panel detail-card"><h3>チェーン</h3><dl><div><dt>高さ</dt><dd>{isPeerMonitor(data.node) ? "対象外" : data.node.height ?? "—"}</dd></div><div><dt>ファイナライズ高</dt><dd>{isPeerMonitor(data.node) ? "対象外" : data.node.finalizedHeight ?? "対象外"}</dd></div><div><dt>同期遅延</dt><dd>{isPeerMonitor(data.node) ? "対象外" : data.node.lag ?? "—"}</dd></div><div><dt>チェーンスコア</dt><dd className="mono text-truncate">{isPeerMonitor(data.node) ? "対象外" : data.chainScore ?? "—"}</dd></div></dl></article>
-      <article className="panel detail-card"><h3>ノード</h3><dl><div><dt>種別</dt><dd>{nodeKindLabel({ ...data.node, roles: data.roles })}</dd></div><div><dt>ネットワーク</dt><dd>{formatNetwork(data.node.network)}</dd></div><div><dt>バージョン</dt><dd>{data.node.version ?? "—"}</dd></div><div><dt>REST</dt><dd>{isPeerMonitor(data.node) ? "対象外" : data.restVersion ?? "—"}</dd></div></dl></article>
+      <article className="panel detail-card"><h3>ノード</h3><dl><div><dt>種別</dt><dd>{nodeKindLabel(detailNode)}</dd></div><div><dt>ネットワーク</dt><dd>{formatNetwork(data.node.network)}</dd></div><div><dt>バージョン</dt><dd>{data.node.version ?? "—"}</dd></div><div><dt>REST</dt><dd>{isPeerMonitor(data.node) ? "対象外" : data.restVersion ?? "—"}</dd></div></dl></article>
       <article className="panel detail-card"><h3>接続</h3><dl><div><dt>{isPeerMonitor(data.node) ? "P2P応答" : "REST応答"}</dt><dd>{formatLatency(data.node.latencyMs)}</dd></div><div><dt>ピア</dt><dd>{isPeerMonitor(data.node) ? "対象外" : data.node.peerCount ?? "—"}</dd></div><div><dt>API / DB</dt><dd>{isPeerMonitor(data.node) ? "対象外" : [data.apiStatus, data.dbStatus].filter(Boolean).join(" / ") || "—"}</dd></div><div><dt>WebSocket</dt><dd>{isPeerMonitor(data.node) ? "対象外" : data.node.kind === "symbol" ? (data.websocketConnected ? "接続中" : "RESTへフォールバック") : "対象外"}</dd></div></dl></article>
       <article className="panel detail-card certificate-card"><h3>証明書</h3>{data.node.kind !== "symbol" ? <p className="harvest-empty">Symbolノードのみ対象です。</p> : <><dl><div><dt>ノード証明書</dt><dd>{isPeerMonitor(data.node) ? "対象外" : formatTime(data.node.nodeCertificateNotAfter)}</dd></div><div><dt>残り日数</dt><dd className={data.node.nodeCertificateRemainingDays != null && data.node.nodeCertificateRemainingDays <= 7 ? "text-warn" : undefined}>{isPeerMonitor(data.node) ? "対象外" : formatDays(data.node.nodeCertificateRemainingDays)}</dd></div><div><dt>投票キー範囲</dt><dd>{hasRole(data, "Voting") || !isPeerMonitor(data.node) ? (data.node.votingKeyStartEpoch != null || data.node.votingKeyEndEpoch != null ? `${data.node.votingKeyStartEpoch ?? "—"} - ${data.node.votingKeyEndEpoch ?? "—"}` : "—") : "対象外"}</dd></div><div><dt>残りepoch</dt><dd className={data.node.votingKeyRemainingEpochs != null && data.node.votingKeyRemainingEpochs <= 7 ? "text-warn" : undefined}>{hasRole(data, "Voting") || !isPeerMonitor(data.node) ? formatEpochs(data.node.votingKeyRemainingEpochs) : "対象外"}</dd></div><div><dt>現在epoch</dt><dd>{hasRole(data, "Voting") || !isPeerMonitor(data.node) ? data.node.finalizationEpoch ?? "—" : "対象外"}</dd></div></dl>{data.node.certificateMetricError && <p className="harvest-error">取得エラー: {data.node.certificateMetricError}</p>}</>}</article>
       <article className="panel detail-card harvest-card"><div className="detail-card__heading"><h3>委任ハーベスト</h3>{data.node.kind === "symbol" && <label className="mini-toggle"><input type="checkbox" checked={data.node.showHarvestMetrics} disabled={toggleHarvest.isPending} onChange={(event) => toggleHarvest.mutate(event.target.checked)} />表示</label>}</div>{data.node.kind !== "symbol" ? <p className="harvest-empty">Symbolノードのみ対象です。</p> : data.node.showHarvestMetrics ? <><dl><div><dt>委任者数</dt><dd>{data.node.delegatedHarvesterCount ?? "—"}</dd></div><div><dt>24時間増減</dt><dd>{formatDelta(data.node.delegatedHarvesterDelta)}</dd></div><div><dt>合計XYM</dt><dd>{formatXym(data.node.totalBalanceMicroXym)}</dd></div><div><dt>最新検知</dt><dd>{formatTime(data.node.latestHarvestAt)}</dd></div></dl>{data.node.harvestMetricError && <p className="harvest-error">取得エラー: {data.node.harvestMetricError}</p>}<HarvestEventList events={data.recentHarvests} /></> : <p className="harvest-empty">表示をONにすると委任ハーベスト情報を表示します。</p>}</article>
@@ -455,7 +517,19 @@ function NodeDetailPage() {
     </section>
     <DiagnosticPanel latest={diagnose.data ?? diagnostics[0]} history={diagnostics} isPending={diagnose.isPending} error={diagnose.error} onRun={() => diagnose.mutate()} />
     <section className="panel"><div className="panel__header"><div><h2>監視期間メトリクス</h2><p>{isPeerMonitor(data.node) ? "P2P応答" : "REST応答、ピア数、同期遅延、委任ハーベスト、Supernode合否"}</p></div><button className="button" onClick={() => api.exportCsv("metrics", nodeId)}><Download size={16} />CSV</button></div>{metrics.length ? <MetricChart data={metrics} showHarvestMetrics={!isPeerMonitor(data.node) && data.node.showHarvestMetrics} showSupernodeMetrics={data.node.kind === "nis1"} latencyLabel={isPeerMonitor(data.node) ? "P2P応答" : "REST応答"} /> : <EmptyState title="履歴を収集中">最初の監視サンプルが保存されるとグラフが表示されます。</EmptyState>}</section>
-    <section className="panel"><div className="panel__header"><div><h2>現在のピア</h2><p>{isPeerMonitor(data.node) ? "対象外" : `${data.peers.length}件`}</p></div></div>{isPeerMonitor(data.node) ? <EmptyState title="ピア一覧は対象外です">APIなしPeerノード自身からpeer一覧は取得できません。トポロジーでは他の監視APIノードが報告した接続として表示されます。</EmptyState> : data.peers.length ? <div className="table-wrap"><table><thead><tr><th>名前</th><th>ホスト</th><th>ポート</th><th>状態</th><th>バージョン</th></tr></thead><tbody>{data.peers.map((peer) => <tr key={peer.key}><td>{peer.name ?? "—"}</td><td>{peer.host ?? "—"}</td><td>{peer.port ?? "—"}</td><td>{peer.status}</td><td>{peer.version ?? "—"}</td></tr>)}</tbody></table></div> : <EmptyState title="ピア情報がありません">次回のピアポーリング後に表示されます。</EmptyState>}</section>
+    <section className="panel">
+      <div className="panel__header">
+        <div>
+          <h2>現在のピア</h2>
+          <p>{peerListUsesTopology ? "対象外" : `${data.peers.length}件`}</p>
+        </div>
+      </div>
+      {peerListUsesTopology ? (
+        <EmptyState title="ピア一覧は対象外です">
+          {isPeerMonitor(data.node) ? "APIなしPeerノード" : "REST未検出ノード"}自身からpeer一覧は取得できません。トポロジーでは他の監視APIノードが報告した接続として表示されます。
+        </EmptyState>
+      ) : data.peers.length ? <div className="table-wrap"><table><thead><tr><th>名前</th><th>ホスト</th><th>ポート</th><th>状態</th><th>バージョン</th></tr></thead><tbody>{data.peers.map((peer) => <tr key={peer.key}><td>{peer.name ?? "—"}</td><td>{peer.host ?? "—"}</td><td>{peer.port ?? "—"}</td><td>{peer.status}</td><td>{peer.version ?? "—"}</td></tr>)}</tbody></table></div> : <EmptyState title="ピア情報がありません">次回のピアポーリング後に表示されます。</EmptyState>}
+    </section>
   </>;
 }
 
@@ -505,7 +579,7 @@ function DiscoveryPage() {
           publicKey: peerPublicKey.trim() || undefined,
           roles: ["Peer", "Voting"],
         }
-      : { baseUrl: manualUrl };
+      : { baseUrl: manualUrl.trim() };
     add.mutate(input, { onSuccess: () => { setManualUrl(""); setPeerPublicKey(""); } });
   }
   function addCandidate(candidate: ScanCandidate) { add.mutate({ baseUrl: candidate.baseUrl, displayName: candidate.name ?? undefined, kind: candidate.kind }); }
@@ -513,7 +587,7 @@ function DiscoveryPage() {
     <div className="page-heading"><div><h2>ノード検出</h2><p>選択したCIDRだけを明示的にスキャンします。URLから手動登録する事もできます。</p></div></div>
     <section className="split-grid">
       <form className="panel form-card" onSubmit={submitScan}><h3>LANをスキャン</h3><label>ネットワーク候補<select value={cidr} onChange={(event) => setCidr(event.target.value)}>{!cidr && <option value="">ネットワークを選択</option>}{cidr && !interfaces.some((item) => item.cidr === cidr) && <option value={cidr}>{cidr}</option>}{interfaces.map((item) => <option key={`${item.name}-${item.cidr}`} value={item.cidr}>{item.name} — {item.cidr}</option>)}</select></label><label>CIDR<input value={cidr} onChange={(event) => setCidr(event.target.value)} required /></label><label>ポート（カンマ区切り）<input value={ports} onChange={(event) => setPorts(event.target.value)} required /></label><div className="actions"><button className="button button--primary" disabled={scan.isPending}><Search size={16} />{scan.isPending ? "スキャン中…" : "スキャン開始"}</button>{scan.isPending && <button type="button" className="button" onClick={() => api.cancelScan()}>キャンセル</button>}</div><p className="form-hint">最大1,024アドレス、既定ポート3000 / 3001 / 7890</p></form>
-      <form className="panel form-card" onSubmit={addManual}><h3>ノードを手動登録</h3><label>監視モード<select value={manualMode} onChange={(event) => { setManualMode(event.target.value as "api" | "peer" | "peer-voting"); if (add.isSuccess || add.isError) add.reset(); }}><option value="api">REST APIノード</option><option value="peer">Peerノード</option><option value="peer-voting">Peer + Votingノード</option></select></label><label>{manualMode === "api" ? "REST URL" : "Peerエンドポイント"}<input type={manualMode === "api" ? "url" : "text"} value={manualUrl} onChange={(event) => { setManualUrl(event.target.value); if (add.isSuccess || add.isError) add.reset(); }} placeholder={manualMode === "api" ? "http://192.0.2.10:3000" : "192.0.2.10:7900"} required /></label>{manualMode !== "api" && <label>ネットワーク<input value={peerNetwork} onChange={(event) => setPeerNetwork(event.target.value)} placeholder="Symbol Mainnet" required={manualMode === "peer-voting"} /></label>}{manualMode === "peer-voting" && <label>公開鍵<input value={peerPublicKey} onChange={(event) => setPeerPublicKey(event.target.value)} placeholder="必須" required /></label>}<button className="button button--primary" disabled={add.isPending}><Plus size={16} />{add.isPending ? "登録中…" : "登録して確認開始"}</button><p className="form-hint">{manualMode === "api" ? "登録後すぐ一覧に追加し、表示名と接続状態はバックグラウンドで確認します。HTTP/HTTPSのみ指定できます。" : manualMode === "peer-voting" ? "登録後すぐ一覧に追加し、P2P疎通とVoting期限をバックグラウンドで確認します。" : "登録後すぐ一覧に追加し、P2Pポートの疎通をバックグラウンドで確認します。"}</p></form>
+      <form className="panel form-card" onSubmit={addManual}><h3>ノードを手動登録</h3><label>監視モード<select value={manualMode} onChange={(event) => { setManualMode(event.target.value as "api" | "peer" | "peer-voting"); if (add.isSuccess || add.isError) add.reset(); }}><option value="api">REST APIノード</option><option value="peer">Peerノード</option><option value="peer-voting">Peer + Votingノード</option></select></label><label>{manualMode === "api" ? "IP・DNS" : "Peerエンドポイント"}<input type="text" inputMode={manualMode === "api" ? "url" : undefined} value={manualUrl} onChange={(event) => { setManualUrl(event.target.value); if (add.isSuccess || add.isError) add.reset(); }} placeholder={manualMode === "api" ? "202.61.248.218" : "192.0.2.10:7900"} required /></label>{manualMode !== "api" && <label>ネットワーク<input value={peerNetwork} onChange={(event) => setPeerNetwork(event.target.value)} placeholder="Symbol Mainnet" required={manualMode === "peer-voting"} /></label>}{manualMode === "peer-voting" && <label>公開鍵<input value={peerPublicKey} onChange={(event) => setPeerPublicKey(event.target.value)} placeholder="必須" required /></label>}<button className="button button--primary" disabled={add.isPending}><Plus size={16} />{add.isPending ? "登録中…" : "登録して確認開始"}</button><p className="form-hint">{manualMode === "api" ? "IP・DNSだけで登録できます。スキームやポートを指定した場合は最初に確認し、失敗時は標準RESTポートも探索します。" : manualMode === "peer-voting" ? "登録後すぐ一覧に追加し、P2P疎通とVoting期限をバックグラウンドで確認します。" : "登録後すぐ一覧に追加し、P2Pポートの疎通をバックグラウンドで確認します。"}</p></form>
     </section>
     {(scan.error || add.error) && <div className="notice notice--error">{String(scan.error ?? add.error)}</div>}
     {add.isSuccess && <div className="notice notice--success">「{add.data.displayName}」を登録しました。<small>{add.data.baseUrl}</small></div>}

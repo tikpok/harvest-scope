@@ -7,9 +7,9 @@ use sqlx::{
 
 use crate::{
     domain::{
-        AlertMutation, AlertRecord, AppSettings, DiagnosticRun, DiagnosticStatus, HarvestEvent,
-        MetricPoint, MonitorMode, NodeDetail, NodeIdentity, NodeKind, NodeSample, NodeStatus,
-        NodeSummary, PeerInfo, StoredNode,
+        AlertMutation, AlertRecord, AppSettings, CertificateSnapshot, DiagnosticRun,
+        DiagnosticStatus, HarvestEvent, MetricPoint, MonitorMode, NodeDetail, NodeIdentity,
+        NodeKind, NodeSample, NodeStatus, NodeSummary, PeerInfo, StoredNode,
     },
     error::{AppError, AppResult},
 };
@@ -17,6 +17,16 @@ use crate::{
 #[derive(Clone)]
 pub struct Repository {
     pool: SqlitePool,
+}
+
+pub struct NodeUpsert<'a> {
+    pub id: &'a str,
+    pub base_url: &'a str,
+    pub display_name: &'a str,
+    pub identity: &'a NodeIdentity,
+    pub monitor_mode: MonitorMode,
+    pub enabled: bool,
+    pub favorite: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -95,6 +105,71 @@ fn optional_i64_string(row: &SqliteRow, column: &str) -> AppResult<Option<String
         .map(|value| value.to_string()))
 }
 
+fn observed_roles_by_host(connections: &[(String, PeerInfo)]) -> HashMap<String, Vec<String>> {
+    let mut identities_by_host: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+    for (_, peer) in connections {
+        if peer.status != "active" {
+            continue;
+        }
+        let Some(host) = peer
+            .host
+            .as_deref()
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+        else {
+            continue;
+        };
+        let roles = identities_by_host
+            .entry(host.to_ascii_lowercase())
+            .or_default()
+            .entry(peer.key.to_ascii_lowercase())
+            .or_default();
+        for role in &peer.roles {
+            if !roles.iter().any(|known| known.eq_ignore_ascii_case(role)) {
+                roles.push(role.clone());
+            }
+        }
+    }
+
+    identities_by_host
+        .into_iter()
+        .filter_map(|(host, mut identities)| {
+            (identities.len() == 1)
+                .then(|| identities.drain().next().map(|(_, roles)| (host, roles)))
+                .flatten()
+        })
+        .collect()
+}
+
+fn observed_roles_for_url(
+    base_url: &str,
+    roles_by_host: &HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    url::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .and_then(|host| roles_by_host.get(&host).cloned())
+        .unwrap_or_default()
+}
+
+fn roles_include(roles: &[String], role: &str) -> bool {
+    roles.iter().any(|value| value.eq_ignore_ascii_case(role))
+}
+
+fn normalize_observed_only_api_status(
+    node: &mut NodeSummary,
+    public_key: Option<&str>,
+    latest_reachable: Option<bool>,
+) {
+    node.rest_private = node.monitor_mode == MonitorMode::Api
+        && public_key.is_none_or(|value| value.trim().is_empty())
+        && latest_reachable == Some(false)
+        && roles_include(&node.observed_roles, "API");
+    if node.rest_private && matches!(node.status, NodeStatus::Warning | NodeStatus::Offline) {
+        node.status = NodeStatus::Unknown;
+    }
+}
+
 fn summary_from_row(row: &SqliteRow) -> AppResult<NodeSummary> {
     let enabled = row.try_get::<i64, _>("enabled")? != 0;
     let show_harvest_metrics = row.try_get::<i64, _>("show_harvest_metrics")? != 0;
@@ -115,6 +190,8 @@ fn summary_from_row(row: &SqliteRow) -> AppResult<NodeSummary> {
         network: row.try_get("network")?,
         version: row.try_get("version")?,
         roles: parse_string_list(row.try_get("roles_json")?),
+        observed_roles: Vec::new(),
+        rest_private: false,
         enabled,
         favorite: row.try_get::<i64, _>("favorite")? != 0,
         status: if enabled {
@@ -274,9 +351,9 @@ impl Repository {
 
     pub async fn list_stored_nodes(&self, enabled_only: bool) -> AppResult<Vec<StoredNode>> {
         let sql = if enabled_only {
-            "SELECT * FROM nodes WHERE enabled = 1 ORDER BY sort_order, display_name COLLATE NOCASE, id"
+            "SELECT * FROM nodes WHERE deleted_at IS NULL AND enabled = 1 ORDER BY sort_order, display_name COLLATE NOCASE, id"
         } else {
-            "SELECT * FROM nodes ORDER BY sort_order, display_name COLLATE NOCASE, id"
+            "SELECT * FROM nodes WHERE deleted_at IS NULL ORDER BY sort_order, display_name COLLATE NOCASE, id"
         };
         let rows = sqlx::query(sql).fetch_all(&self.pool).await?;
         rows.into_iter()
@@ -322,11 +399,13 @@ impl Repository {
               n.base_url,
               n.network,
               n.version,
+              n.public_key,
               n.roles_json,
               n.enabled,
               n.favorite,
               n.show_harvest_metrics,
               s.observed_at AS sample_observed_at,
+              s.reachable AS sample_reachable,
               s.status AS sample_status,
               s.height AS sample_height,
               s.finalized_height AS sample_finalized_height,
@@ -412,12 +491,24 @@ impl Repository {
               ORDER BY observed_at DESC, id DESC
               LIMIT 1
             )
+            WHERE n.deleted_at IS NULL
             ORDER BY n.sort_order, n.display_name COLLATE NOCASE, n.id
             "#,
         )
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(summary_from_row).collect()
+        let mut nodes = rows
+            .iter()
+            .map(summary_from_row)
+            .collect::<AppResult<Vec<_>>>()?;
+        let roles_by_host = observed_roles_by_host(&self.list_peer_connections().await?);
+        for (node, row) in nodes.iter_mut().zip(&rows) {
+            node.observed_roles = observed_roles_for_url(&node.base_url, &roles_by_host);
+            let public_key = row.try_get::<Option<String>, _>("public_key")?;
+            let latest_reachable = bool_from_i64(row.try_get("sample_reachable")?);
+            normalize_observed_only_api_status(node, public_key.as_deref(), latest_reachable);
+        }
+        Ok(nodes)
     }
 
     pub async fn get_node_summary(&self, id: &str) -> AppResult<NodeSummary> {
@@ -432,6 +523,11 @@ impl Repository {
         .bind(&node.id)
         .fetch_optional(&self.pool)
         .await?;
+        let latest_reachable = sample
+            .as_ref()
+            .map(|row| row.try_get::<i64, _>("reachable"))
+            .transpose()?
+            .map(|value| value != 0);
         let harvest = if node.show_harvest_metrics {
             self.latest_harvest_metrics(&node.id).await?
         } else {
@@ -454,6 +550,8 @@ impl Repository {
                 network: node.network.clone(),
                 version: node.version.clone(),
                 roles: node.roles.clone(),
+                observed_roles: Vec::new(),
+                rest_private: false,
                 enabled: node.enabled,
                 favorite: node.favorite,
                 status: if node.enabled {
@@ -550,6 +648,8 @@ impl Repository {
                 network: node.network.clone(),
                 version: node.version.clone(),
                 roles: node.roles.clone(),
+                observed_roles: Vec::new(),
+                rest_private: false,
                 enabled: node.enabled,
                 favorite: node.favorite,
                 status: NodeStatus::Unknown,
@@ -583,6 +683,14 @@ impl Repository {
                 supernode_metric_error: supernode.supernode_metric_error,
             }
         };
+        let mut summary = summary;
+        let roles_by_host = observed_roles_by_host(&self.list_peer_connections().await?);
+        summary.observed_roles = observed_roles_for_url(&summary.base_url, &roles_by_host);
+        normalize_observed_only_api_status(
+            &mut summary,
+            node.public_key.as_deref(),
+            latest_reachable,
+        );
         Ok(summary)
     }
 
@@ -610,26 +718,17 @@ impl Repository {
         Ok(())
     }
 
-    pub async fn upsert_node_with_mode(
-        &self,
-        id: &str,
-        base_url: &str,
-        display_name: &str,
-        identity: &NodeIdentity,
-        monitor_mode: MonitorMode,
-        enabled: bool,
-        favorite: bool,
-    ) -> AppResult<()> {
+    pub async fn upsert_node_with_mode(&self, input: NodeUpsert<'_>) -> AppResult<()> {
         let now = chrono::Utc::now().timestamp_millis();
-        let roles = serde_json::to_string(&identity.roles)?;
+        let roles = serde_json::to_string(&input.identity.roles)?;
         sqlx::query(
             "INSERT INTO nodes (id, display_name, kind, monitor_mode, base_url, network, version, public_key, roles_json, rest_version, enabled, favorite, sort_order, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort_order) + 1, 0) FROM nodes), ?, ?)
              ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name, kind=excluded.kind, monitor_mode=excluded.monitor_mode, base_url=excluded.base_url,
              network=excluded.network, version=excluded.version, public_key=excluded.public_key, roles_json=excluded.roles_json,
              rest_version=excluded.rest_version, enabled=excluded.enabled, favorite=excluded.favorite, updated_at=excluded.updated_at"
-        ).bind(id).bind(display_name).bind(identity.kind.as_str()).bind(monitor_mode.as_str()).bind(base_url).bind(&identity.network).bind(&identity.version)
-            .bind(&identity.public_key).bind(roles).bind(&identity.rest_version).bind(enabled as i64).bind(favorite as i64)
+        ).bind(input.id).bind(input.display_name).bind(input.identity.kind.as_str()).bind(input.monitor_mode.as_str()).bind(input.base_url).bind(&input.identity.network).bind(&input.identity.version)
+            .bind(&input.identity.public_key).bind(roles).bind(&input.identity.rest_version).bind(input.enabled as i64).bind(input.favorite as i64)
             .bind(now).bind(now).execute(&self.pool).await?;
         Ok(())
     }
@@ -661,21 +760,35 @@ impl Repository {
         Ok(())
     }
 
-    pub async fn delete_node(&self, id: &str) -> AppResult<()> {
-        let result = sqlx::query("DELETE FROM nodes WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+    pub async fn mark_node_for_deletion(&self, id: &str) -> AppResult<()> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let result = sqlx::query(
+            "UPDATE nodes
+             SET deleted_at = ?, enabled = 0, base_url = 'deleted:' || id || ':' || base_url, updated_at = ?
+             WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(AppError::NotFound(id.into()));
         }
         Ok(())
     }
 
+    pub async fn purge_deleted_nodes(&self) -> AppResult<u64> {
+        let result = sqlx::query("DELETE FROM nodes WHERE deleted_at IS NOT NULL")
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn move_node(&self, id: &str, offset: isize) -> AppResult<()> {
         let mut tx = self.pool.begin().await?;
         let rows = sqlx::query(
-            "SELECT id FROM nodes ORDER BY sort_order, display_name COLLATE NOCASE, id",
+            "SELECT id FROM nodes WHERE deleted_at IS NULL ORDER BY sort_order, display_name COLLATE NOCASE, id",
         )
         .fetch_all(&mut *tx)
         .await?;
@@ -823,6 +936,22 @@ impl Repository {
             finalization_epoch: row.try_get("finalization_epoch")?,
             voting_key_remaining_epochs: row.try_get("voting_key_remaining_epochs")?,
             certificate_metric_error: row.try_get("certificate_metric_error")?,
+        })
+    }
+
+    pub async fn latest_certificate_snapshot(
+        &self,
+        node_id: &str,
+    ) -> AppResult<CertificateSnapshot> {
+        let metrics = self.latest_certificate_metrics(node_id).await?;
+        Ok(CertificateSnapshot {
+            node_certificate_not_after: metrics.node_certificate_not_after,
+            node_certificate_remaining_days: metrics.node_certificate_remaining_days,
+            voting_key_start_epoch: metrics.voting_key_start_epoch,
+            voting_key_end_epoch: metrics.voting_key_end_epoch,
+            finalization_epoch: metrics.finalization_epoch,
+            voting_key_remaining_epochs: metrics.voting_key_remaining_epochs,
+            error: metrics.certificate_metric_error,
         })
     }
 
@@ -1092,6 +1221,11 @@ impl Repository {
                 ))
             })
             .collect()
+    }
+
+    pub async fn observed_roles_for_node_url(&self, base_url: &str) -> AppResult<Vec<String>> {
+        let roles_by_host = observed_roles_by_host(&self.list_peer_connections().await?);
+        Ok(observed_roles_for_url(base_url, &roles_by_host))
     }
 
     pub async fn latest_topology_health(&self) -> AppResult<HashMap<String, TopologyHealth>> {
@@ -1489,6 +1623,180 @@ mod tests {
         }
     }
 
+    #[test]
+    fn infers_observed_roles_only_for_a_unique_peer_identity_at_the_host() {
+        let connection = |source: &str, key: &str, host: &str, roles: &[&str]| {
+            (
+                source.to_owned(),
+                PeerInfo {
+                    key: key.to_owned(),
+                    name: None,
+                    host: Some(host.to_owned()),
+                    port: Some(7900),
+                    status: "active".into(),
+                    version: None,
+                    roles: roles.iter().map(|role| (*role).to_owned()).collect(),
+                },
+            )
+        };
+        let connections = vec![
+            connection("observer-a", "api-node", "203.0.113.227", &["API"]),
+            connection("observer-b", "api-node", "203.0.113.227", &["API"]),
+            connection("observer-a", "shared-a", "192.0.2.10", &["API"]),
+            connection("observer-b", "shared-b", "192.0.2.10", &[]),
+        ];
+
+        let roles_by_host = observed_roles_by_host(&connections);
+
+        assert_eq!(
+            observed_roles_for_url("https://203.0.113.227:3001", &roles_by_host),
+            ["API"]
+        );
+        assert!(observed_roles_for_url("https://192.0.2.10:3001", &roles_by_host).is_empty());
+        assert!(observed_roles_for_url("https://198.51.100.10:3001", &roles_by_host).is_empty());
+    }
+
+    #[tokio::test]
+    async fn observed_only_api_nodes_are_not_summarized_as_warning() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let repository = Repository::open(&directory.path().join("harvest-scope.db"))
+            .await
+            .expect("repository should open");
+        repository
+            .upsert_node(
+                "observed-api",
+                "https://203.0.113.227:3001",
+                "Observed API",
+                &symbol_identity(),
+                true,
+                false,
+            )
+            .await
+            .expect("node should be inserted");
+        repository
+            .upsert_node(
+                "observer",
+                "http://observer.local:3000",
+                "Observer",
+                &NodeIdentity {
+                    roles: vec!["API".into()],
+                    ..symbol_identity()
+                },
+                true,
+                false,
+            )
+            .await
+            .expect("observer should be inserted");
+        repository
+            .upsert_node(
+                "dual-voting",
+                "https://203.0.113.10:3001",
+                "Dual Voting",
+                &NodeIdentity {
+                    public_key: Some("dual-voting-public-key".into()),
+                    roles: vec!["Peer".into(), "Voting".into()],
+                    ..symbol_identity()
+                },
+                true,
+                false,
+            )
+            .await
+            .expect("dual voting node should be inserted");
+        repository
+            .upsert_node(
+                "verified-api",
+                "https://198.51.100.20:3001",
+                "Verified API",
+                &NodeIdentity {
+                    public_key: Some("verified-api-public-key".into()),
+                    ..symbol_identity()
+                },
+                true,
+                false,
+            )
+            .await
+            .expect("verified api node should be inserted");
+        let mut sample = sample_at(1);
+        sample.reachable = false;
+        sample.status = NodeStatus::Warning;
+        sample.last_error = Some("connection timed out".into());
+        repository
+            .save_sample("observed-api", &sample)
+            .await
+            .expect("sample should be saved");
+        repository
+            .save_sample("dual-voting", &sample)
+            .await
+            .expect("dual voting sample should be saved");
+        repository
+            .save_sample("verified-api", &sample)
+            .await
+            .expect("verified api sample should be saved");
+        repository
+            .replace_peers(
+                "observer",
+                &[
+                    PeerInfo {
+                        key: "observed-public-key".into(),
+                        name: None,
+                        host: Some("203.0.113.227".into()),
+                        port: Some(7900),
+                        status: "active".into(),
+                        version: None,
+                        roles: vec!["API".into()],
+                    },
+                    PeerInfo {
+                        key: "dual-voting-public-key".into(),
+                        name: None,
+                        host: Some("203.0.113.10".into()),
+                        port: Some(7900),
+                        status: "active".into(),
+                        version: None,
+                        roles: vec!["API".into()],
+                    },
+                    PeerInfo {
+                        key: "verified-api-public-key".into(),
+                        name: None,
+                        host: Some("198.51.100.20".into()),
+                        port: Some(7900),
+                        status: "active".into(),
+                        version: None,
+                        roles: vec!["API".into()],
+                    },
+                ],
+                1,
+            )
+            .await
+            .expect("peer observation should be saved");
+
+        let summaries = repository
+            .list_nodes()
+            .await
+            .expect("nodes should be listed");
+        let summary = summaries
+            .iter()
+            .find(|node| node.id == "observed-api")
+            .expect("observed node should be listed");
+        let dual_voting_summary = summaries
+            .iter()
+            .find(|node| node.id == "dual-voting")
+            .expect("dual voting node should be listed");
+        let verified_api_summary = summaries
+            .iter()
+            .find(|node| node.id == "verified-api")
+            .expect("verified api node should be listed");
+
+        assert_eq!(summary.observed_roles, ["API"]);
+        assert!(summary.rest_private);
+        assert_eq!(summary.status, NodeStatus::Unknown);
+        assert_eq!(dual_voting_summary.observed_roles, ["API"]);
+        assert!(!dual_voting_summary.rest_private);
+        assert_eq!(dual_voting_summary.status, NodeStatus::Warning);
+        assert_eq!(verified_api_summary.observed_roles, ["API"]);
+        assert!(!verified_api_summary.rest_private);
+        assert_eq!(verified_api_summary.status, NodeStatus::Warning);
+    }
+
     #[tokio::test]
     async fn persists_manual_node_order() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
@@ -1527,6 +1835,90 @@ mod tests {
             .await
             .expect("repository should reopen");
         assert_eq!(node_ids(&reopened).await, ["node-b", "node-c", "node-a"]);
+    }
+
+    #[tokio::test]
+    async fn hides_a_node_before_background_history_purge() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let repository = Repository::open(&directory.path().join("harvest-scope.db"))
+            .await
+            .expect("repository should open");
+        repository
+            .upsert_node(
+                "node-to-delete",
+                "https://delete.example:3001",
+                "Delete Me",
+                &symbol_identity(),
+                true,
+                false,
+            )
+            .await
+            .expect("node should be inserted");
+        repository
+            .save_sample("node-to-delete", &sample_at(1))
+            .await
+            .expect("sample should be saved");
+
+        repository
+            .mark_node_for_deletion("node-to-delete")
+            .await
+            .expect("node should be marked for deletion");
+
+        assert!(repository
+            .list_stored_nodes(false)
+            .await
+            .expect("visible nodes should be listed")
+            .is_empty());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM nodes WHERE id = ?")
+                .bind("node-to-delete")
+                .fetch_one(&repository.pool)
+                .await
+                .expect("marked node should still exist"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM node_samples WHERE node_id = ?")
+                .bind("node-to-delete")
+                .fetch_one(&repository.pool)
+                .await
+                .expect("history should still exist before purge"),
+            1
+        );
+        repository
+            .upsert_node(
+                "replacement-node",
+                "https://delete.example:3001",
+                "Replacement",
+                &symbol_identity(),
+                true,
+                false,
+            )
+            .await
+            .expect("the released URL should be reusable before history purge");
+        assert_eq!(node_ids(&repository).await, ["replacement-node"]);
+
+        repository
+            .purge_deleted_nodes()
+            .await
+            .expect("marked nodes should be purged");
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM nodes WHERE id = ?")
+                .bind("node-to-delete")
+                .fetch_one(&repository.pool)
+                .await
+                .expect("purged node count should be read"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM node_samples WHERE node_id = ?")
+                .bind("node-to-delete")
+                .fetch_one(&repository.pool)
+                .await
+                .expect("purged history count should be read"),
+            0
+        );
     }
 
     #[tokio::test]

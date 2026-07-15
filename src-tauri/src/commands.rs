@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::atomic::Ordering,
+    time::Duration,
 };
 
 use tauri::{AppHandle, Emitter, State};
@@ -9,22 +10,111 @@ use tauri_plugin_dialog::DialogExt;
 
 use crate::{
     adapters::{
-        adapter_for, normalize_base_url, normalize_peer_endpoint, probe_endpoint,
+        adapter_for, api_probe_candidates, normalize_api_registration_target, normalize_base_url,
+        normalize_peer_endpoint, probe_endpoint,
     },
     domain::{
         AlertRecord, AppSettings, DashboardData, DiagnosticRun, HarvestEvent, MetricPoint,
         MonitorMode, NetworkEvent, NetworkInterfaceInfo, NodeConfigEntry, NodeConfigFile,
         NodeConfigImportFailure, NodeConfigImportResult, NodeDetail, NodeIdentity, NodeKind,
-        NodeStatus, NodeSummary, ScanCandidate, ScanRequest, TopologyEdge, TopologyNode,
-        TopologySnapshot, UpsertNodeInput,
+        NodeStatus, NodeSummary, RefreshAllResult, ScanCandidate, ScanRequest, TopologyEdge,
+        TopologyNode, TopologySnapshot, UpsertNodeInput,
     },
     error::{AppError, AppResult},
     services::{desktop, diagnostic as diagnostic_service, discovery, monitor},
     state::AppState,
+    storage::NodeUpsert,
 };
 
 const NODE_CONFIG_FORMAT_VERSION: u32 = 1;
 const MAX_NODE_COUNT: usize = 50;
+const NODE_PURGE_QUIET_PERIOD: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DashboardStatusCounts {
+    healthy: usize,
+    warning: usize,
+    critical: usize,
+    offline: usize,
+    unknown: usize,
+}
+
+impl DashboardStatusCounts {
+    fn total(&self) -> usize {
+        self.healthy + self.warning + self.critical + self.offline + self.unknown
+    }
+}
+
+fn dashboard_status_counts<'a>(
+    statuses: impl Iterator<Item = &'a NodeStatus>,
+) -> DashboardStatusCounts {
+    let mut counts = DashboardStatusCounts::default();
+    for status in statuses {
+        match status {
+            NodeStatus::Healthy => counts.healthy += 1,
+            NodeStatus::Warning => counts.warning += 1,
+            NodeStatus::Critical => counts.critical += 1,
+            NodeStatus::Offline => counts.offline += 1,
+            NodeStatus::Unknown => counts.unknown += 1,
+        }
+    }
+    counts
+}
+
+fn node_limit_reached(existing_count: usize) -> bool {
+    existing_count >= MAX_NODE_COUNT
+}
+
+async fn lock_node_registration(
+    state: &AppState,
+    is_new: bool,
+) -> AppResult<Option<tokio::sync::MutexGuard<'_, ()>>> {
+    if !is_new {
+        return Ok(None);
+    }
+    let guard = state.node_registration_lock.lock().await;
+    if node_limit_reached(state.repository.list_stored_nodes(false).await?.len()) {
+        return Err(AppError::Configuration(
+            "監視できるノードは最大50台です".into(),
+        ));
+    }
+    Ok(Some(guard))
+}
+
+fn deletion_purge_is_current(scheduled_generation: u64, current_generation: u64) -> bool {
+    scheduled_generation == current_generation
+}
+
+pub(crate) fn schedule_deleted_node_purge(state: AppState, scheduled_generation: u64) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(NODE_PURGE_QUIET_PERIOD).await;
+        if !deletion_purge_is_current(
+            scheduled_generation,
+            state.current_node_deletion_generation(),
+        ) {
+            return;
+        }
+
+        for attempt in 1..=3 {
+            if !deletion_purge_is_current(
+                scheduled_generation,
+                state.current_node_deletion_generation(),
+            ) {
+                return;
+            }
+            match state.repository.purge_deleted_nodes().await {
+                Ok(_) => break,
+                Err(error) if attempt < 3 => {
+                    tracing::warn!(%error, attempt, "deferred node purge retrying");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "deferred node purge failed");
+                }
+            }
+        }
+    });
+}
 
 #[tauri::command]
 pub async fn list_nodes(state: State<'_, AppState>) -> AppResult<Vec<NodeSummary>> {
@@ -34,24 +124,14 @@ pub async fn list_nodes(state: State<'_, AppState>) -> AppResult<Vec<NodeSummary
 #[tauri::command]
 pub async fn get_dashboard(state: State<'_, AppState>) -> AppResult<DashboardData> {
     let nodes = state.repository.list_nodes().await?;
+    let counts = dashboard_status_counts(nodes.iter().map(|node| &node.status));
     Ok(DashboardData {
-        total: nodes.len(),
-        healthy: nodes
-            .iter()
-            .filter(|node| node.status == NodeStatus::Healthy)
-            .count(),
-        warning: nodes
-            .iter()
-            .filter(|node| node.status == NodeStatus::Warning)
-            .count(),
-        critical: nodes
-            .iter()
-            .filter(|node| node.status == NodeStatus::Critical)
-            .count(),
-        offline: nodes
-            .iter()
-            .filter(|node| node.status == NodeStatus::Offline)
-            .count(),
+        total: counts.total(),
+        healthy: counts.healthy,
+        warning: counts.warning,
+        critical: counts.critical,
+        offline: counts.offline,
+        unknown: counts.unknown,
         rechecking: state.is_all_nodes_rechecking(),
         nodes,
     })
@@ -116,9 +196,11 @@ pub async fn get_topology(state: State<'_, AppState>) -> AppResult<TopologySnaps
             TopologyNode {
                 websocket_connected: websocket_by_node.get(&node.id).copied().unwrap_or(false),
                 version: stored.and_then(|stored| stored.version.clone()),
-                roles: stored
-                    .map(|stored| stored.roles.clone())
-                    .unwrap_or_default(),
+                roles: if node.roles.is_empty() {
+                    node.observed_roles.clone()
+                } else {
+                    node.roles.clone()
+                },
                 id: node.id,
                 label: node.display_name,
                 kind: node.kind,
@@ -256,7 +338,7 @@ pub async fn upsert_node(
     state: State<'_, AppState>,
     input: UpsertNodeInput,
 ) -> AppResult<NodeSummary> {
-    upsert_node_from_input(app, state.inner().clone(), input, true).await
+    upsert_node_from_input(app, state.inner().clone(), input).await
 }
 
 fn normalized_roles(input: Option<Vec<String>>, monitor_mode: MonitorMode) -> Vec<String> {
@@ -272,7 +354,9 @@ fn normalized_roles(input: Option<Vec<String>>, monitor_mode: MonitorMode) -> Ve
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
-    if monitor_mode == MonitorMode::Peer && !roles.iter().any(|role| role.eq_ignore_ascii_case("Peer")) {
+    if monitor_mode == MonitorMode::Peer
+        && !roles.iter().any(|role| role.eq_ignore_ascii_case("Peer"))
+    {
         roles.insert(0, "Peer".into());
     }
     roles.sort_by_key(|value| value.to_ascii_lowercase());
@@ -320,15 +404,22 @@ async fn complete_node_registration(
         }
     };
     if node.monitor_mode == MonitorMode::Api {
-        let identity_result = match kind_hint {
-            Some(kind) => {
-                adapter_for(kind, node.base_url.clone(), state.client.clone())
-                    .probe()
-                    .await
+        let mut discovered = None;
+        for candidate in api_probe_candidates(&node.base_url).unwrap_or_default() {
+            let identity_result = match kind_hint {
+                Some(kind) => {
+                    adapter_for(kind, candidate.clone(), state.client.clone())
+                        .probe()
+                        .await
+                }
+                None => probe_endpoint(&candidate, state.client.clone()).await,
+            };
+            if let Ok(identity) = identity_result {
+                discovered = Some((candidate, identity));
+                break;
             }
-            None => probe_endpoint(&node.base_url, state.client.clone()).await,
-        };
-        if let Ok(identity) = identity_result {
+        }
+        if let Some((discovered_base_url, identity)) = discovered {
             let display_name = if node.display_name == node.base_url {
                 identity
                     .name
@@ -340,15 +431,15 @@ async fn complete_node_registration(
             };
             if let Err(error) = state
                 .repository
-                .upsert_node_with_mode(
-                    &node.id,
-                    &node.base_url,
-                    &display_name,
-                    &identity,
-                    node.monitor_mode,
-                    node.enabled,
-                    node.favorite,
-                )
+                .upsert_node_with_mode(NodeUpsert {
+                    id: &node.id,
+                    base_url: &discovered_base_url,
+                    display_name: &display_name,
+                    identity: &identity,
+                    monitor_mode: node.monitor_mode,
+                    enabled: node.enabled,
+                    favorite: node.favorite,
+                })
                 .await
             {
                 tracing::warn!(%error, node_id = %node.id, "registered node identity update failed");
@@ -368,19 +459,14 @@ async fn upsert_node_from_input(
     app: AppHandle,
     state: AppState,
     input: UpsertNodeInput,
-    enforce_limit: bool,
 ) -> AppResult<NodeSummary> {
     let monitor_mode = input.monitor_mode.unwrap_or(MonitorMode::Api);
     let base_url = match monitor_mode {
-        MonitorMode::Api => normalize_base_url(&input.base_url)?,
+        MonitorMode::Api => normalize_api_registration_target(&input.base_url)?,
         MonitorMode::Peer => normalize_peer_endpoint(&input.base_url)?,
     };
-    let existing = state.repository.list_stored_nodes(false).await?;
-    if enforce_limit && input.id.is_none() && existing.len() >= MAX_NODE_COUNT {
-        return Err(AppError::Configuration(
-            "監視できるノードは最大50台です".into(),
-        ));
-    }
+    let is_new = input.id.is_none();
+    let _registration_guard = lock_node_registration(&state, is_new).await?;
     if monitor_mode == MonitorMode::Peer
         && input
             .roles
@@ -405,15 +491,15 @@ async fn upsert_node_from_input(
 
     state
         .repository
-        .upsert_node_with_mode(
-            &id,
-            &base_url,
-            &display_name,
-            &identity,
+        .upsert_node_with_mode(NodeUpsert {
+            id: &id,
+            base_url: &base_url,
+            display_name: &display_name,
+            identity: &identity,
             monitor_mode,
-            input.enabled.unwrap_or(true),
-            input.favorite.unwrap_or(false),
-        )
+            enabled: input.enabled.unwrap_or(true),
+            favorite: input.favorite.unwrap_or(false),
+        })
         .await?;
     let app_for_monitor = app.clone();
     let state_for_monitor = state.clone();
@@ -527,8 +613,8 @@ async fn import_node_config_entries(
                 MonitorMode::Api => normalize_base_url(&node.base_url),
                 MonitorMode::Peer => normalize_peer_endpoint(&node.base_url),
             }
-                .ok()
-                .map(|url| (url, node.clone()))
+            .ok()
+            .map(|url| (url, node.clone()))
         })
         .collect::<HashMap<_, _>>();
     let mut total_nodes = existing.len();
@@ -583,7 +669,7 @@ async fn import_node_config_entries(
                 .favorite
                 .or_else(|| existing_node.as_ref().map(|node| node.favorite)),
         };
-        match upsert_node_from_input(app.clone(), state.clone(), input, false).await {
+        match upsert_node_from_input(app.clone(), state.clone(), input).await {
             Ok(node) => {
                 if let Err(error) = state
                     .repository
@@ -621,8 +707,8 @@ async fn import_node_config_entries(
                     MonitorMode::Api => normalize_base_url(&node.base_url),
                     MonitorMode::Peer => normalize_peer_endpoint(&node.base_url),
                 }
-                    .ok()
-                    .map(|url| (url, node.clone()))
+                .ok()
+                .map(|url| (url, node.clone()))
             })
             .collect();
         total_nodes = existing.len();
@@ -636,10 +722,12 @@ pub async fn delete_node(
     state: State<'_, AppState>,
     node_id: String,
 ) -> AppResult<()> {
-    state.repository.delete_node(&node_id).await?;
+    state.repository.mark_node_for_deletion(&node_id).await?;
+    let deletion_generation = state.note_node_deletion();
     state.runtime.lock().await.remove(&node_id);
     let _ = app.emit("node-updated", &node_id);
     let _ = app.emit("topology-updated", &node_id);
+    schedule_deleted_node_purge(state.inner().clone(), deletion_generation);
     let app_for_tray = app.clone();
     let state_for_tray = state.inner().clone();
     tauri::async_runtime::spawn(async move {
@@ -732,7 +820,10 @@ pub async fn refresh_node(
 }
 
 #[tauri::command]
-pub async fn refresh_all_nodes(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
+pub async fn refresh_all_nodes(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<RefreshAllResult> {
     // A user clicking this button is definitive proof that Windows is awake.
     // This also recovers if a resume notification was missed by the OS.
     state.set_system_suspended(false);
@@ -848,8 +939,10 @@ fn validate_settings(settings: &AppSettings) -> AppResult<()> {
         || !(30..=1800).contains(&settings.peer_interval_seconds)
         || settings.lag_warning_blocks == 0
         || settings.lag_critical_blocks <= settings.lag_warning_blocks
+        || !(250..=30_000).contains(&settings.latency_warning_ms)
         || !(1..=90).contains(&settings.raw_retention_days)
-        || settings.aggregate_retention_days < 30
+        || !(30..=1_825).contains(&settings.aggregate_retention_days)
+        || !matches!(settings.theme.as_str(), "system" | "light" | "dark")
     {
         return Err(AppError::Configuration("設定値が許容範囲外です".into()));
     }
@@ -1113,10 +1206,173 @@ pub async fn export_csv(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_identity() -> NodeIdentity {
+        NodeIdentity {
+            kind: NodeKind::Symbol,
+            name: None,
+            network: Some("Symbol Mainnet".into()),
+            version: None,
+            public_key: None,
+            roles: vec!["API".into()],
+            rest_version: None,
+        }
+    }
+
+    async fn insert_test_node(state: &AppState, index: usize) -> AppResult<()> {
+        let id = format!("node-{index}");
+        state
+            .repository
+            .upsert_node(
+                &id,
+                &format!("http://node-{index}.example:3000"),
+                &format!("Node {index}"),
+                &test_identity(),
+                true,
+                false,
+            )
+            .await
+    }
+
+    async fn register_test_node(state: AppState, index: usize) -> AppResult<()> {
+        let _guard = lock_node_registration(&state, true).await?;
+        insert_test_node(&state, index).await
+    }
+
+    #[test]
+    fn dashboard_counts_include_unknown_nodes() {
+        let counts = dashboard_status_counts(
+            [
+                NodeStatus::Healthy,
+                NodeStatus::Healthy,
+                NodeStatus::Critical,
+                NodeStatus::Unknown,
+                NodeStatus::Unknown,
+            ]
+            .iter(),
+        );
+
+        assert_eq!(counts.healthy, 2);
+        assert_eq!(counts.warning, 0);
+        assert_eq!(counts.critical, 1);
+        assert_eq!(counts.offline, 0);
+        assert_eq!(counts.unknown, 2);
+        assert_eq!(counts.total(), 5);
+    }
+
+    #[test]
+    fn node_limit_rejects_existing_limit_and_overage() {
+        assert!(!node_limit_reached(49));
+        assert!(node_limit_reached(50));
+        assert!(node_limit_reached(51));
+    }
+
+    #[tokio::test]
+    async fn concurrent_registrations_cannot_exceed_fifty_nodes() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let repository = crate::storage::Repository::open(&directory.path().join("nodes.db"))
+            .await
+            .expect("repository should open");
+        let state = AppState::new(repository, reqwest::Client::new())
+            .await
+            .expect("state should initialize");
+        for index in 0..49 {
+            insert_test_node(&state, index)
+                .await
+                .expect("fixture node should be inserted");
+        }
+
+        let (first, second) = tokio::join!(
+            register_test_node(state.clone(), 49),
+            register_test_node(state.clone(), 50),
+        );
+
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        assert_eq!(
+            state
+                .repository
+                .list_stored_nodes(false)
+                .await
+                .expect("nodes should be listed")
+                .len(),
+            50
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_overage_is_preserved_until_count_drops_below_limit() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let repository = crate::storage::Repository::open(&directory.path().join("nodes.db"))
+            .await
+            .expect("repository should open");
+        let state = AppState::new(repository, reqwest::Client::new())
+            .await
+            .expect("state should initialize");
+        for index in 0..51 {
+            insert_test_node(&state, index)
+                .await
+                .expect("fixture node should be inserted");
+        }
+
+        assert!(lock_node_registration(&state, true).await.is_err());
+        state
+            .repository
+            .mark_node_for_deletion("node-0")
+            .await
+            .expect("first node should be removed from monitoring");
+        assert!(lock_node_registration(&state, true).await.is_err());
+        state
+            .repository
+            .mark_node_for_deletion("node-1")
+            .await
+            .expect("second node should be removed from monitoring");
+        register_test_node(state.clone(), 51)
+            .await
+            .expect("one node should fit after count drops to 49");
+
+        assert_eq!(
+            state
+                .repository
+                .list_stored_nodes(false)
+                .await
+                .expect("nodes should be listed")
+                .len(),
+            50
+        );
+        assert!(lock_node_registration(&state, true).await.is_err());
+    }
+
+    #[test]
+    fn only_the_latest_deletion_generation_may_start_a_purge() {
+        assert!(deletion_purge_is_current(3, 3));
+        assert!(!deletion_purge_is_current(2, 3));
+    }
+
     #[test]
     fn rejects_invalid_settings() {
         let settings = AppSettings {
             health_interval_seconds: 1,
+            ..AppSettings::default()
+        };
+        assert!(validate_settings(&settings).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_backend_only_settings() {
+        let settings = AppSettings {
+            latency_warning_ms: 0,
+            ..AppSettings::default()
+        };
+        assert!(validate_settings(&settings).is_err());
+
+        let settings = AppSettings {
+            aggregate_retention_days: 2_000,
+            ..AppSettings::default()
+        };
+        assert!(validate_settings(&settings).is_err());
+
+        let settings = AppSettings {
+            theme: "sepia".into(),
             ..AppSettings::default()
         };
         assert!(validate_settings(&settings).is_err());

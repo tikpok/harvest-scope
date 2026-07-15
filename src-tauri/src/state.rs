@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
-        atomic::{AtomicBool, AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -119,7 +119,9 @@ pub struct AppState {
     pub system_suspended: Arc<AtomicBool>,
     pub all_nodes_rechecking: Arc<AtomicBool>,
     pub all_nodes_refresh_lock: Arc<Mutex<()>>,
+    pub node_registration_lock: Arc<Mutex<()>>,
     pub supernode_nodes_cache: Arc<Mutex<Option<SupernodeListCache>>>,
+    node_deletion_generation: Arc<AtomicU64>,
 }
 
 impl AppState {
@@ -143,8 +145,20 @@ impl AppState {
             system_suspended: Arc::new(AtomicBool::new(false)),
             all_nodes_rechecking: Arc::new(AtomicBool::new(false)),
             all_nodes_refresh_lock: Arc::new(Mutex::new(())),
+            node_registration_lock: Arc::new(Mutex::new(())),
             supernode_nodes_cache: Arc::new(Mutex::new(None)),
+            node_deletion_generation: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    pub fn note_node_deletion(&self) -> u64 {
+        self.node_deletion_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
+    }
+
+    pub fn current_node_deletion_generation(&self) -> u64 {
+        self.node_deletion_generation.load(Ordering::Acquire)
     }
 
     pub fn set_background_monitoring(&self, enabled: bool) {

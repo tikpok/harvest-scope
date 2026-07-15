@@ -80,7 +80,11 @@ fn symbol_network_match_key(value: &str) -> String {
     }
 }
 
-async fn diagnose_peer_voting(state: &AppState, node: &StoredNode, checks: &mut Vec<DiagnosticCheck>) {
+async fn diagnose_peer_voting(
+    state: &AppState,
+    node: &StoredNode,
+    checks: &mut Vec<DiagnosticCheck>,
+) {
     let started = Instant::now();
     if !has_role(node, "Voting") {
         checks.push(check(
@@ -93,7 +97,11 @@ async fn diagnose_peer_voting(state: &AppState, node: &StoredNode, checks: &mut 
         ));
         return;
     }
-    let Some(public_key) = node.public_key.as_deref().filter(|value| !value.trim().is_empty()) else {
+    let Some(public_key) = node
+        .public_key
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
         checks.push(check(
             "voting_key",
             "Voting期限",
@@ -104,7 +112,11 @@ async fn diagnose_peer_voting(state: &AppState, node: &StoredNode, checks: &mut 
         ));
         return;
     };
-    let Some(network) = node.network.as_deref().filter(|value| !value.trim().is_empty()) else {
+    let Some(network) = node
+        .network
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
         checks.push(check(
             "voting_key",
             "Voting期限",
@@ -156,7 +168,10 @@ async fn diagnose_peer_voting(state: &AppState, node: &StoredNode, checks: &mut 
             "Voting期限",
             snapshot
                 .voting_key_remaining_epochs
-                .map_or("warning", |epochs| if epochs <= 30 { "warning" } else { "pass" }),
+                .map_or(
+                    "warning",
+                    |epochs| if epochs <= 30 { "warning" } else { "pass" },
+                ),
             snapshot.voting_key_remaining_epochs.map_or_else(
                 || "Voting期限を取得しましたが、残epochを特定できませんでした。".into(),
                 |epochs| format!("Voting期限まで残り{epochs} epochです。"),
@@ -284,7 +299,11 @@ async fn execute(state: &AppState, node: &StoredNode, alert_id: Option<String>) 
         match tokio::time::timeout(CHECK_TIMEOUT, TcpStream::connect(address)).await {
             Ok(Ok(_)) => checks.push(check(
                 "tcp",
-                if node.monitor_mode == MonitorMode::Peer { "P2Pポート" } else { "RESTポート" },
+                if node.monitor_mode == MonitorMode::Peer {
+                    "P2Pポート"
+                } else {
+                    "RESTポート"
+                },
                 "pass",
                 format!("{address}へ接続できました。"),
                 None,
@@ -292,7 +311,11 @@ async fn execute(state: &AppState, node: &StoredNode, alert_id: Option<String>) 
             )),
             Ok(Err(error)) => checks.push(check(
                 "tcp",
-                if node.monitor_mode == MonitorMode::Peer { "P2Pポート" } else { "RESTポート" },
+                if node.monitor_mode == MonitorMode::Peer {
+                    "P2Pポート"
+                } else {
+                    "RESTポート"
+                },
                 "fail",
                 error.to_string(),
                 Some("ノードプロセス、待受ポート、ファイアウォールを確認してください。"),
@@ -300,7 +323,11 @@ async fn execute(state: &AppState, node: &StoredNode, alert_id: Option<String>) 
             )),
             Err(_) => checks.push(check(
                 "tcp",
-                if node.monitor_mode == MonitorMode::Peer { "P2Pポート" } else { "RESTポート" },
+                if node.monitor_mode == MonitorMode::Peer {
+                    "P2Pポート"
+                } else {
+                    "RESTポート"
+                },
                 "fail",
                 "TCP接続がタイムアウトしました。",
                 Some("ネットワーク経路とファイアウォールを確認してください。"),
@@ -310,7 +337,11 @@ async fn execute(state: &AppState, node: &StoredNode, alert_id: Option<String>) 
     } else {
         checks.push(check(
             "tcp",
-            if node.monitor_mode == MonitorMode::Peer { "P2Pポート" } else { "RESTポート" },
+            if node.monitor_mode == MonitorMode::Peer {
+                "P2Pポート"
+            } else {
+                "RESTポート"
+            },
             "skipped",
             "接続先を解決できないため省略しました。",
             None,
@@ -320,12 +351,36 @@ async fn execute(state: &AppState, node: &StoredNode, alert_id: Option<String>) 
 
     if node.monitor_mode == MonitorMode::Peer {
         for (key, label, message) in [
-            ("identity", "ノード識別", "APIなしPeerノードではREST識別情報は対象外です。"),
-            ("health", "ヘルス", "APIなしPeerノードではRESTヘルスは対象外です。"),
-            ("chain", "チェーン同期", "APIなしPeerノードではチェーンAPI確認は対象外です。"),
-            ("peers", "ピア接続", "APIなしPeerノード自身からpeer一覧は取得できません。"),
-            ("websocket", "WebSocket", "APIなしPeerノードではWebSocketは対象外です。"),
-            ("state_hash", "State hash", "APIなしPeerノードではState hash比較は対象外です。"),
+            (
+                "identity",
+                "ノード識別",
+                "APIなしPeerノードではREST識別情報は対象外です。",
+            ),
+            (
+                "health",
+                "ヘルス",
+                "APIなしPeerノードではRESTヘルスは対象外です。",
+            ),
+            (
+                "chain",
+                "チェーン同期",
+                "APIなしPeerノードではチェーンAPI確認は対象外です。",
+            ),
+            (
+                "peers",
+                "ピア接続",
+                "APIなしPeerノード自身からpeer一覧は取得できません。",
+            ),
+            (
+                "websocket",
+                "WebSocket",
+                "APIなしPeerノードではWebSocketは対象外です。",
+            ),
+            (
+                "state_hash",
+                "State hash",
+                "APIなしPeerノードではState hash比較は対象外です。",
+            ),
         ] {
             checks.push(check(key, label, "skipped", message, None, Instant::now()));
         }
@@ -693,19 +748,28 @@ pub async fn run(
             return Err(AppError::Configuration("このノードは診断実行中です".into()));
         }
     }
-    let _permit = state
-        .request_limit
-        .clone()
-        .acquire_owned()
+    let task_state = state.clone();
+    let task_node = node.clone();
+    let task_node_id = node_id.clone();
+    let task_alert_id = alert_id.clone();
+    let mut task = tokio::spawn(async move {
+        let _permit = task_state
+            .request_limit
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| AppError::Configuration(error.to_string()))?;
+        let result = match tokio::time::timeout(
+            RUN_TIMEOUT,
+            execute(&task_state, &task_node, task_alert_id.clone()),
+        )
         .await
-        .map_err(|error| AppError::Configuration(error.to_string()))?;
-    let result =
-        match tokio::time::timeout(RUN_TIMEOUT, execute(&state, &node, alert_id.clone())).await {
+        {
             Ok(run) => run,
             Err(_) => DiagnosticRun {
                 id: uuid::Uuid::new_v4().to_string(),
-                node_id: node_id.clone(),
-                alert_id,
+                node_id: task_node_id,
+                alert_id: task_alert_id,
                 started_at: chrono::Utc::now().timestamp_millis() - RUN_TIMEOUT.as_millis() as i64,
                 completed_at: chrono::Utc::now().timestamp_millis(),
                 status: DiagnosticStatus::Failed,
@@ -720,7 +784,23 @@ pub async fn run(
                 )],
             },
         };
+        Ok::<_, AppError>(result)
+    });
+    let result = match tokio::time::timeout(RUN_TIMEOUT + Duration::from_secs(5), &mut task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(AppError::Configuration(format!(
+            "診断処理が異常終了しました: {error}"
+        ))),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            Err(AppError::Network(
+                "診断処理が35秒以内に完了しませんでした".into(),
+            ))
+        }
+    };
     state.diagnostic_nodes.lock().await.remove(&node_id);
+    let result = result?;
     state.repository.save_diagnostic_run(&result).await?;
     Ok(result)
 }

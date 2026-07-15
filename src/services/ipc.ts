@@ -11,6 +11,7 @@ import type {
   NodeDetail,
   NodeConfigImportResult,
   NodeSummary,
+  RefreshAllResult,
   ScanCandidate,
   ScanRequest,
   TopologySnapshot,
@@ -45,6 +46,7 @@ const emptyDashboard: DashboardData = {
   warning: 0,
   critical: 0,
   offline: 0,
+  unknown: 0,
   rechecking: false,
   nodes: [],
 };
@@ -74,7 +76,7 @@ export const api = {
   setNodeHarvestMetricsVisible: (nodeId: string, visible: boolean) =>
     invoke<void>("set_node_harvest_metrics_visible", { nodeId, visible }),
   refreshNode: (nodeId: string) => invoke<void>("refresh_node", { nodeId }),
-  refreshAllNodes: () => invoke<void>("refresh_all_nodes"),
+  refreshAllNodes: () => invoke<RefreshAllResult>("refresh_all_nodes"),
   interfaces: () => call<NetworkInterfaceInfo[]>("list_network_interfaces", undefined, []),
   scan: (request: ScanRequest) => invoke<ScanCandidate[]>("scan_subnet", { request }),
   cancelScan: () => invoke<void>("cancel_scan"),

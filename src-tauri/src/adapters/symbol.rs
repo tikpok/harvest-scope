@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{NaiveDate, TimeZone, Utc};
@@ -21,6 +21,8 @@ use crate::{
 };
 
 use super::{string_value, u64_value};
+
+const CERTIFICATE_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct SymbolAdapter {
     base_url: String,
@@ -119,9 +121,10 @@ impl<'a> DerReader<'a> {
             }
             length
         };
-        let end = self.offset.checked_add(length).ok_or_else(|| {
-            AppError::InvalidPayload("証明書DERの長さが大きすぎます".into())
-        })?;
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or_else(|| AppError::InvalidPayload("証明書DERの長さが大きすぎます".into()))?;
         let value = self
             .data
             .get(self.offset..end)
@@ -357,10 +360,13 @@ impl SymbolAdapter {
                 if raw.len() < 10 {
                     return Err(AppError::InvalidPayload("UTCTimeが短すぎます".into()));
                 }
-                let year = raw[0..2].parse::<i32>().map_err(|_| {
-                    AppError::InvalidPayload("UTCTimeの年を解析できません".into())
-                })?;
-                (if year >= 50 { 1900 + year } else { 2000 + year }, &raw[2..])
+                let year = raw[0..2]
+                    .parse::<i32>()
+                    .map_err(|_| AppError::InvalidPayload("UTCTimeの年を解析できません".into()))?;
+                (
+                    if year >= 50 { 1900 + year } else { 2000 + year },
+                    &raw[2..],
+                )
             }
             0x18 => {
                 if raw.len() < 12 {
@@ -373,11 +379,7 @@ impl SymbolAdapter {
                 })?;
                 (year, &raw[4..])
             }
-            _ => {
-                return Err(AppError::InvalidPayload(
-                    "証明書時刻タグが不正です".into(),
-                ))
-            }
+            _ => return Err(AppError::InvalidPayload("証明書時刻タグが不正です".into())),
         };
         let month = rest[0..2]
             .parse::<u32>()
@@ -431,20 +433,27 @@ impl SymbolAdapter {
             .ok_or_else(|| "HTTPS URLにホストがありません".to_string())?
             .to_owned();
         let port = url.port_or_known_default().unwrap_or(443);
-        let stream = TcpStream::connect((host.as_str(), port))
-            .await
-            .map_err(|error| error.to_string())?;
-        let server_name = ServerName::try_from(host)
-            .map_err(|_| "TLS ServerNameを作成できません".to_string())?;
+        let stream = tokio::time::timeout(
+            CERTIFICATE_FETCH_TIMEOUT,
+            TcpStream::connect((host.as_str(), port)),
+        )
+        .await
+        .map_err(|_| "TLS証明書取得のTCP接続がタイムアウトしました".to_string())?
+        .map_err(|error| error.to_string())?;
+        let server_name =
+            ServerName::try_from(host).map_err(|_| "TLS ServerNameを作成できません".to_string())?;
         let config = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(CertificateOnlyVerifier))
             .with_no_client_auth();
         let connector = TlsConnector::from(Arc::new(config));
-        let tls = connector
-            .connect(server_name, stream)
-            .await
-            .map_err(|error| error.to_string())?;
+        let tls = tokio::time::timeout(
+            CERTIFICATE_FETCH_TIMEOUT,
+            connector.connect(server_name, stream),
+        )
+        .await
+        .map_err(|_| "TLS証明書取得のハンドシェイクがタイムアウトしました".to_string())?
+        .map_err(|error| error.to_string())?;
         let (_, session) = tls.get_ref();
         let certificate = session
             .peer_certificates()
@@ -495,7 +504,10 @@ impl SymbolAdapter {
     }
 
     async fn fetch_voting_key_snapshot(&self) -> Result<CertificateSnapshot, String> {
-        let info = self.get_json("/node/info").await.map_err(|error| error.to_string())?;
+        let info = self
+            .get_json("/node/info")
+            .await
+            .map_err(|error| error.to_string())?;
         let roles = u64_value(info.get("roles")).unwrap_or_default();
         if roles & 4 == 0 {
             return Ok(CertificateSnapshot::default());
@@ -779,7 +791,8 @@ impl NodeAdapter for SymbolAdapter {
         match self.fetch_tls_certificate_not_after().await {
             Ok(Some(not_after)) => {
                 snapshot.node_certificate_not_after = Some(not_after);
-                snapshot.node_certificate_remaining_days = Some(Self::remaining_days(not_after, now));
+                snapshot.node_certificate_remaining_days =
+                    Some(Self::remaining_days(not_after, now));
             }
             Ok(None) => {}
             Err(error) => errors.push(format!("node certificate: {error}")),

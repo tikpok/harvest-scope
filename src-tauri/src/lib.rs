@@ -35,13 +35,12 @@ fn run_app() -> tauri::Result<()> {
 
     let builder = tauri::Builder::default();
     #[cfg(not(debug_assertions))]
-    let builder = builder
-        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
-        }));
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }));
     #[cfg(debug_assertions)]
     let builder = builder;
 
@@ -74,6 +73,10 @@ fn run_app() -> tauri::Result<()> {
             }
             services::desktop::setup(app, state.clone())?;
             services::monitor::start(app.handle().clone(), state.clone());
+            commands::schedule_deleted_node_purge(
+                state.clone(),
+                state.current_node_deletion_generation(),
+            );
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 services::desktop::refresh_tray(&handle, &state).await;

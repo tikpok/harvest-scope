@@ -248,6 +248,8 @@ pub struct NodeSummary {
     pub network: Option<String>,
     pub version: Option<String>,
     pub roles: Vec<String>,
+    pub observed_roles: Vec<String>,
+    pub rest_private: bool,
     pub enabled: bool,
     pub favorite: bool,
     pub status: NodeStatus,
@@ -392,8 +394,34 @@ pub struct DashboardData {
     pub warning: usize,
     pub critical: usize,
     pub offline: usize,
+    pub unknown: usize,
     pub rechecking: bool,
     pub nodes: Vec<NodeSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshAllFailure {
+    pub node_id: String,
+    pub node_name: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshAllProgress {
+    pub completed: usize,
+    pub total: usize,
+    pub failed: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshAllResult {
+    pub total: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub failures: Vec<RefreshAllFailure>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

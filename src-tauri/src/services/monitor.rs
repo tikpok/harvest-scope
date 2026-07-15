@@ -11,10 +11,11 @@ use crate::{
     adapters::{adapter_for, probe_tcp_endpoint, Nis1Adapter, SymbolAdapter},
     domain::{
         CertificateSnapshot, MonitorMode, NetworkEvent, NodeKind, NodeSample, NodeStatus,
-        StoredNode, SupernodeProgramNode,
+        RefreshAllFailure, RefreshAllProgress, RefreshAllResult, StoredNode, SupernodeProgramNode,
     },
     error::{AppError, AppResult},
     state::AppState,
+    storage::NodeUpsert,
 };
 
 use super::{desktop, websocket};
@@ -26,7 +27,52 @@ const OFFLINE_CONFIRMATION_FAILURES: u32 = 3;
 const SUSPENDED_REQUEST_THRESHOLD: Duration = Duration::from_secs(10);
 const SUPERNODE_INTERVAL_MS: i64 = 15 * 60 * 1_000;
 const SUPERNODE_CACHE_MS: i64 = 10 * 60 * 1_000;
-const MONITOR_NODE_CONCURRENCY: usize = 2;
+const BACKGROUND_MONITOR_CONCURRENCY: usize = 2;
+const MANUAL_REFRESH_CONCURRENCY: usize = 8;
+
+#[derive(Debug)]
+enum RefreshNodeOutcome {
+    Succeeded,
+    Failed {
+        node_id: String,
+        node_name: String,
+        message: String,
+    },
+}
+
+fn summarize_refresh_outcomes(outcomes: Vec<RefreshNodeOutcome>) -> RefreshAllResult {
+    let total = outcomes.len();
+    let failures = outcomes
+        .into_iter()
+        .filter_map(|outcome| match outcome {
+            RefreshNodeOutcome::Succeeded => None,
+            RefreshNodeOutcome::Failed {
+                node_id,
+                node_name,
+                message,
+            } => Some(RefreshAllFailure {
+                node_id,
+                node_name,
+                message,
+            }),
+        })
+        .collect::<Vec<_>>();
+    let failed = failures.len();
+    RefreshAllResult {
+        total,
+        succeeded: total.saturating_sub(failed),
+        failed,
+        failures,
+    }
+}
+
+struct RecheckingReset(AppState);
+
+impl Drop for RecheckingReset {
+    fn drop(&mut self) {
+        self.0.set_all_nodes_rechecking(false);
+    }
+}
 
 fn wake_was_late(expected_at: i64, actual_at: i64) -> bool {
     actual_at.saturating_sub(expected_at) >= RESUME_LATE_THRESHOLD_MS
@@ -34,6 +80,25 @@ fn wake_was_late(expected_at: i64, actual_at: i64) -> bool {
 
 fn latency_sample_is_slow(health_succeeded: bool, latency_ms: i64, warning_ms: u64) -> bool {
     health_succeeded && latency_ms as u64 >= warning_ms
+}
+
+fn status_from_signals(
+    resume_grace_missing_health: bool,
+    offline: bool,
+    critical: bool,
+    warning: bool,
+) -> NodeStatus {
+    if resume_grace_missing_health {
+        NodeStatus::Unknown
+    } else if offline {
+        NodeStatus::Offline
+    } else if critical {
+        NodeStatus::Critical
+    } else if warning {
+        NodeStatus::Warning
+    } else {
+        NodeStatus::Healthy
+    }
 }
 
 fn certificate_expiry_severity(remaining: Option<i64>) -> Option<&'static str> {
@@ -46,6 +111,60 @@ fn certificate_expiry_severity(remaining: Option<i64>) -> Option<&'static str> {
             None
         }
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpiryAlertTransition {
+    Active(&'static str),
+    Resolved,
+    Unchanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalizationStallTransition {
+    Active(&'static str),
+    Resolved,
+    Unchanged,
+}
+
+fn expiry_alert_transition(
+    current_remaining: Option<i64>,
+    current_expiry_anchor: Option<i64>,
+    previous_expiry_anchor: Option<i64>,
+) -> ExpiryAlertTransition {
+    if let Some(severity) = certificate_expiry_severity(current_remaining) {
+        return ExpiryAlertTransition::Active(severity);
+    }
+
+    if current_expiry_anchor
+        .zip(previous_expiry_anchor)
+        .is_some_and(|(current, previous)| current > previous)
+    {
+        ExpiryAlertTransition::Resolved
+    } else {
+        ExpiryAlertTransition::Unchanged
+    }
+}
+
+fn finalization_stall_transition(
+    evaluated: bool,
+    symbol_node: bool,
+    stalled_for_ms: i64,
+    chain_advanced_since_finalization: u64,
+) -> FinalizationStallTransition {
+    if !evaluated || !symbol_node {
+        return FinalizationStallTransition::Unchanged;
+    }
+
+    if stalled_for_ms >= 30 * 60 * 1_000 && chain_advanced_since_finalization >= 20 {
+        if stalled_for_ms >= 60 * 60 * 1_000 {
+            FinalizationStallTransition::Active("critical")
+        } else {
+            FinalizationStallTransition::Active("warning")
+        }
+    } else {
+        FinalizationStallTransition::Resolved
+    }
 }
 
 fn node_certificate_message(days: i64) -> String {
@@ -122,10 +241,17 @@ fn empty_sample(
     }
 }
 
+fn roles_include(roles: &[String], role: &str) -> bool {
+    roles.iter().any(|value| value.eq_ignore_ascii_case(role))
+}
+
 fn has_role(node: &StoredNode, role: &str) -> bool {
-    node.roles
-        .iter()
-        .any(|value| value.eq_ignore_ascii_case(role))
+    roles_include(&node.roles, role)
+}
+
+fn rest_metric_alerts_enabled(public_key: Option<&str>, observed_roles: &[String]) -> bool {
+    public_key.is_some_and(|value| !value.trim().is_empty())
+        || !roles_include(observed_roles, "API")
 }
 
 fn symbol_network_match_key(value: &str) -> String {
@@ -256,6 +382,10 @@ async fn monitor_peer_node_inner(
         }
         Err(error) => sample.certificate_metric_error = Some(error),
     }
+    let previous_certificate = state
+        .repository
+        .latest_certificate_snapshot(&node.id)
+        .await?;
     state.repository.save_sample(&node.id, &sample).await?;
 
     let evaluation_paused = resume_grace
@@ -308,19 +438,22 @@ async fn monitor_peer_node_inner(
         .await?;
     }
     if !evaluation_paused {
-        let voting_key_severity = certificate_expiry_severity(sample.voting_key_remaining_epochs);
         let voting_key_message = sample
             .voting_key_remaining_epochs
             .map(voting_key_message)
             .unwrap_or_else(|| "投票キー期限を確認できません。".into());
-        update_alert(
+        update_expiry_alert(
             &app,
             &state,
             &node,
-            voting_key_severity.is_some(),
+            expiry_alert_transition(
+                sample.voting_key_remaining_epochs,
+                sample.voting_key_end_epoch,
+                previous_certificate.voting_key_end_epoch,
+            ),
             "voting_key_expiring",
-            voting_key_severity.unwrap_or("warning"),
             &voting_key_message,
+            "投票キーの有効期限が延長されました。",
         )
         .await?;
     }
@@ -404,6 +537,53 @@ async fn update_alert(
     Ok(())
 }
 
+async fn resolve_alert_silently(
+    app: &AppHandle,
+    state: &AppState,
+    node: &StoredNode,
+    alert_type: &str,
+) -> AppResult<()> {
+    if state
+        .repository
+        .resolve_alert(&node.id, alert_type)
+        .await?
+        .is_some()
+    {
+        let _ = app.emit("alert-changed", &node.id);
+        desktop::refresh_tray(app, state).await;
+    }
+    Ok(())
+}
+
+async fn update_expiry_alert(
+    app: &AppHandle,
+    state: &AppState,
+    node: &StoredNode,
+    transition: ExpiryAlertTransition,
+    alert_type: &str,
+    active_message: &str,
+    resolved_message: &str,
+) -> AppResult<()> {
+    match transition {
+        ExpiryAlertTransition::Active(severity) => {
+            update_alert(app, state, node, true, alert_type, severity, active_message).await
+        }
+        ExpiryAlertTransition::Resolved => {
+            update_alert(
+                app,
+                state,
+                node,
+                false,
+                alert_type,
+                "warning",
+                resolved_message,
+            )
+            .await
+        }
+        ExpiryAlertTransition::Unchanged => Ok(()),
+    }
+}
+
 async fn monitor_node_inner(
     app: AppHandle,
     state: AppState,
@@ -435,36 +615,49 @@ async fn monitor_node_inner(
     let resume_grace = state.is_system_suspended() || state.in_resume_grace(evaluation_now);
     let mut poll_event = None;
     let mut topology_changed = false;
-    let mut runtime_map = state.runtime.lock().await;
-    let monitored_max = node.network.as_deref().and_then(|network| {
-        network_nodes
-            .iter()
-            .filter(|candidate| candidate.network.as_deref() == Some(network))
-            .filter_map(|candidate| {
-                runtime_map
-                    .get(&candidate.id)
-                    .and_then(|value| value.chain.height)
-            })
-            .max()
-    });
-    let runtime = runtime_map.entry(node.id.clone()).or_default();
+    let monitored_max = {
+        let runtime_map = state.runtime.lock().await;
+        node.network.as_deref().and_then(|network| {
+            network_nodes
+                .iter()
+                .filter(|candidate| candidate.network.as_deref() == Some(network))
+                .filter_map(|candidate| {
+                    runtime_map
+                        .get(&candidate.id)
+                        .and_then(|value| value.chain.height)
+                })
+                .max()
+        })
+    };
     let mut error = None;
     let health = match health_result {
-        Ok(health) => {
-            runtime.record_connectivity_success(resume_grace);
-            Some(health)
-        }
+        Ok(health) => Some(health),
         Err(err) => {
-            runtime.record_connectivity_failure(resume_grace, now, OFFLINE_CONFIRMATION_DELAY_MS);
             error = Some(err.to_string());
             None
         }
     };
-    let chain_due =
-        force || now - runtime.last_chain_poll >= settings.chain_interval_seconds as i64 * 1_000;
+    let (chain_due, peers_due, static_due, supernode_due) = {
+        let mut runtime_map = state.runtime.lock().await;
+        let runtime = runtime_map.entry(node.id.clone()).or_default();
+        if health.is_some() {
+            runtime.record_connectivity_success(resume_grace);
+        } else {
+            runtime.record_connectivity_failure(resume_grace, now, OFFLINE_CONFIRMATION_DELAY_MS);
+        }
+        (
+            force
+                || now - runtime.last_chain_poll >= settings.chain_interval_seconds as i64 * 1_000,
+            force || now - runtime.last_peer_poll >= settings.peer_interval_seconds as i64 * 1_000,
+            force || now - runtime.last_static_poll >= 15 * 60 * 1_000,
+            force || now - runtime.last_supernode_poll >= SUPERNODE_INTERVAL_MS,
+        )
+    };
     if health.is_some() && chain_due {
         match adapter.fetch_chain().await {
             Ok(chain) => {
+                let mut runtime_map = state.runtime.lock().await;
+                let runtime = runtime_map.entry(node.id.clone()).or_default();
                 if runtime.chain.height.is_some()
                     && runtime.chain.height != chain.height
                     && (node.kind == NodeKind::Nis1 || !runtime.websocket_connected)
@@ -494,12 +687,12 @@ async fn monitor_node_inner(
             Err(err) => error = Some(err.to_string()),
         }
     }
-    let peers_due =
-        force || now - runtime.last_peer_poll >= settings.peer_interval_seconds as i64 * 1_000;
     if health.is_some() && peers_due {
         match adapter.fetch_peers().await {
             Ok(peers) => match state.repository.replace_peers(&node.id, &peers, now).await {
                 Ok(()) => {
+                    let mut runtime_map = state.runtime.lock().await;
+                    let runtime = runtime_map.entry(node.id.clone()).or_default();
                     topology_changed = runtime.peers != peers;
                     runtime.peers = peers;
                     runtime.last_peer_poll = now;
@@ -543,7 +736,6 @@ async fn monitor_node_inner(
             Err(err) => harvest_metric_error = Some(err.to_string()),
         }
     }
-    let static_due = force || now - runtime.last_static_poll >= 15 * 60 * 1_000;
     let mut node_certificate_not_after = None;
     let mut node_certificate_remaining_days = None;
     let mut voting_key_start_epoch = None;
@@ -565,7 +757,6 @@ async fn monitor_node_inner(
             Err(err) => certificate_metric_error = Some(err.to_string()),
         }
     }
-    let supernode_due = force || now - runtime.last_supernode_poll >= SUPERNODE_INTERVAL_MS;
     let mut supernode_id = None;
     let mut supernode_status = None;
     let mut supernode_last_round = None;
@@ -586,7 +777,13 @@ async fn monitor_node_inner(
                     supernode_checks_passed = snapshot.supernode_checks_passed;
                     supernode_failed_checks = snapshot.supernode_failed_checks;
                     supernode_metric_error = snapshot.error;
-                    runtime.last_supernode_poll = now;
+                    state
+                        .runtime
+                        .lock()
+                        .await
+                        .entry(node.id.clone())
+                        .or_default()
+                        .last_supernode_poll = now;
                 }
                 Err(err) => supernode_metric_error = Some(err.to_string()),
             },
@@ -597,22 +794,32 @@ async fn monitor_node_inner(
         if let Ok(identity) = adapter.fetch_static_info().await {
             match state
                 .repository
-                .upsert_node_with_mode(
-                    &node.id,
-                    &node.base_url,
-                    &node.display_name,
-                    &identity,
-                    node.monitor_mode,
-                    node.enabled,
-                    node.favorite,
-                )
+                .upsert_node_with_mode(NodeUpsert {
+                    id: &node.id,
+                    base_url: &node.base_url,
+                    display_name: &node.display_name,
+                    identity: &identity,
+                    monitor_mode: node.monitor_mode,
+                    enabled: node.enabled,
+                    favorite: node.favorite,
+                })
                 .await
             {
-                Ok(()) => runtime.last_static_poll = now,
+                Ok(()) => {
+                    state
+                        .runtime
+                        .lock()
+                        .await
+                        .entry(node.id.clone())
+                        .or_default()
+                        .last_static_poll = now;
+                }
                 Err(err) => error = Some(err.to_string()),
             }
         }
     }
+    let mut runtime_map = state.runtime.lock().await;
+    let runtime = runtime_map.entry(node.id.clone()).or_default();
     runtime.chain.network_height = runtime
         .chain
         .network_height
@@ -642,22 +849,16 @@ async fn monitor_node_inner(
         .lag_critical_since
         .is_some_and(|since| now - since >= 10 * 60 * 1_000);
     let health_degraded = health.as_ref().is_some_and(|health| !health.healthy);
-    let status = if resume_grace && health.is_none() {
-        NodeStatus::Unknown
-    } else if runtime.offline_confirmed(OFFLINE_CONFIRMATION_FAILURES) {
-        NodeStatus::Offline
-    } else if runtime.consecutive_failures > 0 || health_degraded {
-        NodeStatus::Warning
-    } else if lag_critical_active {
-        NodeStatus::Critical
-    } else if lag_warning_active
-        || latency_ms as u64 >= settings.latency_warning_ms
-        || supernode_checks_passed == Some(false)
-    {
-        NodeStatus::Warning
-    } else {
-        NodeStatus::Healthy
-    };
+    let status = status_from_signals(
+        resume_grace && health.is_none(),
+        runtime.offline_confirmed(OFFLINE_CONFIRMATION_FAILURES),
+        lag_critical_active,
+        runtime.consecutive_failures > 0
+            || health_degraded
+            || lag_warning_active
+            || latency_ms as u64 >= settings.latency_warning_ms
+            || supernode_checks_passed == Some(false),
+    );
     if resume_grace || health.is_none() {
         runtime.latency_failures = 0;
         runtime.latency_successes = 0;
@@ -699,10 +900,12 @@ async fn monitor_node_inner(
         .zip(runtime.height_at_finalization_change)
         .map(|(current, previous)| current.saturating_sub(previous))
         .unwrap_or_default();
-    let finalization_stalled = node.kind == crate::domain::NodeKind::Symbol
-        && chain_due
-        && finalization_stalled_for >= 30 * 60 * 1_000
-        && chain_advanced_since_finalization >= 20;
+    let finalization_stall_alert = finalization_stall_transition(
+        health.is_some() && chain_due,
+        node.kind == crate::domain::NodeKind::Symbol,
+        finalization_stalled_for,
+        chain_advanced_since_finalization,
+    );
     let chain = runtime.chain.clone();
     let peer_count = runtime
         .peers
@@ -721,6 +924,10 @@ async fn monitor_node_inner(
         let _ = app.emit("topology-updated", &node.id);
     }
 
+    let previous_certificate = state
+        .repository
+        .latest_certificate_snapshot(&node.id)
+        .await?;
     let sample = NodeSample {
         observed_at: now,
         reachable,
@@ -763,7 +970,17 @@ async fn monitor_node_inner(
     let evaluation_paused = resume_grace
         || state.is_system_suspended()
         || state.in_resume_grace(chrono::Utc::now().timestamp_millis());
-    if !evaluation_paused && offline {
+    let observed_roles = state
+        .repository
+        .observed_roles_for_node_url(&node.base_url)
+        .await?;
+    let rest_metric_alerts_allowed =
+        rest_metric_alerts_enabled(node.public_key.as_deref(), &observed_roles);
+    if !evaluation_paused && !rest_metric_alerts_allowed {
+        resolve_alert_silently(&app, &state, &node, "offline").await?;
+        resolve_alert_silently(&app, &state, &node, "latency").await?;
+        resolve_alert_silently(&app, &state, &node, "peers").await?;
+    } else if !evaluation_paused && offline {
         update_alert(
             &app,
             &state,
@@ -786,7 +1003,7 @@ async fn monitor_node_inner(
         )
         .await?;
     }
-    if !evaluation_paused && latency_alert {
+    if rest_metric_alerts_allowed && !evaluation_paused && latency_alert {
         update_alert(
             &app,
             &state,
@@ -797,7 +1014,7 @@ async fn monitor_node_inner(
             "REST APIの応答遅延が継続しています。",
         )
         .await?;
-    } else if !evaluation_paused && latency_recovered {
+    } else if rest_metric_alerts_allowed && !evaluation_paused && latency_recovered {
         update_alert(
             &app,
             &state,
@@ -814,30 +1031,45 @@ async fn monitor_node_inner(
         desktop::refresh_tray(&app, &state).await;
         return Ok(());
     }
-    update_alert(
-        &app,
-        &state,
-        &node,
-        zero_peers,
-        "peers",
-        "warning",
-        "アクティブピアが0の状態が5分以上継続しています。",
-    )
-    .await?;
-    update_alert(
-        &app,
-        &state,
-        &node,
-        finalization_stalled,
-        "finalization_stall",
-        if finalization_stalled_for >= 60 * 60 * 1_000 {
-            "critical"
-        } else {
-            "warning"
-        },
-        "Symbolのファイナライズ高が30分以上更新されていません。",
-    )
-    .await?;
+    if rest_metric_alerts_allowed {
+        update_alert(
+            &app,
+            &state,
+            &node,
+            zero_peers,
+            "peers",
+            "warning",
+            "アクティブピアが0の状態が5分以上継続しています。",
+        )
+        .await?;
+    }
+    match finalization_stall_alert {
+        FinalizationStallTransition::Active(severity) => {
+            update_alert(
+                &app,
+                &state,
+                &node,
+                true,
+                "finalization_stall",
+                severity,
+                "Symbolのファイナライズ高が30分以上更新されていません。",
+            )
+            .await?;
+        }
+        FinalizationStallTransition::Resolved => {
+            update_alert(
+                &app,
+                &state,
+                &node,
+                false,
+                "finalization_stall",
+                "warning",
+                "Symbolのファイナライズ高が更新されました。",
+            )
+            .await?;
+        }
+        FinalizationStallTransition::Unchanged => {}
+    }
     if let Some(lag) = lag {
         let active = lag_warning_active;
         let severity = if lag_critical_active {
@@ -856,32 +1088,38 @@ async fn monitor_node_inner(
         )
         .await?;
     }
-    let node_certificate_severity = certificate_expiry_severity(node_certificate_remaining_days);
     let node_certificate_message = node_certificate_remaining_days
         .map(node_certificate_message)
         .unwrap_or_else(|| "ノード証明書期限を確認できません。".into());
-    update_alert(
+    update_expiry_alert(
         &app,
         &state,
         &node,
-        node_certificate_severity.is_some(),
+        expiry_alert_transition(
+            node_certificate_remaining_days,
+            node_certificate_not_after,
+            previous_certificate.node_certificate_not_after,
+        ),
         "node_certificate_expiring",
-        node_certificate_severity.unwrap_or("warning"),
         &node_certificate_message,
+        "ノード証明書の期限が延長されました。",
     )
     .await?;
-    let voting_key_severity = certificate_expiry_severity(voting_key_remaining_epochs);
     let voting_key_message = voting_key_remaining_epochs
         .map(voting_key_message)
         .unwrap_or_else(|| "投票キー期限を確認できません。".into());
-    update_alert(
+    update_expiry_alert(
         &app,
         &state,
         &node,
-        voting_key_severity.is_some(),
+        expiry_alert_transition(
+            voting_key_remaining_epochs,
+            voting_key_end_epoch,
+            previous_certificate.voting_key_end_epoch,
+        ),
         "voting_key_expiring",
-        voting_key_severity.unwrap_or("warning"),
         &voting_key_message,
+        "投票キーの有効期限が延長されました。",
     )
     .await?;
     if supernode_alert_evaluated {
@@ -948,33 +1186,62 @@ pub async fn monitor_node(
     result
 }
 
-pub async fn refresh_all_nodes(app: AppHandle, state: AppState) -> AppResult<()> {
+pub async fn refresh_all_nodes(app: AppHandle, state: AppState) -> AppResult<RefreshAllResult> {
     let Ok(_refresh_guard) = state.all_nodes_refresh_lock.try_lock() else {
-        return Ok(());
+        return Ok(RefreshAllResult::default());
     };
     state.set_all_nodes_rechecking(true);
+    let _rechecking_reset = RecheckingReset(state.clone());
     let _ = app.emit("refresh-all-state-changed", true);
 
-    let result = async {
-        let nodes = state.repository.list_stored_nodes(true).await?;
-        let results = futures_util::stream::iter(nodes.into_iter().map(|node| {
-            let app = app.clone();
-            let state = state.clone();
-            async move { monitor_node(app, state, node, true).await }
-        }))
-        .buffer_unordered(MONITOR_NODE_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
-        results
-            .into_iter()
-            .collect::<AppResult<Vec<_>>>()
-            .map(|_| ())
+    let nodes = state.repository.list_stored_nodes(true).await?;
+    let total = nodes.len();
+    let _ = app.emit(
+        "refresh-all-progress",
+        RefreshAllProgress {
+            completed: 0,
+            total,
+            failed: 0,
+        },
+    );
+    let mut stream = futures_util::stream::iter(nodes.into_iter().map(|node| {
+        let app = app.clone();
+        let state = state.clone();
+        async move {
+            let node_id = node.id.clone();
+            let node_name = node.display_name.clone();
+            match monitor_node(app, state, node, true).await {
+                Ok(()) => RefreshNodeOutcome::Succeeded,
+                Err(error) => RefreshNodeOutcome::Failed {
+                    node_id,
+                    node_name,
+                    message: error.to_string(),
+                },
+            }
+        }
+    }))
+    .buffer_unordered(MANUAL_REFRESH_CONCURRENCY);
+    let mut outcomes = Vec::with_capacity(total);
+    let mut failed = 0;
+    while let Some(outcome) = stream.next().await {
+        if matches!(outcome, RefreshNodeOutcome::Failed { .. }) {
+            failed += 1;
+        }
+        outcomes.push(outcome);
+        let _ = app.emit(
+            "refresh-all-progress",
+            RefreshAllProgress {
+                completed: outcomes.len(),
+                total,
+                failed,
+            },
+        );
     }
-    .await;
+    let result = summarize_refresh_outcomes(outcomes);
 
     state.set_all_nodes_rechecking(false);
     let _ = app.emit("refresh-all-state-changed", false);
-    result
+    Ok(result)
 }
 
 async fn compare_state_hashes(app: AppHandle, state: AppState) -> AppResult<()> {
@@ -1079,7 +1346,7 @@ pub fn start(app: AppHandle, state: AppState) {
                         }
                     }
                 }))
-                .buffer_unordered(MONITOR_NODE_CONCURRENCY)
+                .buffer_unordered(BACKGROUND_MONITOR_CONCURRENCY)
                 .collect::<Vec<_>>()
                 .await;
             });
@@ -1109,6 +1376,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn refresh_summary_keeps_partial_failures_out_of_the_command_error_path() {
+        let summary = summarize_refresh_outcomes(vec![
+            RefreshNodeOutcome::Succeeded,
+            RefreshNodeOutcome::Failed {
+                node_id: "node-b".into(),
+                node_name: "REST未検出B".into(),
+                message: "タイムアウトしました".into(),
+            },
+            RefreshNodeOutcome::Succeeded,
+        ]);
+
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.succeeded, 2);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.failures[0].node_id, "node-b");
+    }
+
+    #[test]
     fn detects_a_monitor_loop_delayed_by_suspend() {
         assert!(!wake_was_late(100_000, 114_999));
         assert!(wake_was_late(100_000, 115_000));
@@ -1121,12 +1406,94 @@ mod tests {
     }
 
     #[test]
+    fn rest_metric_alerts_are_suppressed_for_observed_only_api_nodes() {
+        assert!(!rest_metric_alerts_enabled(None, &["API".to_string()]));
+        assert!(rest_metric_alerts_enabled(
+            Some("verified-public-key"),
+            &["API".to_string()]
+        ));
+        assert!(rest_metric_alerts_enabled(None, &[]));
+    }
+
+    #[test]
+    fn critical_status_takes_precedence_over_warning_signals() {
+        assert_eq!(
+            status_from_signals(false, false, true, true),
+            NodeStatus::Critical
+        );
+        assert_eq!(
+            status_from_signals(false, true, true, true),
+            NodeStatus::Offline
+        );
+        assert_eq!(
+            status_from_signals(true, true, true, true),
+            NodeStatus::Unknown
+        );
+    }
+
+    #[test]
     fn certificate_expiry_thresholds_are_warning_then_critical() {
         assert_eq!(certificate_expiry_severity(Some(31)), None);
         assert_eq!(certificate_expiry_severity(Some(30)), Some("warning"));
         assert_eq!(certificate_expiry_severity(Some(7)), Some("critical"));
         assert_eq!(certificate_expiry_severity(Some(-1)), Some("critical"));
         assert_eq!(certificate_expiry_severity(None), None);
+    }
+
+    #[test]
+    fn expiry_alert_skips_when_current_metric_is_missing() {
+        assert_eq!(
+            expiry_alert_transition(None, None, Some(100)),
+            ExpiryAlertTransition::Unchanged
+        );
+    }
+
+    #[test]
+    fn expiry_alert_resolves_only_when_expiry_anchor_extends() {
+        assert_eq!(
+            expiry_alert_transition(Some(31), Some(100), Some(100)),
+            ExpiryAlertTransition::Unchanged
+        );
+        assert_eq!(
+            expiry_alert_transition(Some(31), Some(101), Some(100)),
+            ExpiryAlertTransition::Resolved
+        );
+    }
+
+    #[test]
+    fn expiry_alert_stays_active_when_extended_but_still_expiring() {
+        assert_eq!(
+            expiry_alert_transition(Some(7), Some(101), Some(100)),
+            ExpiryAlertTransition::Active("critical")
+        );
+    }
+
+    #[test]
+    fn finalization_stall_alert_skips_when_chain_was_not_checked() {
+        assert_eq!(
+            finalization_stall_transition(false, true, 45 * 60 * 1_000, 30),
+            FinalizationStallTransition::Unchanged
+        );
+    }
+
+    #[test]
+    fn finalization_stall_alert_resolves_only_after_chain_check() {
+        assert_eq!(
+            finalization_stall_transition(true, true, 5 * 60 * 1_000, 30),
+            FinalizationStallTransition::Resolved
+        );
+    }
+
+    #[test]
+    fn finalization_stall_alert_escalates_after_one_hour() {
+        assert_eq!(
+            finalization_stall_transition(true, true, 30 * 60 * 1_000, 20),
+            FinalizationStallTransition::Active("warning")
+        );
+        assert_eq!(
+            finalization_stall_transition(true, true, 60 * 60 * 1_000, 20),
+            FinalizationStallTransition::Active("critical")
+        );
     }
 
     #[test]
