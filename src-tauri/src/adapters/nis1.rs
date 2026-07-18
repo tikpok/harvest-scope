@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
 use url::Url;
@@ -10,6 +9,7 @@ use crate::{
         SupernodeProgramNode, SupernodeSnapshot,
     },
     error::{AppError, AppResult},
+    transport::{NodeTransport, ResponseBudget},
 };
 
 use super::{string_value, u64_value};
@@ -29,7 +29,7 @@ const SUPERNODE_TEST_KEYS: &[&str] = &[
 
 pub struct Nis1Adapter {
     base_url: String,
-    client: Client,
+    transport: NodeTransport,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,48 +49,47 @@ struct SupernodeRoundResult {
 }
 
 impl Nis1Adapter {
-    pub fn new(base_url: String, client: Client) -> Self {
-        Self { base_url, client }
+    pub fn new(base_url: String, transport: NodeTransport) -> Self {
+        Self {
+            base_url,
+            transport,
+        }
     }
 
     async fn get_json(&self, path: &str) -> AppResult<Value> {
-        let response = self
-            .client
-            .get(format!("{}{}", self.base_url, path))
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            return Err(AppError::Network(format!(
-                "HTTP {} ({path})",
-                response.status()
-            )));
-        }
-        response.json().await.map_err(Into::into)
+        let budget = if matches!(path, "/heartbeat" | "/status") {
+            ResponseBudget::Health
+        } else if path.contains("peer-list") {
+            ResponseBudget::Collection
+        } else {
+            ResponseBudget::Document
+        };
+        self.transport
+            .get_json(&format!("{}{}", self.base_url, path), budget)
+            .await
     }
 
     async fn get_supernode_json<T: serde::de::DeserializeOwned>(
-        client: &Client,
+        transport: &NodeTransport,
         path: &str,
     ) -> AppResult<T> {
-        let response = client
-            .get(format!("{SUPERNODE_API_BASE}{path}"))
-            .send()
+        let value = transport
+            .get_json(
+                &format!("{SUPERNODE_API_BASE}{path}"),
+                ResponseBudget::Collection,
+            )
             .await?;
-        if !response.status().is_success() {
-            return Err(AppError::Network(format!(
-                "HTTP {} ({path})",
-                response.status()
-            )));
-        }
-        response.json().await.map_err(Into::into)
+        serde_json::from_value(value).map_err(Into::into)
     }
 
-    pub async fn fetch_supernode_nodes(client: &Client) -> AppResult<Vec<SupernodeProgramNode>> {
+    pub async fn fetch_supernode_nodes(
+        transport: &NodeTransport,
+    ) -> AppResult<Vec<SupernodeProgramNode>> {
         let mut nodes = Vec::new();
         let mut offset = 0usize;
         loop {
             let page: Vec<SupernodeProgramNode> = Self::get_supernode_json(
-                client,
+                transport,
                 &format!("/nodes?count={SUPERNODE_PAGE_SIZE}&offset={offset}"),
             )
             .await?;
@@ -114,7 +113,6 @@ impl Nis1Adapter {
     fn find_supernode_program_node<'a>(
         supernodes: &'a [SupernodeProgramNode],
         local_endpoint: &str,
-        local_name: Option<&str>,
     ) -> Option<&'a SupernodeProgramNode> {
         let local_key = Self::supernode_match_key(local_endpoint)?;
         if let Some(program_node) = supernodes
@@ -124,17 +122,35 @@ impl Nis1Adapter {
             return Some(program_node);
         }
 
-        let local_name = local_name?.trim();
-        if local_name.is_empty() {
-            return None;
+        None
+    }
+
+    fn select_supernode_program_node<'a>(
+        supernodes: &'a [SupernodeProgramNode],
+        local_endpoint: &str,
+        configured_supernode_id: Option<i64>,
+    ) -> AppResult<Option<&'a SupernodeProgramNode>> {
+        let endpoint_match = Self::find_supernode_program_node(supernodes, local_endpoint);
+        let configured_match =
+            match configured_supernode_id {
+                Some(id) => Some(supernodes.iter().find(|node| node.id == id).ok_or_else(
+                    || {
+                        AppError::Configuration(format!(
+                            "指定したSupernode ID {id}は公式リストにありません"
+                        ))
+                    },
+                )?),
+                None => None,
+            };
+        if let (Some(endpoint), Some(configured)) = (endpoint_match, configured_match) {
+            if endpoint.id != configured.id {
+                return Err(AppError::SupernodeIdentityConflict {
+                    endpoint_id: endpoint.id,
+                    configured_id: configured.id,
+                });
+            }
         }
-        let mut matching_names = supernodes.iter().filter(|node| {
-            node.name
-                .as_deref()
-                .is_some_and(|name| name.trim().eq_ignore_ascii_case(local_name))
-        });
-        let program_node = matching_names.next()?;
-        matching_names.next().is_none().then_some(program_node)
+        Ok(configured_match.or(endpoint_match))
     }
 
     fn parse_round_timestamp(value: Option<&str>) -> Option<i64> {
@@ -339,6 +355,7 @@ impl NodeAdapter for Nis1Adapter {
     async fn fetch_supernode_metrics(
         &self,
         supernodes: &[SupernodeProgramNode],
+        configured_supernode_id: Option<i64>,
     ) -> AppResult<SupernodeSnapshot> {
         if Self::supernode_match_key(&self.base_url).is_none() {
             return Ok(SupernodeSnapshot {
@@ -346,15 +363,11 @@ impl NodeAdapter for Nis1Adapter {
                 ..SupernodeSnapshot::default()
             });
         }
-        let endpoint_match = Self::find_supernode_program_node(supernodes, &self.base_url, None);
-        let local_name = if endpoint_match.is_none() {
-            self.probe().await.ok().and_then(|identity| identity.name)
-        } else {
-            None
-        };
-        let program_node = endpoint_match.or_else(|| {
-            Self::find_supernode_program_node(supernodes, &self.base_url, local_name.as_deref())
-        });
+        let program_node = Self::select_supernode_program_node(
+            supernodes,
+            &self.base_url,
+            configured_supernode_id,
+        )?;
         let Some(program_node) = program_node else {
             return Ok(SupernodeSnapshot {
                 supernode_status: Some("not_found".into()),
@@ -362,7 +375,8 @@ impl NodeAdapter for Nis1Adapter {
             });
         };
         let info: SupernodeInfo =
-            Self::get_supernode_json(&self.client, &format!("/node/{}", program_node.id)).await?;
+            Self::get_supernode_json(&self.transport, &format!("/node/{}", program_node.id))
+                .await?;
         let round_id = match info.last_results_round {
             Some(round_id) if round_id >= 0 => round_id,
             _ => {
@@ -374,7 +388,7 @@ impl NodeAdapter for Nis1Adapter {
             }
         };
         let rounds: Vec<SupernodeRoundResult> = Self::get_supernode_json(
-            &self.client,
+            &self.transport,
             &format!(
                 "/node/{}/results/rounds/{}/to/{}",
                 program_node.id, round_id, round_id
@@ -429,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_supernode_by_unique_name_when_monitoring_through_lan_url() {
+    fn does_not_match_supernode_by_name_when_monitoring_through_lan_url() {
         let supernodes = vec![
             SupernodeProgramNode {
                 id: 6021,
@@ -447,11 +461,10 @@ mod tests {
 
         let matched = Nis1Adapter::find_supernode_program_node(
             &supernodes,
-            "http://192.0.2.115:7890",
-            Some("7338tkpk"),
+            "http://node-lan.example.invalid:7890",
         );
 
-        assert_eq!(matched.map(|node| node.id), Some(6021));
+        assert_eq!(matched.map(|node| node.id), None);
     }
 
     #[test]
@@ -473,11 +486,49 @@ mod tests {
 
         let matched = Nis1Adapter::find_supernode_program_node(
             &supernodes,
-            "http://192.0.2.10:7890",
-            Some(" shared name "),
+            "http://node-lan.example.invalid:7890",
         );
 
         assert!(matched.is_none());
+    }
+
+    #[test]
+    fn manual_supernode_id_supports_lan_endpoint_and_detects_conflict() {
+        let supernodes = vec![
+            SupernodeProgramNode {
+                id: 1,
+                endpoint: "http://public-one.example.invalid:7890".into(),
+                name: Some("One".into()),
+                status: Some("active".into()),
+            },
+            SupernodeProgramNode {
+                id: 2,
+                endpoint: "http://public-two.example.invalid:7890".into(),
+                name: Some("Two".into()),
+                status: Some("active".into()),
+            },
+        ];
+
+        let selected = Nis1Adapter::select_supernode_program_node(
+            &supernodes,
+            "http://node-lan.example.invalid:7890",
+            Some(2),
+        )
+        .unwrap();
+        assert_eq!(selected.map(|node| node.id), Some(2));
+
+        let conflict = Nis1Adapter::select_supernode_program_node(
+            &supernodes,
+            "http://public-one.example.invalid:7890",
+            Some(2),
+        );
+        assert!(matches!(
+            conflict,
+            Err(AppError::SupernodeIdentityConflict {
+                endpoint_id: 1,
+                configured_id: 2
+            })
+        ));
     }
 
     #[test]
@@ -562,7 +613,10 @@ mod tests {
                 });
             }
         });
-        let adapter = Nis1Adapter::new(format!("http://{address}"), Client::new());
+        let adapter = Nis1Adapter::new(
+            format!("http://{address}"),
+            NodeTransport::new().expect("transport should build"),
+        );
 
         let identity = adapter
             .probe()

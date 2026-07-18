@@ -2,7 +2,6 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { listen } from "@tauri-apps/api/event";
 import {
-  Activity,
   ArrowDown,
   ArrowUp,
   Bell,
@@ -11,12 +10,9 @@ import {
   Cherry,
   CircleAlert,
   CircleDashed,
-  CircleGauge,
   Download,
   FileInput,
   FileOutput,
-  Menu,
-  Moon,
   Network,
   Pause,
   Pickaxe,
@@ -24,27 +20,34 @@ import {
   Plus,
   RefreshCw,
   Search,
-  Settings as SettingsIcon,
-  Share2,
   ShieldCheck,
   Stethoscope,
-  Sun,
   Trash2,
-  X,
   XCircle,
 } from "lucide-react";
-import { NavLink, Route, Routes, useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams } from "react-router-dom";
 import { api, defaultSettings } from "./services/ipc";
 import { useMonitorEvents } from "./hooks/useMonitorEvents";
 import { useUiStore } from "./store/ui";
 import { StatusBadge } from "./components/StatusBadge";
 import { MetricChart } from "./components/MetricChart";
+import { Layout } from "./components/AppLayout";
+import { AppPages } from "./pages/AppPages";
 import { TopologyPage } from "./components/TopologyPage";
-import packageJson from "../package.json";
-import type { AppSettings, DashboardData, DiagnosticRun, HarvestEvent, NodeDetail, NodeStatus, NodeSummary, RefreshAllProgress, ScanCandidate, TopologySnapshot } from "./types";
+import type { AppSettings, DashboardData, DiagnosticRun, HarvestEvent, NodeDetail, NodeStatus, NodeSummary, RefreshAllProgress, ScanCandidate, TopologySnapshot, UpsertNodeInput } from "./types";
 
 function formatTime(value: number | null) {
   return value ? new Intl.DateTimeFormat("ja-JP", { dateStyle: "short", timeStyle: "medium" }).format(value) : "—";
+}
+
+async function upsertNodeWithHttpConfirmation(input: UpsertNodeInput) {
+  const explicitHttp = input.baseUrl.trim().toLowerCase().startsWith("http://");
+  if (!explicitHttp) return api.upsertNode(input);
+  const approved = window.confirm(
+    `HTTP接続は暗号化されません。\n\n${input.baseUrl.trim()}\n\nこの接続先を監視しますか？`,
+  );
+  if (!approved) throw new Error("HTTP接続の登録をキャンセルしました");
+  return api.upsertNode({ ...input, allowInsecureHttp: true });
 }
 
 function formatLatency(value: number | null) {
@@ -216,62 +219,6 @@ function HarvestEventList({ events }: { events: HarvestEvent[] }) {
     <Pickaxe size={15} />
     <div><strong>高さ {event.height ?? "—"}</strong><span className="mono">{shortKey(event.harvesterPublicKey)}</span><small>{formatTime(event.observedAt)}</small></div>
   </article>)}</div>;
-}
-
-function Layout({ children }: { children: React.ReactNode }) {
-  const { sidebarOpen, setSidebarOpen } = useUiStore();
-  const queryClient = useQueryClient();
-  const { data: appSettings } = useQuery({ queryKey: ["settings"], queryFn: api.settings });
-  const theme = appSettings?.theme ?? "system";
-  const systemDark = typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia("(prefers-color-scheme: dark)").matches;
-  const dark = theme === "dark" || (theme === "system" && systemDark);
-  const changeTheme = useMutation({
-    mutationFn: (nextTheme: "light" | "dark") => api.updateSettings({ ...(appSettings ?? defaultSettings), theme: nextTheme }),
-    onSuccess: (settings) => queryClient.setQueryData(["settings"], settings),
-  });
-  useEffect(() => {
-    if (theme === "system") document.documentElement.removeAttribute("data-theme");
-    else document.documentElement.dataset.theme = theme;
-  }, [theme]);
-  const nav = [
-    { to: "/", label: "ダッシュボード", icon: CircleGauge },
-    { to: "/topology", label: "ネットワーク", icon: Share2 },
-    { to: "/discovery", label: "ノード検出", icon: Network },
-    { to: "/alerts", label: "アラート", icon: Bell },
-    { to: "/settings", label: "設定", icon: SettingsIcon },
-  ];
-  return (
-    <div className="app-shell">
-      <aside className={`sidebar ${sidebarOpen ? "sidebar--open" : ""}`}>
-        <div className="brand">
-          <div className="brand__mark"><Activity size={22} /></div>
-          <div><strong>Harvest Scope</strong><span>NEM / Symbol</span></div>
-          <button className="icon-button sidebar__close" onClick={() => setSidebarOpen(false)} aria-label="メニューを閉じる"><X /></button>
-        </div>
-        <nav>
-          {nav.map(({ to, label, icon: Icon }) => (
-            <NavLink key={to} to={to} end={to === "/"} onClick={() => setSidebarOpen(false)}>
-              <Icon size={19} /><span>{label}</span>
-            </NavLink>
-          ))}
-        </nav>
-        <div className="sidebar__footer">
-          <span><ShieldCheck size={17} /> 読み取り専用監視</span>
-          <small aria-label="アプリバージョン">v{packageJson.version}</small>
-        </div>
-      </aside>
-      {sidebarOpen && <button className="scrim" onClick={() => setSidebarOpen(false)} aria-label="メニューを閉じる" />}
-      <main className="main">
-        <header className="topbar">
-          <button className="icon-button mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="メニューを開く"><Menu /></button>
-          <div><h1>Harvest Scope</h1><p>Symbol / NEM ノードの状態をひと目で確認</p></div>
-          <div className="live-indicator"><span />監視エンジン稼働中</div>
-          <button className="icon-button theme-toggle" aria-label={dark ? "ライトテーマに切り替え" : "ダークテーマに切り替え"} title={dark ? "ライトテーマ" : "ダークテーマ"} disabled={changeTheme.isPending} onClick={() => changeTheme.mutate(dark ? "light" : "dark")}>{dark ? <Sun size={17} /> : <Moon size={17} />}</button>
-        </header>
-        <div className="page">{children}</div>
-      </main>
-    </div>
-  );
 }
 
 const statMeta: { key: keyof Pick<ReturnType<typeof emptyDashboard>, "total" | "healthy" | "warning" | "critical" | "offline" | "unknown">; label: string; tone: string }[] = [
@@ -469,6 +416,13 @@ function NodeDetailPage() {
   const { data: diagnostics = [], refetch: refetchDiagnostics } = useQuery({ queryKey: ["diagnostics", nodeId], queryFn: () => api.nodeDiagnostics(nodeId) });
   const diagnose = useMutation({ mutationFn: () => api.runNodeDiagnostic(nodeId), onSuccess: () => void refetchDiagnostics() });
   const remove = useMutation({ mutationFn: () => api.deleteNode(nodeId), onSuccess: () => navigate("/") });
+  const confirmHttp = useMutation({
+    mutationFn: () => api.confirmInsecureHttp(nodeId),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["node", nodeId] });
+      await queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+    },
+  });
   const toggleHarvest = useMutation({
     mutationFn: (visible: boolean) => api.setNodeHarvestMetricsVisible(nodeId, visible),
     onMutate: async (visible) => {
@@ -507,6 +461,8 @@ function NodeDetailPage() {
   const peerListUsesTopology = usesTopologyPeerView(detailNode);
   return <>
     <div className="page-heading"><div><button className="link-button" onClick={() => navigate("/")}>← ダッシュボード</button><h2>{data.node.displayName}</h2><p>{data.node.baseUrl}</p></div><div className="actions"><StatusBadge status={data.node.status} label={nodeStatusLabel(data.node)} /><button className="button button--danger" onClick={() => remove.mutate()}><Trash2 size={16} />削除</button></div></div>
+    {data.node.baseUrl.toLowerCase().startsWith("http://") && !data.node.allowInsecureHttp && <div className="notice notice--warning"><strong>HTTP接続の確認待ち</strong><span>このノードは暗号化されていないため、確認するまで監視を停止しています。</span><button className="button" disabled={confirmHttp.isPending} onClick={() => confirmHttp.mutate()}>{confirmHttp.isPending ? "確認中…" : "HTTP利用を確認して再開"}</button></div>}
+    {data.transportRejectedCount > 0 && <div className="notice notice--warning"><strong>不正または過大な通信を拒否しました</strong><span>{data.lastTransportRejectionReason ?? "形式を確認できない通知"}（累計 {data.transportRejectedCount}件・最終 {formatTime(data.lastTransportRejectionAt)}）</span></div>}
     <section className="detail-grid">
       <article className="panel detail-card"><h3>チェーン</h3><dl><div><dt>高さ</dt><dd>{isPeerMonitor(data.node) ? "対象外" : data.node.height ?? "—"}</dd></div><div><dt>ファイナライズ高</dt><dd>{isPeerMonitor(data.node) ? "対象外" : data.node.finalizedHeight ?? "対象外"}</dd></div><div><dt>同期遅延</dt><dd>{isPeerMonitor(data.node) ? "対象外" : data.node.lag ?? "—"}</dd></div><div><dt>チェーンスコア</dt><dd className="mono text-truncate">{isPeerMonitor(data.node) ? "対象外" : data.chainScore ?? "—"}</dd></div></dl></article>
       <article className="panel detail-card"><h3>ノード</h3><dl><div><dt>種別</dt><dd>{nodeKindLabel(detailNode)}</dd></div><div><dt>ネットワーク</dt><dd>{formatNetwork(data.node.network)}</dd></div><div><dt>バージョン</dt><dd>{data.node.version ?? "—"}</dd></div><div><dt>REST</dt><dd>{isPeerMonitor(data.node) ? "対象外" : data.restVersion ?? "—"}</dd></div></dl></article>
@@ -542,9 +498,11 @@ function DiscoveryPage() {
   const [manualUrl, setManualUrl] = useState("");
   const [peerPublicKey, setPeerPublicKey] = useState("");
   const [peerNetwork, setPeerNetwork] = useState("Symbol Mainnet");
+  const [supernodeId, setSupernodeId] = useState("");
+  const { data: supernodes = [] } = useQuery({ queryKey: ["supernodes"], queryFn: api.supernodes, staleTime: 10 * 60 * 1000 });
   const scan = useMutation({ mutationFn: api.scan });
   const add = useMutation({
-    mutationFn: api.upsertNode,
+    mutationFn: upsertNodeWithHttpConfirmation,
     onSuccess: (registered) => {
       queryClient.setQueryData<DashboardData>(["dashboard"], (current) => {
         if (!current) return current;
@@ -579,7 +537,7 @@ function DiscoveryPage() {
           publicKey: peerPublicKey.trim() || undefined,
           roles: ["Peer", "Voting"],
         }
-      : { baseUrl: manualUrl.trim() };
+      : { baseUrl: manualUrl.trim(), supernodeId: supernodeId ? Number(supernodeId) : undefined };
     add.mutate(input, { onSuccess: () => { setManualUrl(""); setPeerPublicKey(""); } });
   }
   function addCandidate(candidate: ScanCandidate) { add.mutate({ baseUrl: candidate.baseUrl, displayName: candidate.name ?? undefined, kind: candidate.kind }); }
@@ -587,7 +545,7 @@ function DiscoveryPage() {
     <div className="page-heading"><div><h2>ノード検出</h2><p>選択したCIDRだけを明示的にスキャンします。URLから手動登録する事もできます。</p></div></div>
     <section className="split-grid">
       <form className="panel form-card" onSubmit={submitScan}><h3>LANをスキャン</h3><label>ネットワーク候補<select value={cidr} onChange={(event) => setCidr(event.target.value)}>{!cidr && <option value="">ネットワークを選択</option>}{cidr && !interfaces.some((item) => item.cidr === cidr) && <option value={cidr}>{cidr}</option>}{interfaces.map((item) => <option key={`${item.name}-${item.cidr}`} value={item.cidr}>{item.name} — {item.cidr}</option>)}</select></label><label>CIDR<input value={cidr} onChange={(event) => setCidr(event.target.value)} required /></label><label>ポート（カンマ区切り）<input value={ports} onChange={(event) => setPorts(event.target.value)} required /></label><div className="actions"><button className="button button--primary" disabled={scan.isPending}><Search size={16} />{scan.isPending ? "スキャン中…" : "スキャン開始"}</button>{scan.isPending && <button type="button" className="button" onClick={() => api.cancelScan()}>キャンセル</button>}</div><p className="form-hint">最大1,024アドレス、既定ポート3000 / 3001 / 7890</p></form>
-      <form className="panel form-card" onSubmit={addManual}><h3>ノードを手動登録</h3><label>監視モード<select value={manualMode} onChange={(event) => { setManualMode(event.target.value as "api" | "peer" | "peer-voting"); if (add.isSuccess || add.isError) add.reset(); }}><option value="api">REST APIノード</option><option value="peer">Peerノード</option><option value="peer-voting">Peer + Votingノード</option></select></label><label>{manualMode === "api" ? "IP・DNS" : "Peerエンドポイント"}<input type="text" inputMode={manualMode === "api" ? "url" : undefined} value={manualUrl} onChange={(event) => { setManualUrl(event.target.value); if (add.isSuccess || add.isError) add.reset(); }} placeholder={manualMode === "api" ? "202.61.248.218" : "192.0.2.10:7900"} required /></label>{manualMode !== "api" && <label>ネットワーク<input value={peerNetwork} onChange={(event) => setPeerNetwork(event.target.value)} placeholder="Symbol Mainnet" required={manualMode === "peer-voting"} /></label>}{manualMode === "peer-voting" && <label>公開鍵<input value={peerPublicKey} onChange={(event) => setPeerPublicKey(event.target.value)} placeholder="必須" required /></label>}<button className="button button--primary" disabled={add.isPending}><Plus size={16} />{add.isPending ? "登録中…" : "登録して確認開始"}</button><p className="form-hint">{manualMode === "api" ? "IP・DNSだけで登録できます。スキームやポートを指定した場合は最初に確認し、失敗時は標準RESTポートも探索します。" : manualMode === "peer-voting" ? "登録後すぐ一覧に追加し、P2P疎通とVoting期限をバックグラウンドで確認します。" : "登録後すぐ一覧に追加し、P2Pポートの疎通をバックグラウンドで確認します。"}</p></form>
+      <form className="panel form-card" onSubmit={addManual}><h3>ノードを手動登録</h3><label>監視モード<select value={manualMode} onChange={(event) => { setManualMode(event.target.value as "api" | "peer" | "peer-voting"); if (add.isSuccess || add.isError) add.reset(); }}><option value="api">REST APIノード</option><option value="peer">Peerノード</option><option value="peer-voting">Peer + Votingノード</option></select></label><label>{manualMode === "api" ? "IP・DNS" : "Peerエンドポイント"}<input type="text" inputMode={manualMode === "api" ? "url" : undefined} value={manualUrl} onChange={(event) => { setManualUrl(event.target.value); if (add.isSuccess || add.isError) add.reset(); }} placeholder={manualMode === "api" ? "node.example.invalid" : "peer.example.invalid:7900"} required /></label>{manualMode === "api" && <label>Supernode（NIS1・任意）<select value={supernodeId} onChange={(event) => setSupernodeId(event.target.value)}><option value="">自動判定（endpoint一致のみ）</option>{supernodes.map((node) => <option key={node.id} value={node.id}>#{node.id} {node.name ?? node.endpoint}</option>)}</select></label>}{manualMode !== "api" && <label>ネットワーク<input value={peerNetwork} onChange={(event) => setPeerNetwork(event.target.value)} placeholder="Symbol Mainnet" required={manualMode === "peer-voting"} /></label>}{manualMode === "peer-voting" && <label>公開鍵<input value={peerPublicKey} onChange={(event) => setPeerPublicKey(event.target.value)} placeholder="必須" required /></label>}<button className="button button--primary" disabled={add.isPending}><Plus size={16} />{add.isPending ? "登録中…" : "登録して確認開始"}</button><p className="form-hint">{manualMode === "api" ? "IP・DNSだけならHTTPS:3001を使用します。http://を明示した場合は暗号化されない接続への確認が必要です。" : manualMode === "peer-voting" ? "登録後すぐ一覧に追加し、P2P疎通とVoting期限をバックグラウンドで確認します。" : "登録後すぐ一覧に追加し、P2Pポートの疎通をバックグラウンドで確認します。"}</p></form>
     </section>
     {(scan.error || add.error) && <div className="notice notice--error">{String(scan.error ?? add.error)}</div>}
     {add.isSuccess && <div className="notice notice--success">「{add.data.displayName}」を登録しました。<small>{add.data.baseUrl}</small></div>}
@@ -684,5 +642,5 @@ function SettingsPage() {
 
 export default function App() {
   useMonitorEvents();
-  return <><Layout><Routes><Route path="/" element={<DashboardPage />} /><Route path="/topology" element={<TopologyPage />} /><Route path="/nodes/:nodeId" element={<NodeDetailPage />} /><Route path="/discovery" element={<DiscoveryPage />} /><Route path="/alerts" element={<AlertsPage />} /><Route path="/alerts/:alertId" element={<AlertDetailPage />} /><Route path="/settings" element={<SettingsPage />} /></Routes></Layout><Onboarding /></>;
+  return <><Layout><AppPages dashboard={<DashboardPage />} topology={<TopologyPage />} nodeDetail={<NodeDetailPage />} discovery={<DiscoveryPage />} alerts={<AlertsPage />} alertDetail={<AlertDetailPage />} settings={<SettingsPage />} /></Layout><Onboarding /></>;
 }

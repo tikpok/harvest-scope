@@ -6,7 +6,21 @@ on:
   pull_request:
 
 jobs:
-  test:
+  msrv:
+    name: Rust 1.89.0 (MSRV)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          shared-key: msrv-1.89.0
+      - run: cargo check --manifest-path src-tauri/Cargo.toml --locked --all-targets
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked --all-targets
+
+  stable:
+    name: Stable / frontend / Tauri
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,12 +34,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          shared-key: stable
       - run: npm ci
       - run: npm run check
       - run: npm test
       - run: npm run build
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
-      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-      - run: cargo test --manifest-path src-tauri/Cargo.toml
+      - run: cargo check --manifest-path src-tauri/Cargo.toml --locked --all-targets
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked --all-targets
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
       - run: npm run tauri build
-

@@ -250,6 +250,8 @@ pub struct NodeSummary {
     pub roles: Vec<String>,
     pub observed_roles: Vec<String>,
     pub rest_private: bool,
+    pub allow_insecure_http: bool,
+    pub configured_supernode_id: Option<i64>,
     pub enabled: bool,
     pub favorite: bool,
     pub status: NodeStatus,
@@ -298,6 +300,8 @@ pub struct StoredNode {
     pub enabled: bool,
     pub favorite: bool,
     pub show_harvest_metrics: bool,
+    pub allow_insecure_http: bool,
+    pub supernode_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,6 +330,9 @@ pub struct NodeDetail {
     pub peers: Vec<PeerInfo>,
     pub websocket_connected: bool,
     pub recent_harvests: Vec<HarvestEvent>,
+    pub transport_rejected_count: u64,
+    pub last_transport_rejection_at: Option<i64>,
+    pub last_transport_rejection_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -438,6 +445,10 @@ pub struct UpsertNodeInput {
     pub roles: Option<Vec<String>>,
     pub enabled: Option<bool>,
     pub favorite: Option<bool>,
+    #[serde(default)]
+    pub allow_insecure_http: Option<bool>,
+    #[serde(default)]
+    pub supernode_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -463,6 +474,8 @@ pub struct NodeConfigEntry {
     pub enabled: Option<bool>,
     pub favorite: Option<bool>,
     pub show_harvest_metrics: Option<bool>,
+    #[serde(default)]
+    pub supernode_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

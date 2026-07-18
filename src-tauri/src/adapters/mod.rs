@@ -1,7 +1,6 @@
 mod nis1;
 mod symbol;
 
-use reqwest::Client;
 use std::{net::Ipv6Addr, time::Duration};
 use tokio::net::{lookup_host, TcpStream};
 use url::Url;
@@ -9,6 +8,7 @@ use url::Url;
 use crate::{
     domain::{NodeAdapter, NodeKind},
     error::{AppError, AppResult},
+    transport::NodeTransport,
 };
 
 pub use nis1::Nis1Adapter;
@@ -63,16 +63,28 @@ pub fn normalize_api_registration_target(input: &str) -> AppResult<String> {
     normalize_base_url(url.as_str())
 }
 
+pub fn require_insecure_http_approval(base_url: &str, approved: bool) -> AppResult<()> {
+    let url = Url::parse(base_url)?;
+    if url.scheme() == "http" && !approved {
+        let origin = format!(
+            "{}://{}:{}",
+            url.scheme(),
+            url.host_str().unwrap_or("unknown"),
+            url.port_or_known_default().unwrap_or(80)
+        );
+        return Err(AppError::InsecureHttpConfirmationRequired(origin));
+    }
+    Ok(())
+}
+
 pub fn api_probe_candidates(base_url: &str) -> AppResult<Vec<String>> {
     let normalized = normalize_base_url(base_url)?;
     let requested = Url::parse(&normalized)?;
     let mut candidates = vec![normalized];
 
-    let mut push = |scheme: &str, port: u16| -> AppResult<()> {
+    let scheme = requested.scheme().to_owned();
+    let mut push = |port: u16| -> AppResult<()> {
         let mut candidate = requested.clone();
-        candidate
-            .set_scheme(scheme)
-            .map_err(|_| AppError::InvalidUrl("REST URLを正規化できません".into()))?;
         candidate
             .set_port(Some(port))
             .map_err(|_| AppError::InvalidUrl("RESTポートを設定できません".into()))?;
@@ -84,22 +96,12 @@ pub fn api_probe_candidates(base_url: &str) -> AppResult<Vec<String>> {
         Ok(())
     };
 
-    if let Some(port) = requested
-        .port()
-        .filter(|port| ![3000, 3001, 7890].contains(port))
-    {
-        push(
-            if requested.scheme() == "https" {
-                "http"
-            } else {
-                "https"
-            },
-            port,
-        )?;
+    if scheme == "https" {
+        push(3001)?;
+    } else {
+        push(3000)?;
+        push(7890)?;
     }
-    push("https", 3001)?;
-    push("http", 3000)?;
-    push("http", 7890)?;
     Ok(candidates)
 }
 
@@ -167,24 +169,28 @@ pub async fn probe_tcp_endpoint(endpoint: &str, timeout: Duration) -> AppResult<
     Ok(())
 }
 
-pub fn adapter_for(kind: NodeKind, base_url: String, client: Client) -> Box<dyn NodeAdapter> {
+pub fn adapter_for(
+    kind: NodeKind,
+    base_url: String,
+    transport: NodeTransport,
+) -> Box<dyn NodeAdapter> {
     match kind {
-        NodeKind::Symbol => Box::new(SymbolAdapter::new(base_url, client)),
-        NodeKind::Nis1 => Box::new(Nis1Adapter::new(base_url, client)),
+        NodeKind::Symbol => Box::new(SymbolAdapter::new(base_url, transport)),
+        NodeKind::Nis1 => Box::new(Nis1Adapter::new(base_url, transport)),
     }
 }
 
 pub async fn probe_endpoint(
     base_url: &str,
-    client: Client,
+    transport: NodeTransport,
 ) -> AppResult<crate::domain::NodeIdentity> {
     let base_url = normalize_base_url(base_url)?;
-    let symbol = SymbolAdapter::new(base_url.clone(), client.clone());
+    let symbol = SymbolAdapter::new(base_url.clone(), transport.clone());
     let symbol_error = match symbol.probe().await {
         Ok(identity) => return Ok(identity),
         Err(error) => error,
     };
-    let nis1 = Nis1Adapter::new(base_url, client);
+    let nis1 = Nis1Adapter::new(base_url, transport);
     let nis1_error = match nis1.probe().await {
         Ok(identity) => return Ok(identity),
         Err(error) => error,
@@ -228,16 +234,28 @@ mod tests {
     }
 
     #[test]
-    fn probes_the_requested_endpoint_before_standard_rest_candidates() {
+    fn probes_only_same_scheme_rest_candidates() {
         assert_eq!(
             api_probe_candidates("https://202.61.248.218:3003").unwrap(),
+            ["https://202.61.248.218:3003", "https://202.61.248.218:3001",]
+        );
+        assert_eq!(
+            api_probe_candidates("http://node.example.invalid:3003").unwrap(),
             [
-                "https://202.61.248.218:3003",
-                "http://202.61.248.218:3003",
-                "https://202.61.248.218:3001",
-                "http://202.61.248.218:3000",
-                "http://202.61.248.218:7890",
+                "http://node.example.invalid:3003",
+                "http://node.example.invalid:3000",
+                "http://node.example.invalid:7890",
             ]
         );
+    }
+
+    #[test]
+    fn requires_explicit_approval_for_http_only() {
+        assert!(matches!(
+            require_insecure_http_approval("http://node.example.invalid:7890", false),
+            Err(AppError::InsecureHttpConfirmationRequired(_))
+        ));
+        require_insecure_http_approval("http://node.example.invalid:7890", true).unwrap();
+        require_insecure_http_approval("https://node.example.invalid:3001", false).unwrap();
     }
 }

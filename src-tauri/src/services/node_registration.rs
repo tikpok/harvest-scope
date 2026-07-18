@@ -1,7 +1,10 @@
 use tauri::{AppHandle, Emitter};
 
 use crate::{
-    adapters::{adapter_for, normalize_base_url, normalize_peer_endpoint, probe_endpoint},
+    adapters::{
+        adapter_for, api_probe_candidates, normalize_api_registration_target,
+        normalize_peer_endpoint, probe_endpoint, require_insecure_http_approval,
+    },
     domain::{MonitorMode, NodeIdentity, NodeKind, NodeSummary, UpsertNodeInput},
     error::{AppError, AppResult},
     state::AppState,
@@ -11,6 +14,26 @@ use crate::{
 use super::monitor;
 
 const MAX_NODE_COUNT: usize = 50;
+
+pub(crate) fn node_limit_reached(existing_count: usize) -> bool {
+    existing_count >= MAX_NODE_COUNT
+}
+
+pub(crate) async fn lock_node_registration(
+    state: &AppState,
+    is_new: bool,
+) -> AppResult<Option<tokio::sync::MutexGuard<'_, ()>>> {
+    if !is_new {
+        return Ok(None);
+    }
+    let guard = state.node_registration_lock.lock().await;
+    if node_limit_reached(state.repository.list_stored_nodes(false).await?.len()) {
+        return Err(AppError::Configuration(
+            "監視できるノードは最大50台です".into(),
+        ));
+    }
+    Ok(Some(guard))
+}
 
 fn normalized_roles(input: Option<Vec<String>>, monitor_mode: MonitorMode) -> Vec<String> {
     let mut roles = input
@@ -75,15 +98,22 @@ async fn complete_node_registration(
         }
     };
     if node.monitor_mode == MonitorMode::Api {
-        let identity_result = match kind_hint {
-            Some(kind) => {
-                adapter_for(kind, node.base_url.clone(), state.client.clone())
-                    .probe()
-                    .await
+        let mut discovered = None;
+        for candidate in api_probe_candidates(&node.base_url).unwrap_or_default() {
+            let identity_result = match kind_hint {
+                Some(kind) => {
+                    adapter_for(kind, candidate.clone(), state.transport.clone())
+                        .probe()
+                        .await
+                }
+                None => probe_endpoint(&candidate, state.transport.clone()).await,
+            };
+            if let Ok(identity) = identity_result {
+                discovered = Some((candidate, identity));
+                break;
             }
-            None => probe_endpoint(&node.base_url, state.client.clone()).await,
-        };
-        if let Ok(identity) = identity_result {
+        }
+        if let Some((discovered_base_url, identity)) = discovered {
             let display_name = if node.display_name == node.base_url {
                 identity
                     .name
@@ -97,12 +127,14 @@ async fn complete_node_registration(
                 .repository
                 .upsert_node_with_mode(NodeUpsert {
                     id: &node.id,
-                    base_url: &node.base_url,
+                    base_url: &discovered_base_url,
                     display_name: &display_name,
                     identity: &identity,
                     monitor_mode: node.monitor_mode,
                     enabled: node.enabled,
                     favorite: node.favorite,
+                    allow_insecure_http: node.allow_insecure_http,
+                    supernode_id: node.supernode_id,
                 })
                 .await
             {
@@ -127,15 +159,19 @@ pub async fn upsert_node_from_input(
 ) -> AppResult<NodeSummary> {
     let monitor_mode = input.monitor_mode.unwrap_or(MonitorMode::Api);
     let base_url = match monitor_mode {
-        MonitorMode::Api => normalize_base_url(&input.base_url)?,
+        MonitorMode::Api => normalize_api_registration_target(&input.base_url)?,
         MonitorMode::Peer => normalize_peer_endpoint(&input.base_url)?,
     };
-    let existing = state.repository.list_stored_nodes(false).await?;
-    if enforce_limit && input.id.is_none() && existing.len() >= MAX_NODE_COUNT {
-        return Err(AppError::Configuration(
-            "監視できるノードは最大50台です".into(),
-        ));
+    let allow_insecure_http = input.allow_insecure_http.unwrap_or(false);
+    if monitor_mode == MonitorMode::Api {
+        require_insecure_http_approval(&base_url, allow_insecure_http)?;
     }
+    let is_new = input.id.is_none();
+    let _registration_guard = if enforce_limit {
+        lock_node_registration(&state, is_new).await?
+    } else {
+        None
+    };
     if monitor_mode == MonitorMode::Peer
         && input
             .roles
@@ -144,7 +180,7 @@ pub async fn upsert_node_from_input(
         && input
             .public_key
             .as_ref()
-            .map_or(true, |value| value.trim().is_empty())
+            .is_none_or(|value| value.trim().is_empty())
     {
         return Err(AppError::Configuration(
             "Votingノードの登録には公開鍵が必要です".into(),
@@ -168,6 +204,8 @@ pub async fn upsert_node_from_input(
             monitor_mode,
             enabled: input.enabled.unwrap_or(true),
             favorite: input.favorite.unwrap_or(false),
+            allow_insecure_http,
+            supernode_id: input.supernode_id,
         })
         .await?;
     let app_for_monitor = app.clone();

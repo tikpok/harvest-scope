@@ -4,7 +4,13 @@ import { api } from "../services/ipc";
 import type { HarvestEvent, NetworkEvent } from "../types";
 
 const MAX_EVENTS = 80;
+const MAX_EVENT_BYTES = 128 * 1024;
 const RETENTION_MS = 60_000;
+const encoder = new TextEncoder();
+
+function eventBytes(event: NetworkEvent) {
+  return encoder.encode(JSON.stringify(event)).byteLength;
+}
 
 function harvestToNetworkEvent(event: HarvestEvent): NetworkEvent {
   return {
@@ -32,9 +38,16 @@ export function mergeNetworkEvents(current: NetworkEvent[], incoming: NetworkEve
   incoming
     .filter((event) => event.observedAt >= cutoff)
     .forEach((event) => byId.set(event.id, event));
-  return [...byId.values()]
-    .sort((left, right) => right.observedAt - left.observedAt)
-    .slice(0, MAX_EVENTS);
+  const result: NetworkEvent[] = [];
+  let totalBytes = 0;
+  for (const event of [...byId.values()].sort((left, right) => right.observedAt - left.observedAt)) {
+    const size = eventBytes(event);
+    if (size > MAX_EVENT_BYTES || totalBytes + size > MAX_EVENT_BYTES) continue;
+    result.push(event);
+    totalBytes += size;
+    if (result.length >= MAX_EVENTS) break;
+  }
+  return result;
 }
 
 export function useNetworkEvents(paused: boolean) {

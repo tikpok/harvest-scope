@@ -2,7 +2,6 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{NaiveDate, TimeZone, Utc};
-use reqwest::Client;
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     DigitallySignedStruct, SignatureScheme,
@@ -18,6 +17,7 @@ use crate::{
         NodeIdentity, NodeKind, PeerInfo, WebSocketSpec,
     },
     error::{AppError, AppResult},
+    transport::{NodeTransport, ResponseBudget},
 };
 
 use super::{string_value, u64_value};
@@ -26,7 +26,7 @@ const CERTIFICATE_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct SymbolAdapter {
     base_url: String,
-    client: Client,
+    transport: NodeTransport,
 }
 
 #[derive(Debug)]
@@ -145,39 +145,34 @@ impl<'a> DerReader<'a> {
 }
 
 impl SymbolAdapter {
-    pub fn new(base_url: String, client: Client) -> Self {
-        Self { base_url, client }
+    pub fn new(base_url: String, transport: NodeTransport) -> Self {
+        Self {
+            base_url,
+            transport,
+        }
     }
 
     async fn get_json(&self, path: &str) -> AppResult<Value> {
-        let response = self
-            .client
-            .get(format!("{}{}", self.base_url, path))
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            return Err(AppError::Network(format!(
-                "HTTP {} ({path})",
-                response.status()
-            )));
-        }
-        response.json().await.map_err(Into::into)
+        let budget = if path == "/node/health" {
+            ResponseBudget::Health
+        } else if matches!(path, "/node/peers" | "/node/unlockedaccount") {
+            ResponseBudget::Collection
+        } else {
+            ResponseBudget::Document
+        };
+        self.transport
+            .get_json(&format!("{}{}", self.base_url, path), budget)
+            .await
     }
 
     async fn post_json(&self, path: &str, body: Value) -> AppResult<Value> {
-        let response = self
-            .client
-            .post(format!("{}{}", self.base_url, path))
-            .json(&body)
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            return Err(AppError::Network(format!(
-                "HTTP {} ({path})",
-                response.status()
-            )));
-        }
-        response.json().await.map_err(Into::into)
+        self.transport
+            .post_json(
+                &format!("{}{}", self.base_url, path),
+                &body,
+                ResponseBudget::Collection,
+            )
+            .await
     }
 
     fn version(raw: Option<u64>) -> Option<String> {
@@ -623,23 +618,16 @@ impl NodeAdapter for SymbolAdapter {
     }
 
     async fn fetch_health(&self) -> AppResult<HealthSnapshot> {
-        let response = self
-            .client
-            .get(format!("{}/node/health", self.base_url))
-            .send()
-            .await?;
-        let status_code = response.status();
-        let body: Value = response.json().await.unwrap_or(Value::Null);
+        let body = self.get_json("/node/health").await?;
         let status = body.get("status").unwrap_or(&body);
         let api_status = status.get("apiNode").and_then(string_value);
         let db_status = status.get("db").and_then(string_value);
-        let healthy = status_code.is_success()
-            && api_status
-                .as_deref()
-                .map_or(true, |value| value.eq_ignore_ascii_case("up"))
+        let healthy = api_status
+            .as_deref()
+            .is_none_or(|value| value.eq_ignore_ascii_case("up"))
             && db_status
                 .as_deref()
-                .map_or(true, |value| value.eq_ignore_ascii_case("up"));
+                .is_none_or(|value| value.eq_ignore_ascii_case("up"));
         Ok(HealthSnapshot {
             reachable: true,
             api_status,

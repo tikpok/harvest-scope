@@ -57,12 +57,14 @@ function node(id: string, displayName: string): NodeSummary {
     displayName,
     kind: "symbol",
     monitorMode: "api",
-    baseUrl: `http://192.168.1.${id}:3000`,
+    baseUrl: `http://node-${id}.example.invalid:3000`,
     network: "Symbol Mainnet",
     version: "1.0.0",
     roles: ["Peer", "API"],
     observedRoles: [],
     restPrivate: false,
+    allowInsecureHttp: true,
+    configuredSupernodeId: null,
     enabled: true,
     favorite: false,
     status: "healthy",
@@ -383,6 +385,9 @@ test("NIS1詳細でSupernodeプログラムの失敗項目を表示する", asyn
     peers: [],
     websocketConnected: false,
     recentHarvests: [],
+    transportRejectedCount: 0,
+    lastTransportRejectionAt: null,
+    lastTransportRejectionReason: null,
   });
   renderApp("/nodes/nem-1");
 
@@ -421,6 +426,9 @@ test("REST未検出ノード詳細のピア情報はトポロジー案内を表�
     }],
     websocketConnected: false,
     recentHarvests: [],
+    transportRejectedCount: 0,
+    lastTransportRejectionAt: null,
+    lastTransportRejectionReason: null,
   });
   renderApp("/nodes/4");
 

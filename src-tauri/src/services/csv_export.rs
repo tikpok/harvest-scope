@@ -6,6 +6,34 @@ use crate::{
     state::AppState,
 };
 
+fn sanitize_untrusted_csv_cell(value: impl AsRef<str>) -> String {
+    let value = value.as_ref();
+    let significant = value.trim_start_matches(' ');
+    if significant.starts_with(['=', '+', '-', '@', '\t', '\r', '\n']) {
+        format!("'{value}")
+    } else {
+        value.to_owned()
+    }
+}
+
+fn safe_numeric_csv_cell(value: impl AsRef<str>) -> String {
+    let value = value.as_ref();
+    let unsigned = value.strip_prefix('-').unwrap_or(value);
+    let mut parts = unsigned.split('.');
+    let integer = parts.next().unwrap_or_default();
+    let fraction = parts.next();
+    let is_numeric = !integer.is_empty()
+        && integer.bytes().all(|byte| byte.is_ascii_digit())
+        && fraction
+            .is_none_or(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        && parts.next().is_none();
+    if is_numeric {
+        value.to_owned()
+    } else {
+        sanitize_untrusted_csv_cell(value)
+    }
+}
+
 fn csv_bytes(records: Vec<Vec<String>>) -> AppResult<Vec<u8>> {
     let mut bytes = vec![0xEF, 0xBB, 0xBF];
     {
@@ -59,13 +87,13 @@ pub async fn export(
                     .into_iter()
                     .map(|node| {
                         vec![
-                            node.display_name,
+                            sanitize_untrusted_csv_cell(node.display_name),
                             node.kind.as_str().into(),
-                            node.base_url,
-                            node.network.unwrap_or_default(),
+                            sanitize_untrusted_csv_cell(node.base_url),
+                            sanitize_untrusted_csv_cell(node.network.unwrap_or_default()),
                             node.status.as_str().into(),
-                            node.height.unwrap_or_default(),
-                            node.lag.unwrap_or_default(),
+                            safe_numeric_csv_cell(node.height.unwrap_or_default()),
+                            safe_numeric_csv_cell(node.lag.unwrap_or_default()),
                             node.latency_ms
                                 .map(|value| value.to_string())
                                 .unwrap_or_default(),
@@ -75,7 +103,7 @@ pub async fn export(
                             node.delegated_harvester_delta
                                 .map(|value| value.to_string())
                                 .unwrap_or_default(),
-                            node.total_balance_micro_xym.unwrap_or_default(),
+                            safe_numeric_csv_cell(node.total_balance_micro_xym.unwrap_or_default()),
                             node.node_certificate_not_after
                                 .map(|value| value.to_string())
                                 .unwrap_or_default(),
@@ -88,11 +116,13 @@ pub async fn export(
                             node.voting_key_remaining_epochs
                                 .map(|value| value.to_string())
                                 .unwrap_or_default(),
-                            node.certificate_metric_error.unwrap_or_default(),
+                            sanitize_untrusted_csv_cell(
+                                node.certificate_metric_error.unwrap_or_default(),
+                            ),
                             node.supernode_id
                                 .map(|value| value.to_string())
                                 .unwrap_or_default(),
-                            node.supernode_status.unwrap_or_default(),
+                            sanitize_untrusted_csv_cell(node.supernode_status.unwrap_or_default()),
                             node.supernode_last_round
                                 .map(|value| value.to_string())
                                 .unwrap_or_default(),
@@ -102,8 +132,10 @@ pub async fn export(
                             node.supernode_checks_passed
                                 .map(|value| value.to_string())
                                 .unwrap_or_default(),
-                            node.supernode_failed_checks.join("|"),
-                            node.supernode_metric_error.unwrap_or_default(),
+                            sanitize_untrusted_csv_cell(node.supernode_failed_checks.join("|")),
+                            sanitize_untrusted_csv_cell(
+                                node.supernode_metric_error.unwrap_or_default(),
+                            ),
                         ]
                     }),
             );
@@ -127,11 +159,11 @@ pub async fn export(
                     .into_iter()
                     .map(|alert| {
                         vec![
-                            alert.node_name,
-                            alert.alert_type,
-                            alert.severity,
-                            alert.state,
-                            alert.message,
+                            sanitize_untrusted_csv_cell(alert.node_name),
+                            sanitize_untrusted_csv_cell(alert.alert_type),
+                            sanitize_untrusted_csv_cell(alert.severity),
+                            sanitize_untrusted_csv_cell(alert.state),
+                            sanitize_untrusted_csv_cell(alert.message),
                             alert.raised_at.to_string(),
                             alert.updated_at.to_string(),
                         ]
@@ -168,9 +200,9 @@ pub async fn export(
                 vec![
                     point.observed_at.to_string(),
                     point.reachable.to_string(),
-                    point.height.unwrap_or_default(),
-                    point.finalized_height.unwrap_or_default(),
-                    point.lag.unwrap_or_default(),
+                    safe_numeric_csv_cell(point.height.unwrap_or_default()),
+                    safe_numeric_csv_cell(point.finalized_height.unwrap_or_default()),
+                    safe_numeric_csv_cell(point.lag.unwrap_or_default()),
                     point
                         .peer_count
                         .map(|value| value.to_string())
@@ -187,8 +219,8 @@ pub async fn export(
                         .delegated_harvester_delta
                         .map(|value| value.to_string())
                         .unwrap_or_default(),
-                    point.total_balance_micro_xym.unwrap_or_default(),
-                    point.total_importance.unwrap_or_default(),
+                    safe_numeric_csv_cell(point.total_balance_micro_xym.unwrap_or_default()),
+                    safe_numeric_csv_cell(point.total_importance.unwrap_or_default()),
                     point
                         .node_certificate_remaining_days
                         .map(|value| value.to_string())
@@ -217,7 +249,7 @@ pub async fn export(
     };
     let bytes = csv_bytes(records)?;
     let file_name = format!(
-        "node-watcher-{dataset}-{}.csv",
+        "harvest-scope-{dataset}-{}.csv",
         chrono::Local::now().format("%Y%m%d-%H%M%S")
     );
     let path = app
@@ -234,4 +266,31 @@ pub async fn export(
         .map_err(|error| AppError::Io(std::io::Error::other(error)))?;
     std::fs::write(&path, bytes)?;
     Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn untrusted_csv_cells_neutralize_formula_prefixes_after_leading_spaces() {
+        for value in [
+            "=1+1",
+            "+cmd",
+            "-2+3",
+            "@SUM(A1)",
+            "\tformula",
+            "\rformula",
+            "  =1+1",
+        ] {
+            assert_eq!(sanitize_untrusted_csv_cell(value), format!("'{value}"));
+        }
+    }
+
+    #[test]
+    fn untrusted_csv_cells_keep_normal_japanese_and_numeric_cells_stay_numeric() {
+        assert_eq!(sanitize_untrusted_csv_cell("正常なノード"), "正常なノード");
+        assert_eq!(safe_numeric_csv_cell("-123"), "-123");
+        assert_eq!(safe_numeric_csv_cell("=1+1"), "'=1+1");
+    }
 }

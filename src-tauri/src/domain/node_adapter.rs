@@ -22,6 +22,7 @@ pub trait NodeAdapter: Send + Sync {
     async fn fetch_supernode_metrics(
         &self,
         _supernodes: &[SupernodeProgramNode],
+        _configured_supernode_id: Option<i64>,
     ) -> AppResult<SupernodeSnapshot> {
         Ok(SupernodeSnapshot::default())
     }

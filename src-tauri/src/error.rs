@@ -7,6 +7,17 @@ pub enum AppError {
     InvalidUrl(String),
     #[error("ネットワークエラー: {0}")]
     Network(String),
+    #[error("安全でないリダイレクトを拒否しました: {0}")]
+    RedirectRejected(String),
+    #[error("APIレスポンスが上限を超えました（上限: {limit} bytes）")]
+    ResponseTooLarge { limit: usize },
+    #[error("HTTP接続には明示的な確認が必要です: {0}")]
+    InsecureHttpConfirmationRequired(String),
+    #[error("Supernode IDが競合しています（URL: {endpoint_id} / 手動指定: {configured_id}）")]
+    SupernodeIdentityConflict {
+        endpoint_id: i64,
+        configured_id: i64,
+    },
     #[error("ノードの種類を判定できませんでした（Symbol: {symbol} / NIS1: {nis1}）")]
     UnknownNode { symbol: String, nis1: String },
     #[error("APIレスポンスを解釈できません: {0}")]

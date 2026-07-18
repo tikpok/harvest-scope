@@ -158,7 +158,7 @@ async fn diagnose_peer_voting(
     };
     match tokio::time::timeout(
         CHECK_TIMEOUT,
-        SymbolAdapter::new(reference.base_url, state.client.clone())
+        SymbolAdapter::new(reference.base_url, state.transport.clone())
             .fetch_voting_key_snapshot_for_public_key(public_key),
     )
     .await
@@ -178,7 +178,7 @@ async fn diagnose_peer_voting(
             ),
             snapshot
                 .voting_key_remaining_epochs
-                .map_or(true, |epochs| epochs <= 30)
+                .is_none_or(|epochs| epochs <= 30)
                 .then_some("Voting keyの更新時期を確認してください。"),
             started,
         )),
@@ -398,7 +398,7 @@ async fn execute(state: &AppState, node: &StoredNode, alert_id: Option<String>) 
         };
     }
 
-    let adapter = adapter_for(node.kind, node.base_url.clone(), state.client.clone());
+    let adapter = adapter_for(node.kind, node.base_url.clone(), state.transport.clone());
     let started = Instant::now();
     match tokio::time::timeout(CHECK_TIMEOUT, adapter.probe()).await {
         Ok(Ok(identity)) => {
@@ -636,7 +636,11 @@ async fn execute(state: &AppState, node: &StoredNode, alert_id: Option<String>) 
             comparable,
             chain.as_ref().and_then(|item| item.finalized_height),
         ) {
-            let other = adapter_for(comparable.kind, comparable.base_url, state.client.clone());
+            let other = adapter_for(
+                comparable.kind,
+                comparable.base_url,
+                state.transport.clone(),
+            );
             let hashes = tokio::time::timeout(CHECK_TIMEOUT, async {
                 let other_height = other
                     .fetch_chain()

@@ -5,12 +5,12 @@ mod error;
 mod services;
 mod state;
 mod storage;
+mod transport;
 
 use std::{
     any::Any,
     panic::{catch_unwind, AssertUnwindSafe},
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 use state::AppState;
@@ -53,14 +53,9 @@ fn run_app() -> tauri::Result<()> {
         ))
         .setup(|app| {
             let data_dir = app_database_path(app)?;
-            let client = reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(2))
-                .timeout(Duration::from_secs(5))
-                .pool_max_idle_per_host(2)
-                .user_agent("Harvest-Scope/0.1")
-                .build()?;
+            let transport = transport::NodeTransport::new()?;
             let repository = tauri::async_runtime::block_on(storage::Repository::open(&data_dir))?;
-            let state = tauri::async_runtime::block_on(AppState::new(repository, client))?;
+            let state = tauri::async_runtime::block_on(AppState::new(repository, transport))?;
             app.manage(state.clone());
             #[cfg(target_os = "windows")]
             match services::power::register(app.handle().clone(), state.clone()) {
@@ -101,11 +96,13 @@ fn run_app() -> tauri::Result<()> {
             commands::get_topology,
             commands::get_recent_network_events,
             commands::get_recent_harvest_events,
+            commands::list_supernode_program_nodes,
             commands::upsert_node,
             commands::delete_node,
             commands::move_node,
             commands::pause_node,
             commands::resume_node,
+            commands::confirm_insecure_http,
             commands::set_node_harvest_metrics_visible,
             commands::refresh_node,
             commands::refresh_all_nodes,

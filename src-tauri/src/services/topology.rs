@@ -64,9 +64,11 @@ pub async fn snapshot(state: &AppState) -> AppResult<TopologySnapshot> {
             TopologyNode {
                 websocket_connected: websocket_by_node.get(&node.id).copied().unwrap_or(false),
                 version: stored.and_then(|stored| stored.version.clone()),
-                roles: stored
-                    .map(|stored| stored.roles.clone())
-                    .unwrap_or_default(),
+                roles: if node.roles.is_empty() {
+                    node.observed_roles.clone()
+                } else {
+                    node.roles.clone()
+                },
                 id: node.id,
                 label: node.display_name,
                 kind: node.kind,

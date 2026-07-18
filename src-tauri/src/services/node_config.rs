@@ -31,6 +31,7 @@ fn config_entry_from_node(node: crate::domain::StoredNode) -> NodeConfigEntry {
         enabled: Some(node.enabled),
         favorite: Some(node.favorite),
         show_harvest_metrics: Some(node.show_harvest_metrics),
+        supernode_id: node.supernode_id,
     }
 }
 
@@ -158,9 +159,16 @@ async fn import_node_config_entries(
             favorite: entry
                 .favorite
                 .or_else(|| existing_node.as_ref().map(|node| node.favorite)),
+            allow_insecure_http: None,
+            supernode_id: entry.supernode_id,
         };
-        match node_registration::upsert_node_from_input(app.clone(), state.clone(), input, false)
-            .await
+        match node_registration::upsert_node_from_input(
+            app.clone(),
+            state.clone(),
+            input,
+            existing_id.is_none(),
+        )
+        .await
         {
             Ok(node) => {
                 if let Err(error) = state
@@ -228,6 +236,8 @@ mod tests {
             enabled: true,
             favorite: true,
             show_harvest_metrics: true,
+            allow_insecure_http: true,
+            supernode_id: Some(6021),
         }]);
         let value = serde_json::to_value(file).expect("config should serialize");
         let node = &value["nodes"][0];
@@ -243,6 +253,8 @@ mod tests {
         assert_eq!(node["enabled"], true);
         assert_eq!(node["favorite"], true);
         assert_eq!(node["showHarvestMetrics"], true);
+        assert_eq!(node["supernodeId"], 6021);
+        assert!(node.get("allowInsecureHttp").is_none());
         assert!(node.get("id").is_none());
         assert!(node.get("restVersion").is_none());
     }

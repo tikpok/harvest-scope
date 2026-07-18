@@ -17,6 +17,8 @@ export interface NodeSummary {
   roles: string[];
   observedRoles: string[];
   restPrivate: boolean;
+  allowInsecureHttp: boolean;
+  configuredSupernodeId: number | null;
   enabled: boolean;
   favorite: boolean;
   status: NodeStatus;
@@ -168,6 +170,9 @@ export interface NodeDetail {
   peers: PeerInfo[];
   websocketConnected: boolean;
   recentHarvests: HarvestEvent[];
+  transportRejectedCount: number;
+  lastTransportRejectionAt: number | null;
+  lastTransportRejectionReason: string | null;
 }
 
 export interface MetricPoint {
@@ -271,6 +276,15 @@ export interface UpsertNodeInput {
   roles?: string[];
   enabled?: boolean;
   favorite?: boolean;
+  allowInsecureHttp?: boolean;
+  supernodeId?: number;
+}
+
+export interface SupernodeProgramNode {
+  id: number;
+  endpoint: string;
+  name: string | null;
+  status: string | null;
 }
 
 export interface NodeConfigImportFailure {

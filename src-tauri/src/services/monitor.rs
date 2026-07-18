@@ -18,7 +18,14 @@ use crate::{
     storage::NodeUpsert,
 };
 
-use super::{desktop, websocket};
+use super::{
+    desktop,
+    monitor_alerts::{
+        certificate_expiry_severity, node_certificate_message, supernode_failure_message,
+        update_alert, voting_key_message,
+    },
+    websocket,
+};
 
 const RESUME_LATE_THRESHOLD_MS: i64 = 15_000;
 const RESUME_GRACE_MS: i64 = 90_000;
@@ -101,18 +108,6 @@ fn status_from_signals(
     }
 }
 
-fn certificate_expiry_severity(remaining: Option<i64>) -> Option<&'static str> {
-    remaining.and_then(|value| {
-        if value <= 7 {
-            Some("critical")
-        } else if value <= 30 {
-            Some("warning")
-        } else {
-            None
-        }
-    })
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExpiryAlertTransition {
     Active(&'static str),
@@ -164,36 +159,6 @@ fn finalization_stall_transition(
         }
     } else {
         FinalizationStallTransition::Resolved
-    }
-}
-
-fn node_certificate_message(days: i64) -> String {
-    if days < 0 {
-        "ノード証明書の期限が切れています。".into()
-    } else {
-        format!("ノード証明書の期限まで残り{days}日です。")
-    }
-}
-
-fn voting_key_message(epochs: i64) -> String {
-    if epochs == 0 {
-        "投票キーの有効epochが終了しています。".into()
-    } else {
-        format!("投票キーの有効期限まで残り{epochs} epochです。")
-    }
-}
-
-fn supernode_failure_message(round: Option<i64>, failed_checks: &[String]) -> String {
-    let round = round
-        .map(|value| format!("ラウンド{value}"))
-        .unwrap_or_else(|| "最新ラウンド".into());
-    if failed_checks.is_empty() {
-        format!("NEM Supernodeの{round}でチェックに失敗しました。")
-    } else {
-        format!(
-            "NEM Supernodeの{round}で{}に失敗しました。",
-            failed_checks.join(", ")
-        )
     }
 }
 
@@ -307,7 +272,7 @@ async fn fetch_peer_voting_metrics(
                     == Some(network_key.as_str())
         })
         .ok_or_else(|| "同一ネットワークの参照用Symbol APIノードがありません".to_string())?;
-    SymbolAdapter::new(reference.base_url, state.client.clone())
+    SymbolAdapter::new(reference.base_url, state.transport.clone())
         .fetch_voting_key_snapshot_for_public_key(public_key)
         .await
 }
@@ -470,7 +435,7 @@ async fn supernode_nodes(state: &AppState, now: i64) -> AppResult<Vec<SupernodeP
     {
         return Ok(cache.nodes.clone());
     }
-    let nodes = Nis1Adapter::fetch_supernode_nodes(&state.client).await?;
+    let nodes = Nis1Adapter::fetch_supernode_nodes(&state.transport).await?;
     *cache = Some(crate::domain::SupernodeListCache {
         observed_at: now,
         nodes: nodes.clone(),
@@ -496,45 +461,6 @@ async fn enter_resume_grace(state: &AppState, now: i64, reason: &str) {
 pub(crate) async fn handle_system_resume(state: &AppState, reason: &str) {
     let now = chrono::Utc::now().timestamp_millis();
     enter_resume_grace(state, now, reason).await;
-}
-
-async fn update_alert(
-    app: &AppHandle,
-    state: &AppState,
-    node: &StoredNode,
-    active: bool,
-    alert_type: &str,
-    severity: &str,
-    message: &str,
-) -> AppResult<()> {
-    let mutation = if active {
-        let mutation = state
-            .repository
-            .raise_alert(&node.id, alert_type, severity, message)
-            .await?;
-        mutation.changed.then_some(mutation.alert_id)
-    } else {
-        state.repository.resolve_alert(&node.id, alert_type).await?
-    };
-    if let Some(alert_id) = mutation {
-        let title = if active {
-            format!(
-                "{}: {}",
-                if severity == "critical" {
-                    "重大"
-                } else {
-                    "警告"
-                },
-                node.display_name
-            )
-        } else {
-            format!("復旧: {}", node.display_name)
-        };
-        desktop::notify_alert(app.clone(), state.clone(), &title, message, alert_id).await;
-        let _ = app.emit("alert-changed", &node.id);
-        desktop::refresh_tray(app, state).await;
-    }
-    Ok(())
 }
 
 async fn resolve_alert_silently(
@@ -600,7 +526,7 @@ async fn monitor_node_inner(
         .await
         .unwrap_or_default();
     let now = chrono::Utc::now().timestamp_millis();
-    let adapter = adapter_for(node.kind, node.base_url.clone(), state.client.clone());
+    let adapter = adapter_for(node.kind, node.base_url.clone(), state.transport.clone());
     if let Some(spec) = adapter.websocket_capability() {
         websocket::ensure_started(app.clone(), state.clone(), node.id.clone(), spec).await;
     }
@@ -767,7 +693,10 @@ async fn monitor_node_inner(
     let mut supernode_alert_evaluated = false;
     if node.kind == NodeKind::Nis1 && health.is_some() && supernode_due {
         match supernode_nodes(&state, now).await {
-            Ok(nodes) => match adapter.fetch_supernode_metrics(&nodes).await {
+            Ok(nodes) => match adapter
+                .fetch_supernode_metrics(&nodes, node.supernode_id)
+                .await
+            {
                 Ok(snapshot) => {
                     supernode_alert_evaluated = snapshot.error.is_none();
                     supernode_id = snapshot.supernode_id;
@@ -802,6 +731,8 @@ async fn monitor_node_inner(
                     monitor_mode: node.monitor_mode,
                     enabled: node.enabled,
                     favorite: node.favorite,
+                    allow_insecure_http: node.allow_insecure_http,
+                    supernode_id: node.supernode_id,
                 })
                 .await
             {
@@ -1274,7 +1205,7 @@ async fn compare_state_hashes(app: AppHandle, state: AppState) -> AppResult<()> 
             .unwrap_or_default();
         let mut hashes: HashMap<String, Vec<StoredNode>> = HashMap::new();
         for (node, _) in &members {
-            let adapter = adapter_for(node.kind, node.base_url.clone(), state.client.clone());
+            let adapter = adapter_for(node.kind, node.base_url.clone(), state.transport.clone());
             if let Ok(Some(hash)) = adapter.fetch_state_hash(height).await {
                 hashes.entry(hash).or_default().push(node.clone());
             }
@@ -1306,10 +1237,12 @@ pub fn start(app: AppHandle, state: AppState) {
     tauri::async_runtime::spawn(async move {
         let state_for_compact = state.clone();
         tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(90)).await;
-            let settings = state_for_compact.settings.read().await.clone();
-            if let Err(error) = state_for_compact.repository.compact(&settings).await {
-                tracing::warn!(%error, "delayed repository compaction failed");
+            loop {
+                let settings = state_for_compact.settings.read().await.clone();
+                if let Err(error) = state_for_compact.repository.compact(&settings).await {
+                    tracing::warn!(%error, "scheduled repository compaction failed");
+                }
+                tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
             }
         });
         let mut last_state_hash_check = chrono::Utc::now().timestamp_millis();
