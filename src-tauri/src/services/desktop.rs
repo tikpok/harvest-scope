@@ -281,6 +281,8 @@ mod tests {
             roles: Vec::new(),
             observed_roles: Vec::new(),
             rest_private: false,
+            allow_insecure_http: true,
+            configured_supernode_id: None,
             enabled,
             favorite: false,
             status,

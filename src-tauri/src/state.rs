@@ -6,12 +6,12 @@ use std::{
     },
 };
 
-use reqwest::Client;
 use tokio::sync::{Mutex, RwLock, Semaphore};
 
 use crate::{
     domain::{AppSettings, ChainSnapshot, NetworkEvent, PeerInfo, SupernodeListCache},
     storage::Repository,
+    transport::NodeTransport,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -35,6 +35,9 @@ pub struct NodeRuntime {
     pub height_at_finalization_change: Option<u64>,
     pub lag_warning_since: Option<i64>,
     pub lag_critical_since: Option<i64>,
+    pub transport_rejected_count: u64,
+    pub last_transport_rejection_at: Option<i64>,
+    pub last_transport_rejection_reason: Option<String>,
 }
 
 impl NodeRuntime {
@@ -100,10 +103,56 @@ impl NodeRuntime {
     }
 }
 
+pub const MAX_NETWORK_EVENTS: usize = 500;
+pub const MAX_NETWORK_EVENT_BYTES: usize = 512 * 1024;
+
+pub struct EventBuffer {
+    events: VecDeque<(NetworkEvent, usize)>,
+    bytes: usize,
+}
+
+impl EventBuffer {
+    pub fn new() -> Self {
+        Self {
+            events: VecDeque::with_capacity(MAX_NETWORK_EVENTS),
+            bytes: 0,
+        }
+    }
+
+    pub fn push(&mut self, event: NetworkEvent) -> bool {
+        let size = serde_json::to_vec(&event)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX);
+        if size > MAX_NETWORK_EVENT_BYTES {
+            return false;
+        }
+        while self.events.len() >= MAX_NETWORK_EVENTS
+            || self.bytes.saturating_add(size) > MAX_NETWORK_EVENT_BYTES
+        {
+            let Some((_, removed_size)) = self.events.pop_front() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(removed_size);
+        }
+        self.bytes += size;
+        self.events.push_back((event, size));
+        true
+    }
+
+    pub fn recent(&self, limit: usize) -> Vec<NetworkEvent> {
+        self.events
+            .iter()
+            .rev()
+            .take(limit)
+            .map(|(event, _)| event.clone())
+            .collect()
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub repository: Repository,
-    pub client: Client,
+    pub transport: NodeTransport,
     pub settings: Arc<RwLock<AppSettings>>,
     pub runtime: Arc<Mutex<HashMap<String, NodeRuntime>>>,
     pub websocket_started: Arc<Mutex<HashSet<String>>>,
@@ -113,7 +162,7 @@ pub struct AppState {
     pub monitoring_nodes: Arc<Mutex<HashSet<String>>>,
     pub diagnostic_nodes: Arc<Mutex<HashSet<String>>>,
     pub request_limit: Arc<Semaphore>,
-    pub network_events: Arc<Mutex<VecDeque<NetworkEvent>>>,
+    pub network_events: Arc<Mutex<EventBuffer>>,
     pub pending_navigation: Arc<Mutex<Option<String>>>,
     pub resume_grace_until: Arc<AtomicI64>,
     pub system_suspended: Arc<AtomicBool>,
@@ -125,11 +174,14 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub async fn new(repository: Repository, client: Client) -> crate::error::AppResult<Self> {
+    pub async fn new(
+        repository: Repository,
+        transport: NodeTransport,
+    ) -> crate::error::AppResult<Self> {
         let settings = repository.load_settings().await?;
         Ok(Self {
             repository,
-            client,
+            transport,
             background_monitoring: Arc::new(AtomicBool::new(settings.background_monitoring)),
             settings: Arc::new(RwLock::new(settings)),
             runtime: Arc::new(Mutex::new(HashMap::new())),
@@ -139,7 +191,7 @@ impl AppState {
             monitoring_nodes: Arc::new(Mutex::new(HashSet::new())),
             diagnostic_nodes: Arc::new(Mutex::new(HashSet::new())),
             request_limit: Arc::new(Semaphore::new(16)),
-            network_events: Arc::new(Mutex::new(VecDeque::with_capacity(500))),
+            network_events: Arc::new(Mutex::new(EventBuffer::new())),
             pending_navigation: Arc::new(Mutex::new(None)),
             resume_grace_until: Arc::new(AtomicI64::new(0)),
             system_suspended: Arc::new(AtomicBool::new(false)),
@@ -198,7 +250,32 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::NodeRuntime;
+    use super::{EventBuffer, NodeRuntime, MAX_NETWORK_EVENT_BYTES};
+    use crate::domain::NetworkEvent;
+
+    fn event(id: &str, node_id: String) -> NetworkEvent {
+        NetworkEvent {
+            id: id.into(),
+            node_id,
+            kind: "block".into(),
+            height: Some("1".into()),
+            hash: None,
+            signer_public_key: None,
+            harvester_public_key: None,
+            harvested_node_id: None,
+            observer_node_id: None,
+            observed_at: 1,
+            source: "websocket".into(),
+        }
+    }
+
+    #[test]
+    fn event_buffer_enforces_byte_budget_without_truncating() {
+        let mut buffer = EventBuffer::new();
+        assert!(!buffer.push(event("oversized", "x".repeat(MAX_NETWORK_EVENT_BYTES))));
+        assert!(buffer.push(event("valid", "node-a".into())));
+        assert_eq!(buffer.recent(10)[0].id, "valid");
+    }
 
     #[test]
     fn resume_reset_clears_transient_failure_state() {

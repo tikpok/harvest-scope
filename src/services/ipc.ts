@@ -14,6 +14,7 @@ import type {
   RefreshAllResult,
   ScanCandidate,
   ScanRequest,
+  SupernodeProgramNode,
   TopologySnapshot,
   UpsertNodeInput,
 } from "../types";
@@ -68,11 +69,13 @@ export const api = {
   metrics: (nodeId: string, from: number, to: number) =>
     call<MetricPoint[]>("query_metrics", { nodeId, from, to }, []),
   upsertNode: (input: UpsertNodeInput) => invoke<NodeSummary>("upsert_node", { input }),
+  supernodes: () => call<SupernodeProgramNode[]>("list_supernode_program_nodes", {}, []),
   deleteNode: (nodeId: string) => invoke<void>("delete_node", { nodeId }),
   moveNode: (nodeId: string, direction: "up" | "down") =>
     invoke<void>("move_node", { nodeId, direction }),
   pauseNode: (nodeId: string) => invoke<void>("pause_node", { nodeId }),
   resumeNode: (nodeId: string) => invoke<void>("resume_node", { nodeId }),
+  confirmInsecureHttp: (nodeId: string) => invoke<void>("confirm_insecure_http", { nodeId }),
   setNodeHarvestMetricsVisible: (nodeId: string, visible: boolean) =>
     invoke<void>("set_node_harvest_metrics_visible", { nodeId, visible }),
   refreshNode: (nodeId: string) => invoke<void>("refresh_node", { nodeId }),

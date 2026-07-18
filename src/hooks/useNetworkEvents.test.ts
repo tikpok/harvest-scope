@@ -27,3 +27,12 @@ test("初期読込時から1分を超えたイベントを除外する", () => {
 
   expect(merged.map((item) => item.id)).toEqual(["incoming-recent"]);
 });
+
+test("イベントを件数とUTF-8バイト数の両方で制限する", () => {
+  const now = 100_000;
+  const large = event("large", now);
+  large.nodeId = "あ".repeat(50_000);
+  const merged = mergeNetworkEvents([], [large, event("small", now - 1)], now);
+
+  expect(merged.map((item) => item.id)).toEqual(["small"]);
+});

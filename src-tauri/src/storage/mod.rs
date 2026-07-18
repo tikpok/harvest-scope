@@ -1,4 +1,13 @@
-use std::{collections::HashMap, path::Path, str::FromStr, time::Duration};
+use std::{
+    collections::HashMap,
+    path::Path,
+    str::FromStr,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow},
@@ -17,6 +26,27 @@ use crate::{
 #[derive(Clone)]
 pub struct Repository {
     pool: SqlitePool,
+    harvest_inserts: Arc<AtomicU64>,
+}
+
+const HARVEST_EVENTS_MAX_ROWS: i64 = 100_000;
+const HARVEST_EVENTS_PER_NODE_PER_MINUTE: i64 = 12;
+const DATABASE_LOGICAL_SIZE_LIMIT_BYTES: i64 = 512 * 1024 * 1024;
+const HARVEST_COMPACTION_INSERT_INTERVAL: u64 = 256;
+
+fn logical_database_bytes(page_count: i64, freelist_count: i64, page_size: i64) -> i64 {
+    page_count
+        .saturating_sub(freelist_count)
+        .saturating_mul(page_size)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HarvestEventInsertOutcome {
+    Inserted,
+    Duplicate,
+    RateLimited,
+    RowLimitReached,
+    DatabaseSizeLimitReached,
 }
 
 pub struct NodeUpsert<'a> {
@@ -27,6 +57,8 @@ pub struct NodeUpsert<'a> {
     pub monitor_mode: MonitorMode,
     pub enabled: bool,
     pub favorite: bool,
+    pub allow_insecure_http: bool,
+    pub supernode_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -192,6 +224,8 @@ fn summary_from_row(row: &SqliteRow) -> AppResult<NodeSummary> {
         roles: parse_string_list(row.try_get("roles_json")?),
         observed_roles: Vec::new(),
         rest_private: false,
+        allow_insecure_http: row.try_get::<i64, _>("allow_insecure_http")? != 0,
+        configured_supernode_id: row.try_get("configured_supernode_id")?,
         enabled,
         favorite: row.try_get::<i64, _>("favorite")? != 0,
         status: if enabled {
@@ -346,7 +380,10 @@ impl Repository {
         sqlx::query("PRAGMA synchronous = NORMAL")
             .execute(&pool)
             .await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            harvest_inserts: Arc::new(AtomicU64::new(0)),
+        })
     }
 
     pub async fn list_stored_nodes(&self, enabled_only: bool) -> AppResult<Vec<StoredNode>> {
@@ -375,6 +412,8 @@ impl Repository {
                     enabled: row.try_get::<i64, _>("enabled")? != 0,
                     favorite: row.try_get::<i64, _>("favorite")? != 0,
                     show_harvest_metrics: row.try_get::<i64, _>("show_harvest_metrics")? != 0,
+                    allow_insecure_http: row.try_get::<i64, _>("allow_insecure_http")? != 0,
+                    supernode_id: row.try_get("supernode_id")?,
                 })
             })
             .collect()
@@ -404,6 +443,8 @@ impl Repository {
               n.enabled,
               n.favorite,
               n.show_harvest_metrics,
+              n.allow_insecure_http,
+              n.supernode_id AS configured_supernode_id,
               s.observed_at AS sample_observed_at,
               s.reachable AS sample_reachable,
               s.status AS sample_status,
@@ -552,6 +593,8 @@ impl Repository {
                 roles: node.roles.clone(),
                 observed_roles: Vec::new(),
                 rest_private: false,
+                allow_insecure_http: node.allow_insecure_http,
+                configured_supernode_id: node.supernode_id,
                 enabled: node.enabled,
                 favorite: node.favorite,
                 status: if node.enabled {
@@ -650,6 +693,8 @@ impl Repository {
                 roles: node.roles.clone(),
                 observed_roles: Vec::new(),
                 rest_private: false,
+                allow_insecure_http: node.allow_insecure_http,
+                configured_supernode_id: node.supernode_id,
                 enabled: node.enabled,
                 favorite: node.favorite,
                 status: NodeStatus::Unknown,
@@ -707,8 +752,8 @@ impl Repository {
         let now = chrono::Utc::now().timestamp_millis();
         let roles = serde_json::to_string(&identity.roles)?;
         sqlx::query(
-            "INSERT INTO nodes (id, display_name, kind, monitor_mode, base_url, network, version, public_key, roles_json, rest_version, enabled, favorite, sort_order, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort_order) + 1, 0) FROM nodes), ?, ?)
+            "INSERT INTO nodes (id, display_name, kind, monitor_mode, base_url, network, version, public_key, roles_json, rest_version, enabled, favorite, allow_insecure_http, supernode_id, sort_order, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, (SELECT COALESCE(MAX(sort_order) + 1, 0) FROM nodes), ?, ?)
              ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name, kind=excluded.kind, monitor_mode=excluded.monitor_mode, base_url=excluded.base_url,
              network=excluded.network, version=excluded.version, public_key=excluded.public_key, roles_json=excluded.roles_json,
              rest_version=excluded.rest_version, enabled=excluded.enabled, favorite=excluded.favorite, updated_at=excluded.updated_at"
@@ -722,13 +767,15 @@ impl Repository {
         let now = chrono::Utc::now().timestamp_millis();
         let roles = serde_json::to_string(&input.identity.roles)?;
         sqlx::query(
-            "INSERT INTO nodes (id, display_name, kind, monitor_mode, base_url, network, version, public_key, roles_json, rest_version, enabled, favorite, sort_order, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort_order) + 1, 0) FROM nodes), ?, ?)
+            "INSERT INTO nodes (id, display_name, kind, monitor_mode, base_url, network, version, public_key, roles_json, rest_version, enabled, favorite, allow_insecure_http, supernode_id, sort_order, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort_order) + 1, 0) FROM nodes), ?, ?)
              ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name, kind=excluded.kind, monitor_mode=excluded.monitor_mode, base_url=excluded.base_url,
              network=excluded.network, version=excluded.version, public_key=excluded.public_key, roles_json=excluded.roles_json,
-             rest_version=excluded.rest_version, enabled=excluded.enabled, favorite=excluded.favorite, updated_at=excluded.updated_at"
+             rest_version=excluded.rest_version, enabled=excluded.enabled, favorite=excluded.favorite,
+             allow_insecure_http=excluded.allow_insecure_http, supernode_id=excluded.supernode_id, updated_at=excluded.updated_at"
         ).bind(input.id).bind(input.display_name).bind(input.identity.kind.as_str()).bind(input.monitor_mode.as_str()).bind(input.base_url).bind(&input.identity.network).bind(&input.identity.version)
             .bind(&input.identity.public_key).bind(roles).bind(&input.identity.rest_version).bind(input.enabled as i64).bind(input.favorite as i64)
+            .bind(input.allow_insecure_http as i64).bind(input.supernode_id)
             .bind(now).bind(now).execute(&self.pool).await?;
         Ok(())
     }
@@ -740,6 +787,20 @@ impl Repository {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::NotFound(id.into()));
+        }
+        Ok(())
+    }
+
+    pub async fn confirm_insecure_http(&self, id: &str) -> AppResult<()> {
+        let result = sqlx::query(
+            "UPDATE nodes SET allow_insecure_http = 1, enabled = 1, updated_at = ? WHERE id = ? AND LOWER(base_url) LIKE 'http://%'",
+        )
+        .bind(chrono::Utc::now().timestamp_millis())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(AppError::NotFound(id.into()));
         }
@@ -1084,7 +1145,49 @@ impl Repository {
             .collect()
     }
 
-    pub async fn record_harvest_event(&self, event: &HarvestEvent) -> AppResult<bool> {
+    async fn logical_database_size_bytes(&self) -> AppResult<i64> {
+        let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
+            .fetch_one(&self.pool)
+            .await?;
+        let freelist_count: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+            .fetch_one(&self.pool)
+            .await?;
+        let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(logical_database_bytes(
+            page_count,
+            freelist_count,
+            page_size,
+        ))
+    }
+
+    async fn prune_harvest_events(&self, raw_retention_days: u64) -> AppResult<()> {
+        let cutoff = chrono::Utc::now().timestamp_millis() - raw_retention_days as i64 * 86_400_000;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM harvest_events WHERE observed_at < ?")
+            .bind(cutoff)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "DELETE FROM harvest_events WHERE id IN (
+               SELECT id FROM harvest_events
+               ORDER BY observed_at DESC, id DESC
+               LIMIT -1 OFFSET ?
+             )",
+        )
+        .bind(HARVEST_EVENTS_MAX_ROWS)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn record_harvest_event(
+        &self,
+        event: &HarvestEvent,
+        raw_retention_days: u64,
+    ) -> AppResult<HarvestEventInsertOutcome> {
         let event_key = event
             .hash
             .clone()
@@ -1096,6 +1199,35 @@ impl Repository {
                     event.harvester_public_key
                 )
             });
+        if self.logical_database_size_bytes().await? >= DATABASE_LOGICAL_SIZE_LIMIT_BYTES {
+            return Ok(HarvestEventInsertOutcome::DatabaseSizeLimitReached);
+        }
+
+        let mut row_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM harvest_events")
+            .fetch_one(&self.pool)
+            .await?;
+        if row_count >= HARVEST_EVENTS_MAX_ROWS {
+            self.prune_harvest_events(raw_retention_days).await?;
+            row_count = sqlx::query_scalar("SELECT COUNT(*) FROM harvest_events")
+                .fetch_one(&self.pool)
+                .await?;
+            if row_count >= HARVEST_EVENTS_MAX_ROWS {
+                return Ok(HarvestEventInsertOutcome::RowLimitReached);
+            }
+        }
+
+        let one_minute_ago = chrono::Utc::now().timestamp_millis() - 60_000;
+        let recent_for_node: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM harvest_events WHERE node_id = ? AND observed_at >= ?",
+        )
+        .bind(&event.node_id)
+        .bind(one_minute_ago)
+        .fetch_one(&self.pool)
+        .await?;
+        if recent_for_node >= HARVEST_EVENTS_PER_NODE_PER_MINUTE {
+            return Ok(HarvestEventInsertOutcome::RateLimited);
+        }
+
         let result = sqlx::query("INSERT OR IGNORE INTO harvest_events (id, event_key, node_id, observer_node_id, harvester_public_key, height, hash, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&event.id)
             .bind(event_key)
@@ -1107,7 +1239,15 @@ impl Repository {
             .bind(event.observed_at)
             .execute(&self.pool)
             .await?;
-        Ok(result.rows_affected() > 0)
+        if result.rows_affected() == 0 {
+            return Ok(HarvestEventInsertOutcome::Duplicate);
+        }
+
+        let inserts = self.harvest_inserts.fetch_add(1, Ordering::Relaxed) + 1;
+        if inserts.is_multiple_of(HARVEST_COMPACTION_INSERT_INTERVAL) {
+            self.prune_harvest_events(raw_retention_days).await?;
+        }
+        Ok(HarvestEventInsertOutcome::Inserted)
     }
 
     pub async fn recent_harvest_events(&self, limit: usize) -> AppResult<Vec<HarvestEvent>> {
@@ -1313,6 +1453,9 @@ impl Repository {
             peers,
             websocket_connected,
             recent_harvests,
+            transport_rejected_count: 0,
+            last_transport_rejection_at: None,
+            last_transport_rejection_reason: None,
         })
     }
 
@@ -1550,6 +1693,20 @@ impl Repository {
             .bind(raw_cutoff)
             .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM harvest_events WHERE observed_at < ?")
+            .bind(raw_cutoff)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "DELETE FROM harvest_events WHERE id IN (
+               SELECT id FROM harvest_events
+               ORDER BY observed_at DESC, id DESC
+               LIMIT -1 OFFSET ?
+             )",
+        )
+        .bind(HARVEST_EVENTS_MAX_ROWS)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("DELETE FROM hourly_metrics WHERE bucket_at < ?")
             .bind(aggregate_cutoff)
             .execute(&mut *tx)
@@ -1621,6 +1778,42 @@ mod tests {
             supernode_failed_checks: Vec::new(),
             supernode_metric_error: None,
         }
+    }
+
+    async fn insert_harvest_test_node(repository: &Repository, id: &str) {
+        repository
+            .upsert_node(
+                id,
+                &format!("https://{id}.example.invalid:3001"),
+                id,
+                &symbol_identity(),
+                true,
+                false,
+            )
+            .await
+            .expect("test node should be inserted");
+    }
+
+    fn harvest_event(index: usize, observed_at: i64) -> HarvestEvent {
+        HarvestEvent {
+            id: format!("event-{index}"),
+            node_id: "harvester-node".into(),
+            observer_node_id: "observer-node".into(),
+            harvester_public_key:
+                "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF".into(),
+            height: Some(index.to_string()),
+            hash: Some(format!("{index:064X}")),
+            observed_at,
+        }
+    }
+
+    #[test]
+    fn logical_database_size_excludes_free_pages_and_preserves_the_512_mib_boundary() {
+        assert_eq!(logical_database_bytes(10, 2, 4096), 8 * 4096);
+        assert_eq!(
+            logical_database_bytes(131_072, 0, 4096),
+            DATABASE_LOGICAL_SIZE_LIMIT_BYTES
+        );
     }
 
     #[test]
@@ -2194,5 +2387,131 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn harvest_event_rate_limit_rejects_the_thirteenth_event_per_node_per_minute() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::open(&directory.path().join("test.db"))
+            .await
+            .unwrap();
+        insert_harvest_test_node(&repository, "harvester-node").await;
+        insert_harvest_test_node(&repository, "observer-node").await;
+        let now = chrono::Utc::now().timestamp_millis();
+
+        for index in 0..12 {
+            assert_eq!(
+                repository
+                    .record_harvest_event(&harvest_event(index, now), 30)
+                    .await
+                    .unwrap(),
+                HarvestEventInsertOutcome::Inserted
+            );
+        }
+        assert_eq!(
+            repository
+                .record_harvest_event(&harvest_event(12, now), 30)
+                .await
+                .unwrap(),
+            HarvestEventInsertOutcome::RateLimited
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_expires_raw_harvest_events_and_keeps_only_the_newest_row_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::open(&directory.path().join("test.db"))
+            .await
+            .unwrap();
+        insert_harvest_test_node(&repository, "harvester-node").await;
+        insert_harvest_test_node(&repository, "observer-node").await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let expired_at = now - 31 * 86_400_000;
+        sqlx::query(
+            "INSERT INTO harvest_events
+             (id, event_key, node_id, observer_node_id, harvester_public_key, height, hash, observed_at)
+             VALUES ('expired', 'expired', 'harvester-node', 'observer-node', 'key', '0', NULL, ?)",
+        )
+        .bind(expired_at)
+        .execute(&repository.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "WITH RECURSIVE seq(value) AS (
+               SELECT 1
+               UNION ALL
+               SELECT value + 1 FROM seq WHERE value < 100001
+             )
+             INSERT INTO harvest_events
+             (id, event_key, node_id, observer_node_id, harvester_public_key, height, hash, observed_at)
+             SELECT printf('bulk-%06d', value), printf('bulk-key-%06d', value),
+                    'harvester-node', 'observer-node', 'key', CAST(value AS TEXT), NULL, ? + value
+             FROM seq",
+        )
+        .bind(now)
+        .execute(&repository.pool)
+        .await
+        .unwrap();
+
+        repository
+            .compact(&AppSettings {
+                raw_retention_days: 30,
+                ..AppSettings::default()
+            })
+            .await
+            .unwrap();
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM harvest_events")
+            .fetch_one(&repository.pool)
+            .await
+            .unwrap();
+        let expired: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM harvest_events WHERE id = 'expired'")
+                .fetch_one(&repository.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 100_000);
+        assert_eq!(expired, 0);
+        assert_eq!(
+            repository
+                .record_harvest_event(&harvest_event(200_000, now), 30)
+                .await
+                .unwrap(),
+            HarvestEventInsertOutcome::RowLimitReached
+        );
+    }
+
+    #[tokio::test]
+    async fn insecure_http_confirmation_and_supernode_mapping_are_persisted() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository::open(&directory.path().join("test.db"))
+            .await
+            .unwrap();
+        let identity = symbol_identity();
+        repository
+            .upsert_node_with_mode(NodeUpsert {
+                id: "http-node",
+                base_url: "http://node-lan.example.invalid:7890",
+                display_name: "HTTP Node",
+                identity: &identity,
+                monitor_mode: MonitorMode::Api,
+                enabled: false,
+                favorite: false,
+                allow_insecure_http: false,
+                supernode_id: Some(6021),
+            })
+            .await
+            .unwrap();
+
+        let before = repository.get_stored_node("http-node").await.unwrap();
+        assert!(!before.enabled);
+        assert!(!before.allow_insecure_http);
+        assert_eq!(before.supernode_id, Some(6021));
+
+        repository.confirm_insecure_http("http-node").await.unwrap();
+        let after = repository.get_stored_node("http-node").await.unwrap();
+        assert!(after.enabled);
+        assert!(after.allow_insecure_http);
+        assert_eq!(after.supernode_id, Some(6021));
     }
 }

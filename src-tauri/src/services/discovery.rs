@@ -89,7 +89,9 @@ pub async fn scan(
                 let scheme = if port == 3001 { "https" } else { "http" };
                 let base_url = format!("{scheme}://{host}:{port}");
                 let started = Instant::now();
-                let identity = probe_endpoint(&base_url, state.client.clone()).await.ok();
+                let identity = probe_endpoint(&base_url, state.transport.clone())
+                    .await
+                    .ok();
                 let _ = app.emit(
                     "scan-progress",
                     ScanProgress {
