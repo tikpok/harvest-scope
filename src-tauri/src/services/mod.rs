@@ -1,7 +1,12 @@
+pub mod csv_export;
 pub mod desktop;
 pub mod diagnostic;
 pub mod discovery;
 pub mod monitor;
+pub mod monitor_alerts;
+pub mod node_config;
+pub mod node_registration;
 #[cfg(target_os = "windows")]
 pub mod power;
+pub mod topology;
 pub mod websocket;
