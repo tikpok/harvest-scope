@@ -1,5 +1,14 @@
 # 変更履歴
 
+## 1.1.1
+
+- Windows自動起動が無効な環境でテーマ変更などの設定保存が失敗する問題を修正しました。
+- テーマ変更に失敗した場合、上部バーへ理由を表示するようにしました。
+- LANスキャンで検出したNIS1ノードにも、任意のSupernode IDを明示設定できるようにしました。
+- 手動登録をSymbol REST API、Symbol Peer、Symbol Peer + Voting、NIS1の4モードへ分け、Supernode IDをNIS1選択時だけ表示するようにしました。
+- HTTP接続のSymbol RESTノードとSymbol Peerノードでも、Peer TLSからノード証明書期限を取得するようにしました。
+- Windows配布用の高DPIアイコン指定を復旧し、設定されたbundle iconが実在することをビルド前に検証します。
+
 ## 1.1.0
 
 - 必要Rustバージョン（MSRV）を1.89へ更新し、CIで1.89.0と最新stableを検証します。

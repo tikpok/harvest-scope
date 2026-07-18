@@ -1,4 +1,4 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { access, readFile, writeFile } from "node:fs/promises";
 import process from "node:process";
 
 const files = {
@@ -47,7 +47,7 @@ function assertValidVersion(version) {
 }
 
 async function check() {
-  const { versions } = await readVersions();
+  const { tauriConfig, versions } = await readVersions();
   const expected = versions[files.package];
   assertValidVersion(expected);
   const mismatches = Object.entries(versions).filter(([, version]) => version !== expected);
@@ -55,6 +55,18 @@ async function check() {
   if (mismatches.length > 0) {
     const details = Object.entries(versions).map(([file, version]) => `  ${file}: ${version ?? "未設定"}`).join("\n");
     throw new Error(`版番号が一致していません。\n${details}\n\nnpm run version:set -- <version> で揃えてください。`);
+  }
+
+  const bundleIcons = tauriConfig.bundle?.icon;
+  if (!Array.isArray(bundleIcons) || bundleIcons.length === 0) {
+    throw new Error(`${files.tauri}のbundle.iconが設定されていません。`);
+  }
+  for (const icon of bundleIcons) {
+    try {
+      await access(`src-tauri/${icon}`);
+    } catch {
+      throw new Error(`${files.tauri}のbundle.iconが存在しません: ${icon}`);
+    }
   }
 
   console.log(`Version OK: ${expected}`);

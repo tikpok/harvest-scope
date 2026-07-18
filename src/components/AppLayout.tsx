@@ -69,6 +69,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
           <button className="icon-button mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="メニューを開く"><Menu /></button>
           <div className="topbar__title"><h1>{routeTitle.title}</h1><p>{routeTitle.description}</p></div>
           <div className="live-indicator"><span />監視エンジン稼働中</div>
+          {changeTheme.error && <div className="theme-error" role="alert">テーマを変更できません: {String(changeTheme.error)}</div>}
           <button className="icon-button theme-toggle" aria-label={dark ? "ライトテーマに切り替え" : "ダークテーマに切り替え"} title={dark ? "ライトテーマ" : "ダークテーマ"} disabled={changeTheme.isPending} onClick={() => changeTheme.mutate(dark ? "light" : "dark")}>{dark ? <Sun size={17} /> : <Moon size={17} />}</button>
         </header>
         <div className="page">{children}</div>

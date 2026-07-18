@@ -467,7 +467,7 @@ function NodeDetailPage() {
       <article className="panel detail-card"><h3>チェーン</h3><dl><div><dt>高さ</dt><dd>{isPeerMonitor(data.node) ? "対象外" : data.node.height ?? "—"}</dd></div><div><dt>ファイナライズ高</dt><dd>{isPeerMonitor(data.node) ? "対象外" : data.node.finalizedHeight ?? "対象外"}</dd></div><div><dt>同期遅延</dt><dd>{isPeerMonitor(data.node) ? "対象外" : data.node.lag ?? "—"}</dd></div><div><dt>チェーンスコア</dt><dd className="mono text-truncate">{isPeerMonitor(data.node) ? "対象外" : data.chainScore ?? "—"}</dd></div></dl></article>
       <article className="panel detail-card"><h3>ノード</h3><dl><div><dt>種別</dt><dd>{nodeKindLabel(detailNode)}</dd></div><div><dt>ネットワーク</dt><dd>{formatNetwork(data.node.network)}</dd></div><div><dt>バージョン</dt><dd>{data.node.version ?? "—"}</dd></div><div><dt>REST</dt><dd>{isPeerMonitor(data.node) ? "対象外" : data.restVersion ?? "—"}</dd></div></dl></article>
       <article className="panel detail-card"><h3>接続</h3><dl><div><dt>{isPeerMonitor(data.node) ? "P2P応答" : "REST応答"}</dt><dd>{formatLatency(data.node.latencyMs)}</dd></div><div><dt>ピア</dt><dd>{isPeerMonitor(data.node) ? "対象外" : data.node.peerCount ?? "—"}</dd></div><div><dt>API / DB</dt><dd>{isPeerMonitor(data.node) ? "対象外" : [data.apiStatus, data.dbStatus].filter(Boolean).join(" / ") || "—"}</dd></div><div><dt>WebSocket</dt><dd>{isPeerMonitor(data.node) ? "対象外" : data.node.kind === "symbol" ? (data.websocketConnected ? "接続中" : "RESTへフォールバック") : "対象外"}</dd></div></dl></article>
-      <article className="panel detail-card certificate-card"><h3>証明書</h3>{data.node.kind !== "symbol" ? <p className="harvest-empty">Symbolノードのみ対象です。</p> : <><dl><div><dt>ノード証明書</dt><dd>{isPeerMonitor(data.node) ? "対象外" : formatTime(data.node.nodeCertificateNotAfter)}</dd></div><div><dt>残り日数</dt><dd className={data.node.nodeCertificateRemainingDays != null && data.node.nodeCertificateRemainingDays <= 7 ? "text-warn" : undefined}>{isPeerMonitor(data.node) ? "対象外" : formatDays(data.node.nodeCertificateRemainingDays)}</dd></div><div><dt>投票キー範囲</dt><dd>{hasRole(data, "Voting") || !isPeerMonitor(data.node) ? (data.node.votingKeyStartEpoch != null || data.node.votingKeyEndEpoch != null ? `${data.node.votingKeyStartEpoch ?? "—"} - ${data.node.votingKeyEndEpoch ?? "—"}` : "—") : "対象外"}</dd></div><div><dt>残りepoch</dt><dd className={data.node.votingKeyRemainingEpochs != null && data.node.votingKeyRemainingEpochs <= 7 ? "text-warn" : undefined}>{hasRole(data, "Voting") || !isPeerMonitor(data.node) ? formatEpochs(data.node.votingKeyRemainingEpochs) : "対象外"}</dd></div><div><dt>現在epoch</dt><dd>{hasRole(data, "Voting") || !isPeerMonitor(data.node) ? data.node.finalizationEpoch ?? "—" : "対象外"}</dd></div></dl>{data.node.certificateMetricError && <p className="harvest-error">取得エラー: {data.node.certificateMetricError}</p>}</>}</article>
+      <article className="panel detail-card certificate-card"><h3>証明書</h3>{data.node.kind !== "symbol" ? <p className="harvest-empty">Symbolノードのみ対象です。</p> : <><dl><div><dt>ノード証明書</dt><dd>{formatTime(data.node.nodeCertificateNotAfter)}</dd></div><div><dt>残り日数</dt><dd className={data.node.nodeCertificateRemainingDays != null && data.node.nodeCertificateRemainingDays <= 7 ? "text-warn" : undefined}>{formatDays(data.node.nodeCertificateRemainingDays)}</dd></div><div><dt>投票キー範囲</dt><dd>{hasRole(data, "Voting") || !isPeerMonitor(data.node) ? (data.node.votingKeyStartEpoch != null || data.node.votingKeyEndEpoch != null ? `${data.node.votingKeyStartEpoch ?? "—"} - ${data.node.votingKeyEndEpoch ?? "—"}` : "—") : "対象外"}</dd></div><div><dt>残りepoch</dt><dd className={data.node.votingKeyRemainingEpochs != null && data.node.votingKeyRemainingEpochs <= 7 ? "text-warn" : undefined}>{hasRole(data, "Voting") || !isPeerMonitor(data.node) ? formatEpochs(data.node.votingKeyRemainingEpochs) : "対象外"}</dd></div><div><dt>現在epoch</dt><dd>{hasRole(data, "Voting") || !isPeerMonitor(data.node) ? data.node.finalizationEpoch ?? "—" : "対象外"}</dd></div></dl>{data.node.certificateMetricError && <p className="harvest-error">取得エラー: {data.node.certificateMetricError}</p>}</>}</article>
       <article className="panel detail-card harvest-card"><div className="detail-card__heading"><h3>委任ハーベスト</h3>{data.node.kind === "symbol" && <label className="mini-toggle"><input type="checkbox" checked={data.node.showHarvestMetrics} disabled={toggleHarvest.isPending} onChange={(event) => toggleHarvest.mutate(event.target.checked)} />表示</label>}</div>{data.node.kind !== "symbol" ? <p className="harvest-empty">Symbolノードのみ対象です。</p> : data.node.showHarvestMetrics ? <><dl><div><dt>委任者数</dt><dd>{data.node.delegatedHarvesterCount ?? "—"}</dd></div><div><dt>24時間増減</dt><dd>{formatDelta(data.node.delegatedHarvesterDelta)}</dd></div><div><dt>合計XYM</dt><dd>{formatXym(data.node.totalBalanceMicroXym)}</dd></div><div><dt>最新検知</dt><dd>{formatTime(data.node.latestHarvestAt)}</dd></div></dl>{data.node.harvestMetricError && <p className="harvest-error">取得エラー: {data.node.harvestMetricError}</p>}<HarvestEventList events={data.recentHarvests} /></> : <p className="harvest-empty">表示をONにすると委任ハーベスト情報を表示します。</p>}</article>
       <article className="panel detail-card supernode-card"><h3>Supernodeプログラム</h3>{data.node.kind !== "nis1" ? <p className="harvest-empty">NIS1ノードのみ対象です。</p> : data.node.supernodeStatus === "not_found" ? <p className="harvest-empty">Supernode対象リストに見つかりません。</p> : <><dl><div><dt>対象ID</dt><dd>{data.node.supernodeId ?? "—"}</dd></div><div><dt>状態</dt><dd>{data.node.supernodeStatus ?? "—"}</dd></div><div><dt>最新ラウンド</dt><dd>{data.node.supernodeLastRound ?? "—"}</dd></div><div><dt>最終チェック</dt><dd>{formatTime(data.node.supernodeLastRoundAt)}</dd></div><div><dt>総合合否</dt><dd className={data.node.supernodeChecksPassed === false ? "text-warn" : data.node.supernodeChecksPassed === true ? "text-good" : undefined}>{data.node.supernodeChecksPassed == null ? "—" : data.node.supernodeChecksPassed ? "合格" : "失敗"}</dd></div><div><dt>失敗項目</dt><dd>{formatFailedChecks(data.node.supernodeFailedChecks)}</dd></div></dl>{data.node.supernodeMetricError && <p className="harvest-error">取得エラー: {data.node.supernodeMetricError}</p>}</>}</article>
     </section>
@@ -489,16 +489,19 @@ function NodeDetailPage() {
   </>;
 }
 
+type ManualNodeMode = "symbol-api" | "symbol-peer" | "symbol-peer-voting" | "nis1";
+
 function DiscoveryPage() {
   const queryClient = useQueryClient();
   const { data: interfaces = [] } = useQuery({ queryKey: ["interfaces"], queryFn: api.interfaces });
   const [cidr, setCidr] = useState("");
   const [ports, setPorts] = useState("3000,3001,7890");
-  const [manualMode, setManualMode] = useState<"api" | "peer" | "peer-voting">("api");
+  const [manualMode, setManualMode] = useState<ManualNodeMode>("symbol-api");
   const [manualUrl, setManualUrl] = useState("");
   const [peerPublicKey, setPeerPublicKey] = useState("");
   const [peerNetwork, setPeerNetwork] = useState("Symbol Mainnet");
   const [supernodeId, setSupernodeId] = useState("");
+  const [candidateSupernodeIds, setCandidateSupernodeIds] = useState<Record<string, string>>({});
   const { data: supernodes = [] } = useQuery({ queryKey: ["supernodes"], queryFn: api.supernodes, staleTime: 10 * 60 * 1000 });
   const scan = useMutation({ mutationFn: api.scan });
   const add = useMutation({
@@ -519,7 +522,7 @@ function DiscoveryPage() {
   function submitScan(event: FormEvent) { event.preventDefault(); scan.mutate({ cidr, ports: ports.split(",").map(Number).filter((port) => Number.isInteger(port)) }); }
   function addManual(event: FormEvent) {
     event.preventDefault();
-    const input = manualMode === "peer"
+    const input = manualMode === "symbol-peer"
       ? {
           baseUrl: manualUrl,
           kind: "symbol" as const,
@@ -528,7 +531,7 @@ function DiscoveryPage() {
           publicKey: undefined,
           roles: ["Peer"],
         }
-      : manualMode === "peer-voting"
+      : manualMode === "symbol-peer-voting"
       ? {
           baseUrl: manualUrl,
           kind: "symbol" as const,
@@ -537,19 +540,84 @@ function DiscoveryPage() {
           publicKey: peerPublicKey.trim() || undefined,
           roles: ["Peer", "Voting"],
         }
-      : { baseUrl: manualUrl.trim(), supernodeId: supernodeId ? Number(supernodeId) : undefined };
-    add.mutate(input, { onSuccess: () => { setManualUrl(""); setPeerPublicKey(""); } });
+      : manualMode === "nis1"
+      ? {
+          baseUrl: manualUrl.trim(),
+          kind: "nis1" as const,
+          ...(supernodeId ? { supernodeId: Number(supernodeId) } : {}),
+        }
+      : { baseUrl: manualUrl.trim(), kind: "symbol" as const };
+    add.mutate(input, { onSuccess: () => { setManualUrl(""); setPeerPublicKey(""); setSupernodeId(""); } });
   }
-  function addCandidate(candidate: ScanCandidate) { add.mutate({ baseUrl: candidate.baseUrl, displayName: candidate.name ?? undefined, kind: candidate.kind }); }
+  function addCandidate(candidate: ScanCandidate) {
+    const selectedSupernodeId = candidateSupernodeIds[candidate.baseUrl];
+    add.mutate({
+      baseUrl: candidate.baseUrl,
+      displayName: candidate.name ?? undefined,
+      kind: candidate.kind,
+      ...(candidate.kind === "nis1" && selectedSupernodeId ? { supernodeId: Number(selectedSupernodeId) } : {}),
+    }, {
+      onSuccess: () => setCandidateSupernodeIds((current) => {
+        const next = { ...current };
+        delete next[candidate.baseUrl];
+        return next;
+      }),
+    });
+  }
   return <>
     <div className="page-heading"><div><h2>ノード検出</h2><p>選択したCIDRだけを明示的にスキャンします。URLから手動登録する事もできます。</p></div></div>
     <section className="split-grid">
       <form className="panel form-card" onSubmit={submitScan}><h3>LANをスキャン</h3><label>ネットワーク候補<select value={cidr} onChange={(event) => setCidr(event.target.value)}>{!cidr && <option value="">ネットワークを選択</option>}{cidr && !interfaces.some((item) => item.cidr === cidr) && <option value={cidr}>{cidr}</option>}{interfaces.map((item) => <option key={`${item.name}-${item.cidr}`} value={item.cidr}>{item.name} — {item.cidr}</option>)}</select></label><label>CIDR<input value={cidr} onChange={(event) => setCidr(event.target.value)} required /></label><label>ポート（カンマ区切り）<input value={ports} onChange={(event) => setPorts(event.target.value)} required /></label><div className="actions"><button className="button button--primary" disabled={scan.isPending}><Search size={16} />{scan.isPending ? "スキャン中…" : "スキャン開始"}</button>{scan.isPending && <button type="button" className="button" onClick={() => api.cancelScan()}>キャンセル</button>}</div><p className="form-hint">最大1,024アドレス、既定ポート3000 / 3001 / 7890</p></form>
-      <form className="panel form-card" onSubmit={addManual}><h3>ノードを手動登録</h3><label>監視モード<select value={manualMode} onChange={(event) => { setManualMode(event.target.value as "api" | "peer" | "peer-voting"); if (add.isSuccess || add.isError) add.reset(); }}><option value="api">REST APIノード</option><option value="peer">Peerノード</option><option value="peer-voting">Peer + Votingノード</option></select></label><label>{manualMode === "api" ? "IP・DNS" : "Peerエンドポイント"}<input type="text" inputMode={manualMode === "api" ? "url" : undefined} value={manualUrl} onChange={(event) => { setManualUrl(event.target.value); if (add.isSuccess || add.isError) add.reset(); }} placeholder={manualMode === "api" ? "node.example.invalid" : "peer.example.invalid:7900"} required /></label>{manualMode === "api" && <label>Supernode（NIS1・任意）<select value={supernodeId} onChange={(event) => setSupernodeId(event.target.value)}><option value="">自動判定（endpoint一致のみ）</option>{supernodes.map((node) => <option key={node.id} value={node.id}>#{node.id} {node.name ?? node.endpoint}</option>)}</select></label>}{manualMode !== "api" && <label>ネットワーク<input value={peerNetwork} onChange={(event) => setPeerNetwork(event.target.value)} placeholder="Symbol Mainnet" required={manualMode === "peer-voting"} /></label>}{manualMode === "peer-voting" && <label>公開鍵<input value={peerPublicKey} onChange={(event) => setPeerPublicKey(event.target.value)} placeholder="必須" required /></label>}<button className="button button--primary" disabled={add.isPending}><Plus size={16} />{add.isPending ? "登録中…" : "登録して確認開始"}</button><p className="form-hint">{manualMode === "api" ? "IP・DNSだけならHTTPS:3001を使用します。http://を明示した場合は暗号化されない接続への確認が必要です。" : manualMode === "peer-voting" ? "登録後すぐ一覧に追加し、P2P疎通とVoting期限をバックグラウンドで確認します。" : "登録後すぐ一覧に追加し、P2Pポートの疎通をバックグラウンドで確認します。"}</p></form>
+      <form className="panel form-card" onSubmit={addManual}>
+        <h3>ノードを手動登録</h3>
+        <label>監視モード
+          <select value={manualMode} onChange={(event) => {
+            const nextMode = event.target.value as ManualNodeMode;
+            setManualMode(nextMode);
+            if (nextMode !== "nis1") setSupernodeId("");
+            if (add.isSuccess || add.isError) add.reset();
+          }}>
+            <option value="symbol-api">Symbol / REST API</option>
+            <option value="symbol-peer">Symbol / Peer</option>
+            <option value="symbol-peer-voting">Symbol / Peer, Voting</option>
+            <option value="nis1">NIS1</option>
+          </select>
+        </label>
+        <label>{manualMode === "symbol-peer" || manualMode === "symbol-peer-voting" ? "Peerエンドポイント" : "IP・DNS"}
+          <input
+            type="text"
+            inputMode={manualMode === "symbol-peer" || manualMode === "symbol-peer-voting" ? undefined : "url"}
+            value={manualUrl}
+            onChange={(event) => { setManualUrl(event.target.value); if (add.isSuccess || add.isError) add.reset(); }}
+            placeholder={manualMode === "symbol-peer" || manualMode === "symbol-peer-voting" ? "peer.example.invalid:7900" : "node.example.invalid"}
+            required
+          />
+        </label>
+        {manualMode === "nis1" && <label>Supernode ID（任意）
+          <select value={supernodeId} onChange={(event) => setSupernodeId(event.target.value)}>
+            <option value="">自動判定（endpoint一致のみ）</option>
+            {supernodes.map((node) => <option key={node.id} value={node.id}>#{node.id} {node.name ?? node.endpoint}</option>)}
+          </select>
+        </label>}
+        {(manualMode === "symbol-peer" || manualMode === "symbol-peer-voting") && <label>ネットワーク
+          <input value={peerNetwork} onChange={(event) => setPeerNetwork(event.target.value)} placeholder="Symbol Mainnet" required={manualMode === "symbol-peer-voting"} />
+        </label>}
+        {manualMode === "symbol-peer-voting" && <label>公開鍵
+          <input value={peerPublicKey} onChange={(event) => setPeerPublicKey(event.target.value)} placeholder="必須" required />
+        </label>}
+        <button className="button button--primary" disabled={add.isPending}><Plus size={16} />{add.isPending ? "登録中…" : "登録して確認開始"}</button>
+        <p className="form-hint">{
+          manualMode === "symbol-api" || manualMode === "nis1"
+            ? "IP・DNSだけの時は自動的にHTTPS:3001を使用します。http://を明示した場合は暗号化されない接続となるのでポート番号まで入力してください。"
+            : manualMode === "symbol-peer-voting"
+            ? "登録後すぐ一覧に追加し、P2P疎通とVoting期限をバックグラウンドで確認します。"
+            : "登録後すぐ一覧に追加し、P2Pポートの疎通をバックグラウンドで確認します。"
+        }</p>
+      </form>
     </section>
     {(scan.error || add.error) && <div className="notice notice--error">{String(scan.error ?? add.error)}</div>}
     {add.isSuccess && <div className="notice notice--success">「{add.data.displayName}」を登録しました。<small>{add.data.baseUrl}</small></div>}
-    <section className="panel"><div className="panel__header"><div><h2>検出候補</h2><p>{scan.data?.length ?? 0}件のノードを検出</p></div></div>{scan.data?.length ? <div className="candidate-grid">{scan.data.map((candidate) => <article className="candidate" key={candidate.baseUrl}><div><span className={`kind kind--${candidate.kind}`}>{candidate.kind === "symbol" ? "Symbol" : "NIS1"}</span><h3>{candidate.name || candidate.baseUrl}</h3><p>{candidate.baseUrl}</p><small>{candidate.network ?? "ネットワーク未確認"} · {candidate.latencyMs} ms</small></div><button className="button" onClick={() => addCandidate(candidate)}><Plus size={16} />登録</button></article>)}</div> : <EmptyState title="まだスキャンしていません">CIDRとポートを確認して、スキャンを開始してください。</EmptyState>}</section>
+    <section className="panel"><div className="panel__header"><div><h2>検出候補</h2><p>{scan.data?.length ?? 0}件のノードを検出</p></div></div>{scan.data?.length ? <div className="candidate-grid">{scan.data.map((candidate) => <article className="candidate" key={candidate.baseUrl}><div className="candidate__info"><span className={`kind kind--${candidate.kind}`}>{candidate.kind === "symbol" ? "Symbol" : "NIS1"}</span><h3>{candidate.name || candidate.baseUrl}</h3><p>{candidate.baseUrl}</p><small>{candidate.network ?? "ネットワーク未確認"} · {candidate.latencyMs} ms</small>{candidate.kind === "nis1" && <label className="candidate__supernode">Supernode（任意）<select value={candidateSupernodeIds[candidate.baseUrl] ?? ""} onChange={(event) => setCandidateSupernodeIds((current) => ({ ...current, [candidate.baseUrl]: event.target.value }))}><option value="">自動判定（endpoint一致のみ）</option>{supernodes.map((node) => <option key={node.id} value={node.id}>#{node.id} {node.name ?? node.endpoint}</option>)}</select></label>}</div><button className="button" disabled={add.isPending} onClick={() => addCandidate(candidate)}><Plus size={16} />登録</button></article>)}</div> : <EmptyState title="まだスキャンしていません">CIDRとポートを確認して、スキャンを開始してください。</EmptyState>}</section>
   </>;
 }
 

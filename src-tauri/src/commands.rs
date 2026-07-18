@@ -420,6 +420,10 @@ fn validate_settings(settings: &AppSettings) -> AppResult<()> {
     Ok(())
 }
 
+fn autostart_action(currently_enabled: bool, requested_enabled: bool) -> Option<bool> {
+    (currently_enabled != requested_enabled).then_some(requested_enabled)
+}
+
 #[tauri::command]
 pub async fn update_settings(
     app: AppHandle,
@@ -427,14 +431,22 @@ pub async fn update_settings(
     settings: AppSettings,
 ) -> AppResult<AppSettings> {
     validate_settings(&settings)?;
-    if settings.autostart_enabled {
-        app.autolaunch()
-            .enable()
+    {
+        let autolaunch = app.autolaunch();
+        let currently_enabled = autolaunch
+            .is_enabled()
             .map_err(|error| AppError::Configuration(error.to_string()))?;
-    } else {
-        app.autolaunch()
-            .disable()
-            .map_err(|error| AppError::Configuration(error.to_string()))?;
+        if let Some(enable) = autostart_action(currently_enabled, settings.autostart_enabled) {
+            if enable {
+                autolaunch
+                    .enable()
+                    .map_err(|error| AppError::Configuration(error.to_string()))?;
+            } else {
+                autolaunch
+                    .disable()
+                    .map_err(|error| AppError::Configuration(error.to_string()))?;
+            }
+        }
     }
     state.repository.save_settings(&settings).await?;
     state.set_background_monitoring(settings.background_monitoring);
@@ -633,5 +645,17 @@ mod tests {
             ..AppSettings::default()
         };
         assert!(validate_settings(&settings).is_err());
+    }
+
+    #[test]
+    fn unchanged_disabled_autostart_does_not_trigger_registry_update() {
+        assert_eq!(autostart_action(false, false), None);
+    }
+
+    #[test]
+    fn changed_autostart_triggers_only_the_requested_registry_update() {
+        assert_eq!(autostart_action(false, true), Some(true));
+        assert_eq!(autostart_action(true, false), Some(false));
+        assert_eq!(autostart_action(true, true), None);
     }
 }

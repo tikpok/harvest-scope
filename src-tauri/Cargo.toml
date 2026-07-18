@@ -1,6 +1,6 @@
 [package]
 name = "harvest-scope"
-version = "1.1.0"
+version = "1.1.1"
 description = "Harvest Scope desktop monitor for Symbol and NEM NIS1 nodes"
 authors = ["tikpok"]
 edition = "2021"
@@ -22,6 +22,7 @@ futures-util = "0.3"
 ipnet = "2.10"
 local-ip-address = "0.6"
 rand = "0.9"
+rcgen = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = "1"

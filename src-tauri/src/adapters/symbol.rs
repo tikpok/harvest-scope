@@ -1,12 +1,20 @@
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use chrono::{NaiveDate, TimeZone, Utc};
+use rcgen::{
+    BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
+    PKCS_ED25519,
+};
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    DigitallySignedStruct, SignatureScheme,
+    ClientConfig, DigitallySignedStruct, SignatureScheme,
 };
-use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls_pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -23,6 +31,46 @@ use crate::{
 use super::{string_value, u64_value};
 
 const CERTIFICATE_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn build_symbol_peer_client_config() -> Result<Arc<ClientConfig>, String> {
+    let ca_key = KeyPair::generate_for(&PKCS_ED25519).map_err(|error| error.to_string())?;
+    let mut ca_params =
+        CertificateParams::new(Vec::<String>::new()).map_err(|error| error.to_string())?;
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+    ];
+    let ca_certificate = ca_params
+        .self_signed(&ca_key)
+        .map_err(|error| error.to_string())?;
+
+    let node_key = KeyPair::generate_for(&PKCS_ED25519).map_err(|error| error.to_string())?;
+    let mut node_params =
+        CertificateParams::new(Vec::<String>::new()).map_err(|error| error.to_string())?;
+    node_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    node_params.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ClientAuth,
+        ExtendedKeyUsagePurpose::ServerAuth,
+    ];
+    let node_certificate = node_params
+        .signed_by(&node_key, &ca_certificate, &ca_key)
+        .map_err(|error| error.to_string())?;
+    let certificate_chain = vec![node_certificate.der().clone(), ca_certificate.der().clone()];
+    let private_key = PrivatePkcs8KeyDer::from(node_key.serialize_der());
+    let config = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(CertificateOnlyVerifier))
+        .with_client_auth_cert(certificate_chain, private_key.into())
+        .map_err(|error| error.to_string())?;
+    Ok(Arc::new(config))
+}
+
+fn symbol_peer_client_config() -> Result<Arc<ClientConfig>, String> {
+    static CONFIG: OnceLock<Result<Arc<ClientConfig>, String>> = OnceLock::new();
+    CONFIG.get_or_init(build_symbol_peer_client_config).clone()
+}
 
 pub struct SymbolAdapter {
     base_url: String,
@@ -418,16 +466,20 @@ impl SymbolAdapter {
         Self::parse_asn1_time(tag, not_after)
     }
 
-    async fn fetch_tls_certificate_not_after(&self) -> Result<Option<i64>, String> {
-        let url = url::Url::parse(&self.base_url).map_err(|error| error.to_string())?;
-        if url.scheme() != "https" {
-            return Ok(None);
-        }
+    fn peer_target_from_api_info(base_url: &str, info: &Value) -> Result<(String, u16), String> {
+        let url = url::Url::parse(base_url).map_err(|error| error.to_string())?;
         let host = url
             .host_str()
-            .ok_or_else(|| "HTTPS URLにホストがありません".to_string())?
+            .ok_or_else(|| "REST URLにホストがありません".to_string())?
             .to_owned();
-        let port = url.port_or_known_default().unwrap_or(443);
+        let port = u64_value(info.get("port"))
+            .and_then(|value| u16::try_from(value).ok())
+            .filter(|port| *port > 0)
+            .ok_or_else(|| "node/infoに有効なPeerポートがありません".to_string())?;
+        Ok((host, port))
+    }
+
+    async fn fetch_peer_certificate_at(host: String, port: u16) -> Result<i64, String> {
         let stream = tokio::time::timeout(
             CERTIFICATE_FETCH_TIMEOUT,
             TcpStream::connect((host.as_str(), port)),
@@ -437,11 +489,7 @@ impl SymbolAdapter {
         .map_err(|error| error.to_string())?;
         let server_name =
             ServerName::try_from(host).map_err(|_| "TLS ServerNameを作成できません".to_string())?;
-        let config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(CertificateOnlyVerifier))
-            .with_no_client_auth();
-        let connector = TlsConnector::from(Arc::new(config));
+        let connector = TlsConnector::from(symbol_peer_client_config()?);
         let tls = tokio::time::timeout(
             CERTIFICATE_FETCH_TIMEOUT,
             connector.connect(server_name, stream),
@@ -455,8 +503,36 @@ impl SymbolAdapter {
             .and_then(|certificates| certificates.first())
             .ok_or_else(|| "TLS証明書が提示されませんでした".to_string())?;
         Self::parse_certificate_not_after_ms(certificate.as_ref())
-            .map(Some)
             .map_err(|error| error.to_string())
+    }
+
+    pub async fn fetch_peer_certificate_not_after(endpoint: &str) -> Result<i64, String> {
+        let (host, port) =
+            super::endpoint_host_port(endpoint).map_err(|error| error.to_string())?;
+        Self::fetch_peer_certificate_at(host, port).await
+    }
+
+    pub async fn fetch_peer_certificate_metrics(
+        endpoint: &str,
+    ) -> Result<CertificateSnapshot, String> {
+        let not_after = Self::fetch_peer_certificate_not_after(endpoint).await?;
+        Ok(CertificateSnapshot {
+            node_certificate_not_after: Some(not_after),
+            node_certificate_remaining_days: Some(Self::remaining_days(
+                not_after,
+                chrono::Utc::now().timestamp_millis(),
+            )),
+            ..CertificateSnapshot::default()
+        })
+    }
+
+    async fn fetch_node_certificate_not_after(&self) -> Result<i64, String> {
+        let info = self
+            .get_json("/node/info")
+            .await
+            .map_err(|error| error.to_string())?;
+        let (host, port) = Self::peer_target_from_api_info(&self.base_url, &info)?;
+        Self::fetch_peer_certificate_at(host, port).await
     }
 
     pub async fn fetch_voting_key_snapshot_for_public_key(
@@ -776,13 +852,12 @@ impl NodeAdapter for SymbolAdapter {
         let now = chrono::Utc::now().timestamp_millis();
         let mut errors = Vec::new();
 
-        match self.fetch_tls_certificate_not_after().await {
-            Ok(Some(not_after)) => {
+        match self.fetch_node_certificate_not_after().await {
+            Ok(not_after) => {
                 snapshot.node_certificate_not_after = Some(not_after);
                 snapshot.node_certificate_remaining_days =
                     Some(Self::remaining_days(not_after, now));
             }
-            Ok(None) => {}
             Err(error) => errors.push(format!("node certificate: {error}")),
         }
 
@@ -939,5 +1014,26 @@ mod tests {
     fn remaining_certificate_days_rounds_expired_values_down() {
         assert_eq!(SymbolAdapter::remaining_days(1_001, 1_000), 1);
         assert_eq!(SymbolAdapter::remaining_days(999, 1_000), -1);
+    }
+
+    #[test]
+    fn derives_peer_certificate_target_from_http_rest_without_changing_host() {
+        assert_eq!(
+            SymbolAdapter::peer_target_from_api_info(
+                "http://192.0.2.20:3000",
+                &serde_json::json!({ "host": "other.example.invalid", "port": 7900 }),
+            )
+            .unwrap(),
+            ("192.0.2.20".into(), 7900)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_peer_certificate_port_from_node_info() {
+        assert!(SymbolAdapter::peer_target_from_api_info(
+            "http://node.example.invalid:3000",
+            &serde_json::json!({ "port": 0 }),
+        )
+        .is_err());
     }
 }

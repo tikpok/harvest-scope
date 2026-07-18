@@ -37,6 +37,9 @@ vi.mock("./services/ipc", async () => {
       exportNodeConfig: vi.fn(),
       importNodeConfig: vi.fn(),
       interfaces: vi.fn().mockResolvedValue([]),
+      supernodes: vi.fn().mockResolvedValue([]),
+      scan: vi.fn(),
+      cancelScan: vi.fn().mockResolvedValue(undefined),
     },
   };
 });
@@ -184,6 +187,9 @@ beforeEach(() => {
   vi.mocked(api.exportNodeConfig).mockResolvedValue(null);
   vi.mocked(api.importNodeConfig).mockReset();
   vi.mocked(api.importNodeConfig).mockResolvedValue(null);
+  vi.mocked(api.supernodes).mockResolvedValue([]);
+  vi.mocked(api.scan).mockReset();
+  vi.mocked(api.cancelScan).mockResolvedValue(undefined);
 });
 
 test("日本語ダッシュボードを表示する", async () => {
@@ -398,6 +404,39 @@ test("NIS1詳細でSupernodeプログラムの失敗項目を表示する", asyn
   expect(screen.getByText("帯域")).toBeInTheDocument();
 });
 
+test("Peerノード詳細にもノード証明書期限を表示する", async () => {
+  const notAfter = 1_783_645_323_000;
+  const peerNode = {
+    ...node("peer-1", "Peer Node"),
+    monitorMode: "peer" as const,
+    baseUrl: "tcp://peer.example.invalid:7900",
+    nodeCertificateNotAfter: notAfter,
+    nodeCertificateRemainingDays: 12,
+  };
+  vi.mocked(api.nodeDetail).mockResolvedValue({
+    node: peerNode,
+    publicKey: null,
+    roles: ["Peer"],
+    restVersion: null,
+    chainScore: null,
+    apiStatus: null,
+    dbStatus: null,
+    nisStatusCode: null,
+    peers: [],
+    websocketConnected: false,
+    recentHarvests: [],
+    transportRejectedCount: 0,
+    lastTransportRejectionAt: null,
+    lastTransportRejectionReason: null,
+  });
+  renderApp("/nodes/peer-1");
+
+  const certificateCard = (await screen.findByRole("heading", { name: "証明書" })).closest("article");
+  expect(certificateCard).not.toBeNull();
+  expect(within(certificateCard!).getByText(new Intl.DateTimeFormat("ja-JP", { dateStyle: "short", timeStyle: "medium" }).format(notAfter))).toBeInTheDocument();
+  expect(within(certificateCard!).getByText("12 日")).toBeInTheDocument();
+});
+
 test("REST未検出ノード詳細のピア情報はトポロジー案内を表示する", async () => {
   const observedOnlyNode = {
     ...node("4", "Observed API Node"),
@@ -535,7 +574,7 @@ test("URLだけで登録し成功結果を表示する", async () => {
   fireEvent.click(screen.getByRole("button", { name: "登録して確認開始" }));
 
   await waitFor(() => expect(api.upsertNode).toHaveBeenCalled());
-  expect(vi.mocked(api.upsertNode).mock.calls[0][0]).toEqual({ baseUrl: registered.baseUrl });
+  expect(vi.mocked(api.upsertNode).mock.calls[0][0]).toEqual({ baseUrl: registered.baseUrl, kind: "symbol" });
   expect(await screen.findByText("「Symbol API Node」を登録しました。")).toBeInTheDocument();
   expect(screen.getByText(registered.baseUrl)).toBeInTheDocument();
   expect(url).toHaveValue("");
@@ -554,7 +593,87 @@ test("APIノード登録はIP・DNSをそのまま自動検出へ渡す", async 
   fireEvent.click(screen.getByRole("button", { name: "登録して確認開始" }));
 
   await waitFor(() => expect(api.upsertNode).toHaveBeenCalled());
-  expect(vi.mocked(api.upsertNode).mock.calls[0][0]).toEqual({ baseUrl: "202.61.248.218" });
+  expect(vi.mocked(api.upsertNode).mock.calls[0][0]).toEqual({ baseUrl: "202.61.248.218", kind: "symbol" });
+});
+
+test("手動登録を4モードに分けNIS1選択時だけSupernode IDを表示する", async () => {
+  vi.mocked(api.supernodes).mockResolvedValue([
+    { id: 6021, endpoint: "http://public.example.invalid:7890", name: "Public SN", status: "active" },
+  ]);
+  vi.mocked(api.upsertNode).mockResolvedValue({
+    ...node("nis1-manual", "Manual NIS1"),
+    kind: "nis1",
+    baseUrl: "http://node-lan.example.invalid:7890",
+    configuredSupernodeId: 6021,
+    supernodeId: 6021,
+  });
+  const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+  renderApp("/discovery");
+
+  const mode = await screen.findByLabelText("監視モード");
+  expect(within(mode).getAllByRole("option").map((option) => option.textContent)).toEqual([
+    "Symbol / REST API",
+    "Symbol / Peer",
+    "Symbol / Peer, Voting",
+    "NIS1",
+  ]);
+  expect(screen.queryByLabelText("Supernode ID（任意）")).not.toBeInTheDocument();
+  expect(screen.getByText("IP・DNSだけの時は自動的にHTTPS:3001を使用します。http://を明示した場合は暗号化されない接続となるのでポート番号まで入力してください。")).toBeInTheDocument();
+
+  fireEvent.change(mode, { target: { value: "nis1" } });
+  const supernode = await screen.findByLabelText("Supernode ID（任意）");
+  expect(screen.getByText("IP・DNSだけの時は自動的にHTTPS:3001を使用します。http://を明示した場合は暗号化されない接続となるのでポート番号まで入力してください。")).toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText("IP・DNS"), { target: { value: "http://node-lan.example.invalid:7890" } });
+  fireEvent.change(supernode, { target: { value: "6021" } });
+  fireEvent.click(screen.getByRole("button", { name: "登録して確認開始" }));
+
+  await waitFor(() => expect(api.upsertNode).toHaveBeenCalledWith(expect.objectContaining({
+    baseUrl: "http://node-lan.example.invalid:7890",
+    kind: "nis1",
+    supernodeId: 6021,
+    allowInsecureHttp: true,
+  })));
+  confirm.mockRestore();
+});
+
+test("LANスキャンで検出したNIS1へ明示したSupernode IDを設定する", async () => {
+  const candidate = {
+    baseUrl: "http://node-lan.example.invalid:7890",
+    kind: "nis1" as const,
+    name: "LAN NIS1",
+    network: "NEM Mainnet",
+    version: "0.6.101",
+    latencyMs: 12,
+  };
+  vi.mocked(api.scan).mockResolvedValue([candidate]);
+  vi.mocked(api.supernodes).mockResolvedValue([
+    { id: 6021, endpoint: "http://public.example.invalid:7890", name: "Public SN", status: "active" },
+  ]);
+  vi.mocked(api.upsertNode).mockResolvedValue({
+    ...node("nis1-lan", "LAN NIS1"),
+    kind: "nis1",
+    baseUrl: candidate.baseUrl,
+    configuredSupernodeId: 6021,
+    supernodeId: 6021,
+  });
+  const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+  renderApp("/discovery");
+
+  fireEvent.change(await screen.findByLabelText("CIDR"), { target: { value: "192.0.2.0/24" } });
+  fireEvent.click(screen.getByRole("button", { name: "スキャン開始" }));
+
+  const card = (await screen.findByText("LAN NIS1")).closest("article");
+  expect(card).not.toBeNull();
+  fireEvent.change(within(card!).getByLabelText("Supernode（任意）"), { target: { value: "6021" } });
+  fireEvent.click(within(card!).getByRole("button", { name: "登録" }));
+
+  await waitFor(() => expect(api.upsertNode).toHaveBeenCalledWith(expect.objectContaining({
+    baseUrl: candidate.baseUrl,
+    kind: "nis1",
+    supernodeId: 6021,
+    allowInsecureHttp: true,
+  })));
+  confirm.mockRestore();
 });
 
 const alert: AlertRecord = {
@@ -628,6 +747,19 @@ test("上部バーからライトテーマへ切り替える", async () => {
   const toggle = await screen.findByRole("button", { name: "ライトテーマに切り替え" });
   fireEvent.click(toggle);
   await waitFor(() => expect(api.updateSettings).toHaveBeenCalledWith(expect.objectContaining({ theme: "light" })));
+  await waitFor(() => expect(document.documentElement).toHaveAttribute("data-theme", "light"));
+  expect(screen.getByRole("button", { name: "ダークテーマに切り替え" })).toBeInTheDocument();
+});
+
+test("テーマ保存に失敗した理由を上部バーへ表示する", async () => {
+  vi.mocked(api.settings).mockResolvedValue({ ...defaultSettings, theme: "system", onboardingCompleted: true });
+  vi.mocked(api.updateSettings).mockRejectedValue(new Error("自動起動設定を変更できません"));
+  renderApp();
+
+  fireEvent.click(await screen.findByRole("button", { name: "ダークテーマに切り替え" }));
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("テーマを変更できません");
+  expect(screen.getByRole("alert")).toHaveTextContent("自動起動設定を変更できません");
 });
 
 test("設定画面からノード設定をエクスポートする", async () => {

@@ -1,12 +1,48 @@
-Source-Available Proprietary License
 
 Copyright (c) 2026 tikpok.
 
-Permission is granted to view and study this repository's source code.
-No permission is granted to use, copy, modify, distribute, sublicense, sell,
-or deploy this software or substantial portions of it without prior written
-permission from the copyright holder.
+Permission is granted to any person to:
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+1. view and study this repository's source code; and
+2. download, install, and execute unmodified official binary releases that are published by the copyright holder on this repository's GitHub Releases page, for any lawful purpose.
+
+The permission to use official binary releases does not grant permission to:
+
+- use the source code to build or deploy the software;
+- copy, modify, adapt, or create derivative works from the source code;
+- modify, repackage, redistribute, mirror, sublicense, sell, or otherwise make the source code or binary releases available to third parties;
+- remove or alter copyright, license, or attribution notices; or
+- use the copyright holder's name, trademarks, or branding to imply endorsement.
+
+Any permission not expressly granted by this license is reserved by the copyright holder. Additional permission may be granted separately in writing by the copyright holder.
+
+The software is provided on an "as is" basis. The copyright holder does not
+guarantee the accuracy, completeness, availability, or continuity of the
+software or its monitoring results. To the maximum extent permitted by
+applicable law, the copyright holder is not liable for any damages arising from
+the software, its monitoring results, or their use. Nothing in this license
+excludes or limits any liability that cannot be excluded or limited under
+applicable law.
+
+---
+
+## 日本語参考訳
+
+Copyright (c) 2026 tikpok.
+
+すべての人に、次の行為を許可します。
+
+1. このリポジトリのソースコードを閲覧・学習すること。
+2. 著作権者がこのリポジトリのGitHub Releasesページで公式に公開した、未改変のバイナリを、適法な目的でダウンロード、インストール、実行すること。
+
+公式バイナリの利用許可には、次の行為は含まれません。
+
+- ソースコードを利用して本ソフトウェアをビルドまたは配備すること。
+- ソースコードを複製、改変、翻案し、または派生物を作成すること。
+- ソースコードまたはバイナリを改変、再パッケージ、再配布、ミラー公開、サブライセンス、販売し、または第三者が取得できる状態にすること。
+- 著作権、ライセンス、帰属表示を削除または変更すること。
+- 著作権者の名称、商標、ブランドを、著作権者による推奨や承認を示す目的で利用すること。
+
+このライセンスで明示的に許可していない権利は、著作権者が留保します。著作権者は、書面により追加の許可を与えることができます。
+
+本ソフトウェアは現状有姿で提供され、ソフトウェアまたはその監視結果の正確性、完全性、可用性、継続性を保証しません。適用される法令で認められる最大限の範囲において、本ソフトウェア、その監視結果またはこれらの利用により生じた損害について、著作権者は責任を負いません。ただし、本条項は、適用される法令により著作権者が負うべき責任を免除または制限するものではありません。

@@ -281,7 +281,7 @@ async fn monitor_peer_node_inner(
     app: AppHandle,
     state: AppState,
     node: StoredNode,
-    _force: bool,
+    force: bool,
 ) -> AppResult<()> {
     let settings = state.settings.read().await.clone();
     let now = chrono::Utc::now().timestamp_millis();
@@ -292,6 +292,7 @@ async fn monitor_peer_node_inner(
     let resume_grace = state.is_system_suspended() || state.in_resume_grace(evaluation_now);
     let mut runtime_map = state.runtime.lock().await;
     let runtime = runtime_map.entry(node.id.clone()).or_default();
+    let certificate_due = force || now.saturating_sub(runtime.last_static_poll) >= 15 * 60 * 1_000;
     let mut last_error = None;
     match probe_result {
         Ok(()) => {
@@ -337,16 +338,34 @@ async fn monitor_peer_node_inner(
         Some(latency_ms),
         last_error,
     );
+    let mut certificate_errors = Vec::new();
+    if sample.reachable && certificate_due {
+        match SymbolAdapter::fetch_peer_certificate_metrics(&node.base_url).await {
+            Ok(certificate) => {
+                sample.node_certificate_not_after = certificate.node_certificate_not_after;
+                sample.node_certificate_remaining_days =
+                    certificate.node_certificate_remaining_days;
+            }
+            Err(error) => certificate_errors.push(format!("node certificate: {error}")),
+        }
+        if let Some(runtime) = state.runtime.lock().await.get_mut(&node.id) {
+            runtime.last_static_poll = now;
+        }
+    }
     match fetch_peer_voting_metrics(&state, &node).await {
         Ok(certificate) => {
             sample.voting_key_start_epoch = certificate.voting_key_start_epoch;
             sample.voting_key_end_epoch = certificate.voting_key_end_epoch;
             sample.finalization_epoch = certificate.finalization_epoch;
             sample.voting_key_remaining_epochs = certificate.voting_key_remaining_epochs;
-            sample.certificate_metric_error = certificate.error;
+            if let Some(error) = certificate.error {
+                certificate_errors.push(error);
+            }
         }
-        Err(error) => sample.certificate_metric_error = Some(error),
+        Err(error) => certificate_errors.push(error),
     }
+    sample.certificate_metric_error =
+        (!certificate_errors.is_empty()).then(|| certificate_errors.join("; "));
     let previous_certificate = state
         .repository
         .latest_certificate_snapshot(&node.id)
@@ -403,6 +422,24 @@ async fn monitor_peer_node_inner(
         .await?;
     }
     if !evaluation_paused {
+        let node_certificate_message = sample
+            .node_certificate_remaining_days
+            .map(node_certificate_message)
+            .unwrap_or_else(|| "ノード証明書期限を確認できません。".into());
+        update_expiry_alert(
+            &app,
+            &state,
+            &node,
+            expiry_alert_transition(
+                sample.node_certificate_remaining_days,
+                sample.node_certificate_not_after,
+                previous_certificate.node_certificate_not_after,
+            ),
+            "node_certificate_expiring",
+            &node_certificate_message,
+            "ノード証明書の期限が延長されました。",
+        )
+        .await?;
         let voting_key_message = sample
             .voting_key_remaining_epochs
             .map(voting_key_message)
