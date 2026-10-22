@@ -7,7 +7,9 @@ use super::{
     SupernodeProgramNode, SupernodeSnapshot, WebSocketSpec,
 };
 
+// async-trait adds #[must_use] to futures that Rust 1.99 already treats as must-use.
 #[async_trait]
+#[allow(clippy::double_must_use)]
 pub trait NodeAdapter: Send + Sync {
     async fn probe(&self) -> AppResult<NodeIdentity>;
     async fn fetch_health(&self) -> AppResult<HealthSnapshot>;

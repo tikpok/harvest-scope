@@ -217,6 +217,8 @@ impl AppState {
         self.background_monitoring.store(enabled, Ordering::Relaxed);
     }
 
+    // Preserve the Rust 1.89-compatible fetch_update API, renamed in Rust 1.99.
+    #[allow(deprecated)]
     pub fn begin_resume_grace(&self, now: i64, duration_ms: i64) -> bool {
         let until = now.saturating_add(duration_ms);
         self.resume_grace_until
