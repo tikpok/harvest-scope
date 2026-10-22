@@ -1,5 +1,9 @@
 # 変更履歴
 
+## 1.1.2
+
+- eMudhra中間CAの秘密鍵漏えいに対応し、HTTPS / WSSの証明書検証に使う`rustls-webpki`を0.103.16、同梱CA一覧の`webpki-roots`を1.0.10へ更新しました（[RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382.html)）。既存の配布済みアプリには、再ビルドした更新版の適用が必要です。
+
 ## 1.1.1
 
 - Windows自動起動が無効な環境でテーマ変更などの設定保存が失敗する問題を修正しました。

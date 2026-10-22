@@ -1,6 +1,6 @@
 [package]
 name = "harvest-scope"
-version = "1.1.1"
+version = "1.1.2"
 description = "Harvest Scope desktop monitor for Symbol and NEM NIS1 nodes"
 authors = ["tikpok"]
 edition = "2021"

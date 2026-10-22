@@ -17,8 +17,8 @@ Harvest Scopeは、Symbol（Catapult）ノードとNEM（NIS1）ノードの状�
 
 ### インストール手順
 
-1. [Harvest Scope v1.1.1のReleaseページ](https://github.com/tikpok/harvest-scope/releases/tag/v1.1.1)を開きます。
-2. ページ下部の「Assets」から`Harvest Scope_1.1.1_x64-setup.exe`をダウンロードします。
+1. [Harvest Scope v1.1.2のReleaseページ](https://github.com/tikpok/harvest-scope/releases/tag/v1.1.2)を開きます。
+2. ページ下部の「Assets」から`Harvest Scope_1.1.2_x64-setup.exe`をダウンロードします。
 3. ダウンロードしたインストーラーを実行します。
 4. インストール完了後、スタートメニューなどから「Harvest Scope」を起動します。
 
